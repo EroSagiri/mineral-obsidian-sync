@@ -36,6 +36,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       registerDevelopmentSelfTests({
         app: this.app,
         settings: this.settings,
+        pluginDir: this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
         addCommand: (command) => this.addCommand(command),
         setStatus: (text) => this.setStatus(text),
       });
