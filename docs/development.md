@@ -11,7 +11,7 @@
 | Phase 1 | 本地元数据扫描、分页 `ListObjectsV2`、纯确定性三方 planner、IndexedDB previous-state、Inspect Sync State 诊断 | 完成 |
 | Phase 1.5 | 安全 bootstrap 基线、惰性二进制 SHA-256 比对、`GET If-Match`、只有验证为逐字节相同的配对才能建立基线 | 完成 |
 | Phase 2A | aws4fetch 仅签名、`CredentialProvider`、`RequestUrlTransport`、`R2Client` 的 GET / PUT / HEAD、`PUT If-Match`、`PUT If-None-Match: *`、`GET If-Match`、顺序 `SafeExecutor`、本地/远端执行前置条件、per-key previous-state 提交、PUT 结果不明与状态写失败 → `unresolved`、二进制 `createBinary` / `modifyBinary`、remote identity 含 endpoint/bucket/prefix、忽略策略变化 fail closed、删除硬阻断 | 完成 |
-| Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | 完成：桌面 9/9 + 8/8，Android 9/9 + 8/8（见下方验证记录） |
+| Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | **CLOSED**：桌面 9/9 + 9/9，Android 9/9 + 9/9（见下方验证记录） |
 | Phase 3A | 自动调度器（Vault 事件 → dirty set → debounce → planner → SafeExecutor），删除仍为 BLOCKED | 尚未开始 |
 
 ---
@@ -263,6 +263,20 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T17:47:57Z | Transport Self-Test（**Android**，矩阵含错误路径） | 7 / 9 PASS：矩阵 18 项中 16 项通过，2 项 HEAD 错误路径被平台丢弃；`conditional-head` 同理 |
 | 2026-09-21T18:00:20Z | Transport Self-Test（**Android**，平台期望编码后） | **9 / 9 PASS**：2 项 HEAD 限制照旧逐字记录，其余 16 项严格通过；64 KiB 与 1 MiB 二进制在设备上逐字节 + SHA-256 一致 |
 | 2026-09-21T18:01:52Z | Convergence Self-Test（**Android**） | **8 / 8 PASS**：真实 executor 写盘、真实 IndexedDB 提交 + 重读、三级缺失目录链创建、stale / unresolved 保护全部成立 |
+| 2026-09-21T18:10:16Z | Transport Self-Test（桌面，移除确认 HEAD 后的构建） | **9 / 9 PASS**：18 项原语矩阵全绿；`remote-advanced-after-write` 不在此套 |
+| 2026-09-21T18:10:47Z | Convergence Self-Test（桌面，含 `remote-advanced-after-write`） | **9 / 9 PASS** |
+| 2026-09-21T18:11:59Z | Convergence Self-Test（**Android**，含 `remote-advanced-after-write`） | **9 / 9 PASS**；落盘核对：`remote-advanced.md` 内容为外部写者的 v2，确认跟进下载真的收敛 |
+
+构建归属（避免把不同构建的结果混在一起）：
+
+```text
+md5 46c390c7e374b99c7af543d955628688   17:47 – 18:01 的运行（仍带 post-PUT 确认 HEAD）
+md5 e26a46745fe34075fcc025b91db47000   18:10 之后的运行（baseline 取自 PUT 响应，无确认 HEAD）
+```
+
+Android 传输矩阵的最近一次完整记录是 18:00:20Z（旧构建）。矩阵代码此后未改动，唯一的
+产品改动是 PUT 不再尾随一次确认 HEAD（只减少请求），因此该记录仍然适用；若要凑成单一构建的
+完整证据集，重跑一次 Transport Self-Test 即可（约 20 秒）。
 
 ### Android 非 2xx 语义（真机实测，问题已彻底摸清）
 
@@ -489,12 +503,24 @@ Vault: private/mineral-sync-test-local/<run-id>/       （回退时的可见根�
 
 ## 下一步
 
-Phase 3A（自动调度器）开工前的两项前置条件均已满足：
+Phase 2A / Phase 2A.5 已收口，**网络层冻结**：`Signer` / `Transport` / `R2Client` / `SafeExecutor` 自本阶段起不再改动，除非真机证据要求。
 
-1. ~~收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。~~ 已于 2026-09-21T17:30:31Z（桌面）与 18:01:52Z（Android）满足。
-2. ~~移动端验证。~~ Android 传输 9/9 + 收敛 8/8 均已通过；iOS 从未运行，属于已知未覆盖面。
+Phase 3A（自动调度器）的两项前置条件均已满足：
 
-Phase 3A 的已知前置技术项：
+1. ~~收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。~~ 桌面与 Android 均通过。
+2. ~~移动端验证。~~ Android 传输 9/9 + 收敛 9/9；iOS 从未运行，属于已知未覆盖面。
+
+Phase 3A 的实现顺序应是**先触发时机语义，后代码**：
+
+```text
+先确定：文件正在被编辑 / 一次计划跨了两次扫描 / Obsidian 自身正在同步 /
+        执行中用户又改了文件 —— 这些情况下 scheduler 应该做什么、不做什么。
+
+理由：写入路径会产生本地副作用（建目录、写文件），所以"什么时候允许执行"比"怎么执行"
+      更难，也更需要先定义清楚。
+```
+
+Phase 3A 的已知技术项：
 
 ```text
 a. ~~putObject 的确认 HEAD~~ 已移除（2026-09-21）。baseline 直接取自 PUT 响应。
