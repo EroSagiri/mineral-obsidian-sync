@@ -200,7 +200,8 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T17:10:53Z | Convergence Self-Test | 0 / 5，全部 `ENOENT`（脚手架缺陷，已修复） |
 | 2026-09-21T17:17:20Z | Transport Self-Test（guard 重构后重跑） | **8 / 8 PASS** |
 | 2026-09-21T17:17:50Z | Convergence Self-Test | **6 / 6 PASS**，本地 scratch 回退到可见根目录 |
-| 待执行 | Convergence Self-Test（含 `download-applied`、`download-blocked-by-file-parent`） | —— |
+| 2026-09-21T17:29:18Z | Transport Self-Test | **8 / 8 PASS** |
+| 2026-09-21T17:30:31Z | Convergence Self-Test（含 `download-applied`、`download-blocked-by-file-parent`） | **8 / 8 PASS**，成功下载写盘路径的真实 Vault 验证完成 |
 
 ### 真实端点确认的行为
 
@@ -208,6 +209,8 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 - `PUT If-None-Match: *` 第二次返回 412，且**不覆盖**既有内容。
 - `PUT If-Match` 过时返回 412；`GET If-Match` 过时返回 412 且**不返回正文**。
 - 64 KiB 与 1 MiB 二进制往返：长度、逐字节、SHA-256 三者一致。
+- 成功下载会在真实 Vault 中创建缺失的父目录链：`root-file.md`（无需建目录）、`one-level/foo.md`、`multi/level/deep/foo.md`、`existing/parent/kept.md`（父目录已存在）四种情况全部落盘确认，且第二次 reconcile 为 noop。
+- 父路径被文件占用时（`blocked/occupier` 为文件）返回 `failed / parent-path-is-file`，未创建任何文件，占用文件字节不变。
 - Obsidian 能创建点目录并写入文件，但 `vault.getFileByPath()` 看不到它们。
 - `Vault.createBinary` 不创建父目录；`Vault.createFolder` 非递归。
 
@@ -292,6 +295,7 @@ npx vitest run test/integration/r2-real.manual.test.ts
 412 stale 语义                            已验证
 64 KiB 与 1 MiB 二进制往返                已验证
 上传路径 + state 提交 + noop 收敛          已验证
+成功 download 写盘路径（真实 Vault）       已验证（2026-09-21T17:30:31Z）
 stale remote / stale local 保护           已验证
 状态提交失败与 PUT 结果不明 → unresolved   已验证
 测试前缀隔离（真实 bucket）                已验证
@@ -301,7 +305,6 @@ stale remote / stale local 保护           已验证
 未验证：
 
 ```text
-成功 download 写盘路径（真实 Vault）       等待下一次自检运行
 Android / iOS                             未验证
 自动调度、事件监听、任何后台行为            尚未实现
 ```
@@ -326,7 +329,7 @@ Vault: private/mineral-sync-test-local/<run-id>/       （回退时的可见根�
 
 Phase 3A（自动调度器）开工前必须满足：
 
-1. 收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。
+1. ~~收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。~~ 已于 2026-09-21T17:30:31Z 满足。
 2. Android 冒烟测试通过，或在明确知晓风险的前提下决定暂不覆盖移动端。
 
 Phase 3A 本身仍受以下约束：删除保持 BLOCKED；不实现 Gateway、临时凭据端点、队列、Cloudflare Worker、Durable Object、WebSocket。
