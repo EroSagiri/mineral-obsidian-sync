@@ -45,3 +45,6 @@ desktop.ini
 # Optional local test artifacts
 test-output/
 tmp/
+
+# Integration self-test namespace: any local artifact of an R2 transport run
+.mineral-sync-test/

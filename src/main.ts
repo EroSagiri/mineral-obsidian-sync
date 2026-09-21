@@ -8,6 +8,7 @@ import { IndexedDbStateStore } from "./state/state-store";
 import { buildBootstrapResult } from "./bootstrap/bootstrap";
 import { DryRunModal } from "./ui/dry-run-modal";
 import { createVaultPathFilter, ignorePolicyFingerprint } from "./sync/ignore";
+import { registerDevelopmentSelfTests } from "./dev/self-test-command";
 
 export default class R2PersonalSyncPlugin extends Plugin {
   settings: R2SyncSettings = { ...DEFAULT_SETTINGS };
@@ -30,6 +31,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.addSettingTab(new R2SyncSettingTab(this.app, this));
     this.addCommand({ id: "r2-sync-inspect-state", name: "Mineral Sync: Inspect Sync State", callback: () => this.inspectSyncState() });
     this.addCommand({ id: "r2-sync-test-connection", name: "R2 Sync: Test Connection", callback: () => this.testConnection() });
+    // Development-only diagnostics: never registered, and not even bundled, in production.
+    if (__DEV__) {
+      registerDevelopmentSelfTests({
+        app: this.app,
+        settings: this.settings,
+        addCommand: (command) => this.addCommand(command),
+        setStatus: (text) => this.setStatus(text),
+      });
+    }
     this.statusBar = this.addStatusBarItem();
     this.setStatus("✓ idle");
   }

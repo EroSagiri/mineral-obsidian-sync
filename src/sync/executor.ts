@@ -1,6 +1,6 @@
 import type { Vault } from "obsidian";
 import { LocalFileChangedError, readStableLocalBytes } from "../local/read-local";
-import { RemoteObjectChangedError } from "../remote/errors";
+import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, SyncOperation } from "./types";
@@ -9,8 +9,25 @@ export type OperationResult =
   | { status: "applied"; key: string }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" }
   | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" }
+  /** A definitive negative answer: a received auth/permission failure, not a lost response. */
   | { status: "failed"; key: string; error: string }
+  /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
   | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed" };
+
+/**
+ * A conditional mismatch is a stale plan, not a plugin error. A received 4xx means the write
+ * definitely did not happen. Only 5xx/429 responses and transport-level throws leave the
+ * outcome of a write genuinely unknown, and those stay fail-safe as `unresolved`.
+ */
+function uploadFailure(operation: string, key: string, error: unknown): OperationResult {
+  if (error instanceof RemoteObjectChangedError) return { status: "stale", key, reason: "remote-changed" };
+  if (error instanceof RemoteHttpError) {
+    if (error.status < 500 && error.status !== 429) return { status: "failed", key, error: `R2 ${operation} failed with HTTP ${error.status}` };
+    return { status: "unresolved", key, reason: "ambiguous-put" };
+  }
+  // A lost or interrupted response cannot be distinguished from a lost successful response.
+  return { status: "unresolved", key, reason: "ambiguous-put" };
+}
 
 function same(stat: { size: number; mtime: number } | null, expected: LocalEntry): boolean { return Boolean(stat && stat.size === expected.size && stat.mtime === expected.mtime); }
 async function localStillMatches(vault: Vault, key: string, expected: LocalEntry | { kind: "absent" }): Promise<boolean> {
@@ -43,9 +60,7 @@ export class SafeExecutor {
       const commit = await this.commit({ key: operation.key, local: { size: localStat!.size, mtime: localStat!.mtime }, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
       return commit ?? { status: "applied", key: operation.key };
     } catch (error) {
-      if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
-      // A transport failure after PUT is not safely distinguishable from a lost successful response.
-      return { status: "unresolved", key: operation.key, reason: "ambiguous-put" };
+      return uploadFailure("PutObject", operation.key, error);
     }
   }
   private async download(operation: Extract<SyncOperation, { type: "download" }>): Promise<OperationResult> {

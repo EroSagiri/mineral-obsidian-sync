@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RemoteObjectChangedError } from "../remote/errors";
+import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
 import { SafeExecutor } from "./executor";
 import type { R2Client } from "../remote/r2-client";
 import type { StateStore } from "../state/sync-state";
@@ -52,6 +52,18 @@ describe("SafeExecutor", () => {
   });
   it("reports a successful transfer with failed state persistence as unresolved", async () => {
     await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, remote(), state(true), identity, "[]").execute(upload())).resolves.toEqual({ status: "unresolved", key: "a.bin", reason: "state-commit-failed" });
+  });
+  it("classifies a received auth failure as failed instead of an ambiguous write", async () => {
+    const saved = state();
+    const failing = remote({ putObject: async () => { throw new RemoteHttpError("PutObject", 403); } });
+    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, failing, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "failed", key: "a.bin", error: "R2 PutObject failed with HTTP 403" });
+    expect(saved.entries).toHaveLength(0);
+  });
+  it("keeps a 5xx write response fail-safe as unresolved", async () => {
+    const saved = state();
+    const failing = remote({ putObject: async () => { throw new RemoteHttpError("PutObject", 503); } });
+    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, failing, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "unresolved", key: "a.bin", reason: "ambiguous-put" });
+    expect(saved.entries).toHaveLength(0);
   });
   it("hard-blocks both deletion operations", async () => {
     const executor = new SafeExecutor(vault({}) as never, remote(), state(), identity, "[]");

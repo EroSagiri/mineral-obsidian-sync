@@ -1,5 +1,35 @@
-type Handler = (request: { url: string; method?: string; headers?: Record<string, string>; throw?: boolean }) => Promise<unknown>;
-let handler: Handler = async () => { throw new Error("requestUrl mock was not configured"); };
+export interface MockRequestUrlRequest {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: ArrayBuffer | string;
+  throw?: boolean;
+}
 
-export function setRequestUrlHandler(next: Handler): void { handler = next; }
-export async function requestUrl(request: { url: string; method?: string; headers?: Record<string, string>; throw?: boolean }): Promise<unknown> { return handler(request); }
+export interface MockRequestUrlResponse {
+  status: number;
+  headers: Record<string, string>;
+  text: string;
+  arrayBuffer: ArrayBuffer;
+  json?: unknown;
+}
+
+type Handler = (request: MockRequestUrlRequest) => Promise<MockRequestUrlResponse>;
+
+let handler: Handler = async () => {
+  throw new Error("requestUrl mock was not configured");
+};
+
+export function setRequestUrlHandler(next: Handler): void {
+  handler = next;
+}
+
+export function resetRequestUrlHandler(): void {
+  handler = async () => {
+    throw new Error("requestUrl mock was not configured");
+  };
+}
+
+export async function requestUrl(request: MockRequestUrlRequest): Promise<MockRequestUrlResponse> {
+  return handler(request);
+}
