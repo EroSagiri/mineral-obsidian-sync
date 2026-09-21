@@ -40,9 +40,18 @@ export function observation(name: string, value: string | number | boolean): Sce
   return { name, value };
 }
 
+/**
+ * Renders an error for a report, including the underlying cause.
+ *
+ * The cause matters: a wrapped transport failure would otherwise hide the platform's own message
+ * (`Request Failed. IOException Stream closed`), which is exactly the text a platform diagnosis
+ * depends on.
+ */
 export function errorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "unknown error";
-  return raw.replace(/\s+/g, " ").slice(0, 240);
+  if (!(error instanceof Error)) return typeof error === "string" ? error.replace(/\s+/g, " ").slice(0, 240) : "unknown error";
+  const cause = error.cause;
+  const detail = cause instanceof Error && cause.message !== error.message ? ` ← ${cause.message}` : "";
+  return `${error.message}${detail}`.replace(/\s+/g, " ").slice(0, 240);
 }
 
 /** Runs one scenario, converting a throw into a structured failure instead of aborting the run. */

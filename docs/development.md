@@ -262,6 +262,39 @@ HEAD 200 / 条件 HEAD 200       → 正常返回                               
 
 教训：只测 happy path 的矩阵可以在一个平台上全绿而什么都不解释。错误路径必须一起测。
 
+### 关于 `throw: false`：已经在用，而且这次实测正好是它生效的证据
+
+一条外部建议认为根因是 `RequestUrlTransport` 没写 `throw: false`（Obsidian 的 `requestUrl` 默认在 status ≥ 400 时 reject）。核对源码后：**从 Phase 2A 起就一直在传** `throw: false`。
+
+而那次 Android 实测本身就是内部控制 —— 同一个 build、同一个 transport、同一个调用点：
+
+```text
+GET  404 → 类型化 http-404               ✅
+PUT  412 → 类型化 precondition-failed     ✅
+GET  412 → 类型化 precondition-failed     ✅
+HEAD 非 2xx → opaque throw                ❌
+```
+
+如果 `throw: false` 缺失，`GET 404` 与 `PUT 412` 不可能带着 status 返回。⇒ 参数是生效的；残余问题发生在原生桥接层读取"无 body 的错误响应"时，位置在 `throw: false` 的管辖范围**之下**。
+
+不过这条建议确实挖出一个真问题：**`throw: false` 此前零测试覆盖** —— `test/obsidian.ts` 的替身完全忽略 `throw`，把这一行删掉所有测试仍然全绿。现在补上了：
+
+```text
+test/obsidian.ts   替身按 Obsidian 语义实现：status ≥ 400 且未传 throw: false 时 reject
+transport.test.ts  3 项断言：throw 恒为 false；400/401/403/404/409/412/429/500/503 作为普通响应返回；
+                   真正未完成的请求抛 RemoteTransportError（并保留 cause）
+已验证守卫有效   临时删掉 throw: false → 4 项测试失败（含 r2-client 的条件 GET / 412 用例）
+```
+
+架构边界（这条建议讲得对，现在写进代码契约）：
+
+```text
+完成的 HTTP 交换 → 响应，不论 status        （404 / 412 / 429 / 5xx 都是协议结果，不是 transport error）
+没有完成的交换   → RemoteTransportError      （DNS / TLS / socket / 原生桥接失败）
+```
+
+新增 `RemoteTransportError`，与 `RemoteHttpError` 分开：前者是"没有响应"，后者是"有响应但状态非 2xx"。执行器的分类不变（未完成的 PUT → `unresolved/ambiguous-put`，不提交 state）。报告会把包装前的原始文本一并带出（`... ← Request Failed. IOException Stream closed`），因为那行文本正是平台诊断的依据。
+
 ### 真实端点确认的行为
 
 - R2 对 `HeadObject` 的 `If-Match` 返回 **412**。此前只能依据官方兼容表推断，现已由真实端点观测确认。
@@ -284,6 +317,8 @@ HEAD 200 / 条件 HEAD 200       → 正常返回                               
 | 5 | 脚手架本地写入不建父目录 | 见上方事故记录，已改为显式建目录链 + 能力探测 |
 | 6 | `SafeExecutor.download` 在父目录缺失时 `ENOENT` | 新增 `ensureParentFolders`；下载的本地副作用被推到尽可能晚 |
 | 7 | 收敛场景从未执行过"成功 download" | 新增 `download-applied` 与 `download-blocked-by-file-parent` |
+| 8 | 只测 happy path 的原语矩阵在 Android 上全绿却什么都没解释 | 矩阵补 6 项错误路径探测 + 5 项 LIST 地面真相 |
+| 9 | `throw: false` 零测试覆盖（删掉它所有测试仍然全绿） | 替身按 Obsidian 语义实现，新增 3 项断言锁住该不变量 |
 
 ---
 

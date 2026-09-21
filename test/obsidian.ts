@@ -40,6 +40,13 @@ export function resetRequestUrlHandler(): void {
   };
 }
 
+/**
+ * Faithful enough to pin the transport's most important parameter: Obsidian rejects on any status
+ * >= 400 **unless** the caller passed `throw: false`. The mock honours `throw` for the same reason,
+ * so removing `throw: false` from `RequestUrlTransport` fails the suite instead of passing silently.
+ */
 export async function requestUrl(request: MockRequestUrlRequest): Promise<MockRequestUrlResponse> {
-  return handler(request);
+  const response = await handler(request);
+  if (request.throw !== false && response.status >= 400) throw new Error(`Request failed with status code ${response.status}`);
+  return response;
 }

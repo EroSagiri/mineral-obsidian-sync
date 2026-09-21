@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RemoteTransportError } from "../../src/remote/errors";
 import { SettingsCredentialProvider } from "../../src/remote/credentials";
 import type { R2Credentials } from "../../src/remote/credentials";
 import { Aws4FetchSigner } from "../../src/remote/signer";
@@ -74,7 +75,9 @@ describe("signed request immutability across RequestUrlTransport", () => {
     setRequestUrlHandler(async () => {
       throw new Error("network down");
     });
-    await expect(new RequestUrlTransport().send(signed)).rejects.toThrow("network down");
+    // A request that never completed is a transport failure, and stays distinguishable from a 4xx.
+    await expect(new RequestUrlTransport().send(signed)).rejects.toBeInstanceOf(RemoteTransportError);
+    await expect(new RequestUrlTransport().send(signed)).rejects.toMatchObject({ operation: "HEAD", cause: { message: "network down" } });
   });
 });
 

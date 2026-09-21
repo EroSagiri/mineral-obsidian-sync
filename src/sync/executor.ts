@@ -20,8 +20,9 @@ export type OperationResult =
 
 /**
  * A conditional mismatch is a stale plan, not a plugin error. A received 4xx means the write
- * definitely did not happen. Only 5xx/429 responses and transport-level throws leave the
- * outcome of a write genuinely unknown, and those stay fail-safe as `unresolved`.
+ * definitely did not happen. Only 5xx/429 responses and a request that never completed
+ * ({@link RemoteTransportError}) leave the outcome of a write genuinely unknown, and those stay
+ * fail-safe as `unresolved`.
  */
 function uploadFailure(operation: string, key: string, error: unknown): OperationResult {
   if (error instanceof RemoteObjectChangedError) return { status: "stale", key, reason: "remote-changed" };
@@ -29,7 +30,8 @@ function uploadFailure(operation: string, key: string, error: unknown): Operatio
     if (error.status < 500 && error.status !== 429) return { status: "failed", key, error: `R2 ${operation} failed with HTTP ${error.status}` };
     return { status: "unresolved", key, reason: "ambiguous-put" };
   }
-  // A lost or interrupted response cannot be distinguished from a lost successful response.
+  // No response was received, so the write may or may not have landed. The same applies to any
+  // unexpected failure: claiming "failed" would be a guess, so the outcome stays unknown.
   return { status: "unresolved", key, reason: "ambiguous-put" };
 }
 

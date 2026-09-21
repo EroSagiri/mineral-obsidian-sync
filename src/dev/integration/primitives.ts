@@ -1,9 +1,9 @@
 import type { RemoteEntry } from "../../sync/types";
 import { randomBytes as secureRandomBytes, toArrayBuffer, utf8 } from "./bytes";
-import { classifyTransportError, describeTransportError } from "./classify";
+import { classifyTransportError } from "./classify";
 import { headErrorsAreOpaque } from "./context";
 import type { TransportScenarioContext } from "./context";
-import { observation, ScenarioFailure } from "./result";
+import { errorMessage, observation, ScenarioFailure } from "./result";
 import type { ScenarioObservation } from "./result";
 
 /**
@@ -39,7 +39,7 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
     try {
       record(name, await action());
     } catch (error) {
-      record(name, `FAILED: ${describeTransportError(error)}`);
+      record(name, `FAILED: ${errorMessage(error)}`);
     }
   };
   /**
@@ -64,7 +64,7 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
         record(name, "ok on mobile: transport-error, response dropped by the platform (never gates a write)");
         return;
       }
-      record(name, `FAILED: expected ${expected}, got ${kind} (${describeTransportError(error)})`);
+      record(name, `FAILED: expected ${expected}, got ${kind} (${errorMessage(error)})`);
     }
   };
 
