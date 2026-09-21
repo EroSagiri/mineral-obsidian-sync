@@ -224,6 +224,7 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T17:40:57Z | Convergence Self-Test（桌面） | **8 / 8 PASS** |
 | 2026-09-21T17:42:08Z | Transport Self-Test（**Android**，矩阵只有 happy path） | 2 / 9 PASS：矩阵 12 项 happy path **全部通过**；7 个场景仍全部失败 |
 | 2026-09-21T17:47:57Z | Transport Self-Test（**Android**，矩阵含错误路径） | 7 / 9 PASS：矩阵 18 项中 16 项通过，2 项 HEAD 错误路径被平台丢弃；`conditional-head` 同理 |
+| 2026-09-21T18:00:20Z | Transport Self-Test（**Android**，平台期望编码后） | **9 / 9 PASS**：2 项 HEAD 限制照旧逐字记录，其余 16 项严格通过；64 KiB 与 1 MiB 二进制在设备上逐字节 + SHA-256 一致 |
 
 ### Android 非 2xx 语义（真机实测，问题已彻底摸清）
 
@@ -367,23 +368,25 @@ npx vitest run test/integration/r2-real.manual.test.ts
 
 桌面端与移动端使用同一个 `RequestUrlTransport`，没有第二套移动端实现。
 
-已在 OPPO Find X8 / Android 16 上完成（2026-09-21）：
+已在 OPPO Find X8 / Android 16 上完成（2026-09-21，最后一轮 18:00:20Z 为 **9 / 9 PASS**）：
 
 ```text
 1. Test Connection / ListObjectsV2                       ✅ 经 test-prefix-guard 与矩阵 LIST
-2. R2 Transport Self-Test（含 18 项原语矩阵）             ✅ 见上方"Android 非 2xx 语义"
+2. R2 Transport Self-Test（含 18 项原语矩阵）             ✅ 9/9，见上方"Android 非 2xx 语义"
 3. 64 KiB PUT / GET 往返                                 ✅ 矩阵实测
-4. Web Crypto SHA-256                                    ✅ 1 MiB 二进制 SHA-256 一致
-5. 点目录不被索引 → fallback 本地根目录正常工作            ✅ local-scratch-root 通过
-6. 报告渲染与落盘（存在插件目录，可 adb 读取）             ✅
+4. 1 MiB 二进制往返                                      ✅ 逐字节 + SHA-256 一致
+5. Web Crypto SHA-256                                    ✅
+6. 点目录不被索引 → fallback 本地根目录正常工作            ✅ local-scratch-root 通过
+7. 条件创建 / 更新 / GET 的 412 语义                      ✅ 全部类型化
+8. 报告渲染与落盘（存在插件目录，可 adb 读取）             ✅
 ```
 
 仍待执行：
 
 ```text
-7. Convergence Self-Test（executor + 真实 IndexedDB + 真实 Vault 写盘）  ← 移动端最后一个缺口
-8. 1 MiB binary 场景（移动端内存与 ArrayBuffer）—— 矩阵只到 64 KiB，
-   完整 1 MiB 由 Transport Self-Test 的 binary-roundtrip-1m 覆盖
+9. Convergence Self-Test（executor + 真实 IndexedDB + 真实 Vault 写盘）  ← 移动端最后一个缺口
+   注：旧版（01:32 那次）已在 Android 上证明本地文件与目录创建可行，
+       失败点在当时仍使用 404 HEAD 的远端观测，现已改为 LIST。
 ```
 
 ## 已验证 / 未验证
@@ -404,14 +407,15 @@ stale remote / stale local 保护           已验证
 删除仍然被硬阻断                           已验证
 ```
 
-Android 上已单独验证（OPPO Find X8 / Android 16，2026-09-21T17:47:57Z）：
+Android 上已单独验证（OPPO Find X8 / Android 16，最后一轮 2026-09-21T18:00:20Z 为 9 / 9 PASS）：
 
 ```text
-全部 2xx 原语（含 HEAD、条件 HEAD、64 KiB 上下行）   已验证
-GET / PUT 的 404 与 412 错误路径（类型化）            已验证
-点目录不被索引 → fallback 本地根目录                  已验证
-Web Crypto SHA-256（1 MiB 二进制）                    已验证
-HEAD 的非 2xx 响应被平台丢弃                          已确认，且从不影响写入决策（见上）
+全部 2xx 原语（含 HEAD、条件 HEAD、64 KiB 与 1 MiB 上下行）  已验证
+GET / PUT 的 404 与 412 错误路径（类型化）                      已验证
+条件创建 / 更新 / GET 的 412 语义与"被拒写不改动对象"           已验证
+点目录不被索引 → fallback 本地根目录                            已验证
+Web Crypto SHA-256（1 MiB 二进制）                              已验证
+HEAD 的非 2xx 响应被平台丢弃                                    已确认，且从不影响写入决策（见上）
 ```
 
 未验证：
