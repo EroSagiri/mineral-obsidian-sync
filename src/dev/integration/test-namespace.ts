@@ -1,33 +1,37 @@
 /**
  * Phase 2A.5 integration-test namespace and hard prefix guard.
  *
- * Nothing in this plugin may operate on a canonical Vault key during validation. Every
- * integration helper key must live inside `.mineral-sync-test/<run-id>/`, and the guard
- * is applied at the lowest layer (the guarded R2 client) so a caller cannot escape it by
- * passing a plausible-looking path. Callers never hand-build a Vault path: they mint a
- * leaf name through {@link IntegrationTestNamespace.key}.
+ * Two invariants are enforced here, and they are deliberately separate:
+ *
+ * 1. **Remote safety (non-negotiable).** Every R2 object key an integration helper can produce
+ *    must land inside `<configuredPrefix>.mineral-sync-test/<run-id>/`. This is checked on the
+ *    *mapped object key*, i.e. on what R2 will actually receive, not on the Vault path.
+ * 2. **Local safety.** Every Vault path an integration helper can touch must live inside a
+ *    run-scoped scratch root, and callers never hand-build a path: they mint a leaf name.
+ *
+ * The local root is resolved at runtime (see `local-scratch.ts`) because Obsidian's Vault API
+ * may refuse to create a dot-directory. The remote invariant does not depend on that choice.
  */
 
 export const INTEGRATION_TEST_ROOT = ".mineral-sync-test/";
+
+/** Vault-relative fallback root, used only when Obsidian refuses the dot-directory. */
+export const INTEGRATION_FALLBACK_ROOT = "private/mineral-sync-test-local/";
 
 /** `20260922T001500Z` — one run directory per validation round. */
 const RUN_ID = /^\d{8}T\d{6}Z$/;
 /** A relative leaf: no empty segments, no `.`/`..`, no absolute or backslash paths. */
 const LEAF = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 
-/** Thrown when an integration helper is asked to touch anything outside the test root. */
+/** Thrown when an integration helper is asked to touch anything outside the test scope. */
 export class IntegrationTestEscapeError extends Error {
   constructor(readonly key: string) {
-    super(`Integration test refused a key outside ${INTEGRATION_TEST_ROOT}: ${JSON.stringify(key)}`);
+    super(`Integration test refused a key outside the test scope: ${JSON.stringify(key)}`);
     this.name = "IntegrationTestEscapeError";
   }
 }
 
-/**
- * The single hard guard. It rejects any key that is not inside a run directory under
- * `.mineral-sync-test/`. It is deliberately strict: a missing run segment, a sibling
- * prefix such as `.mineral-sync-test-evil/`, and traversal are all refused.
- */
+/** The single hard guard for run-directory naming. */
 export function assertIntegrationTestKey(key: string): void {
   if (typeof key !== "string" || !key.startsWith(INTEGRATION_TEST_ROOT)) throw new IntegrationTestEscapeError(String(key));
   const rest = key.slice(INTEGRATION_TEST_ROOT.length);
@@ -36,18 +40,42 @@ export function assertIntegrationTestKey(key: string): void {
 }
 
 /**
- * Defense in depth for the mapped object key: after removing the configured remote
- * prefix, the object key must still be inside the test root.
+ * The remote invariant, checked on the object key R2 will receive: after removing the user's
+ * configured remote prefix, the object key must still be inside the run's test root.
  */
-export function assertIntegrationObjectKey(objectKey: string, configuredPrefix: string): void {
+export function assertIntegrationObjectKey(objectKey: string, configuredPrefix: string, objectRoot: string): void {
   const prefix = normalizeConfiguredPrefix(configuredPrefix);
   if (!objectKey.startsWith(prefix)) throw new IntegrationTestEscapeError(objectKey);
-  assertIntegrationTestKey(objectKey.slice(prefix.length));
+  const relative = objectKey.slice(prefix.length);
+  if (!relative.startsWith(objectRoot)) throw new IntegrationTestEscapeError(objectKey);
 }
 
-function normalizeConfiguredPrefix(prefix: string): string {
+/** The local invariant: a Vault path must live inside the resolved scratch root. */
+export function assertIntegrationLocalKey(key: string, localRoot: string): void {
+  if (typeof key !== "string" || !key.startsWith(localRoot)) throw new IntegrationTestEscapeError(String(key));
+}
+
+export function normalizeConfiguredPrefix(prefix: string): string {
   const trimmed = prefix.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
   return trimmed ? `${trimmed}/` : "";
+}
+
+/** The only supported way to name a scoped object. */
+export function mintScopedKey(root: string, leaf: string): string {
+  const segments = typeof leaf === "string" ? leaf.split("/") : [];
+  if (!LEAF.test(leaf) || segments.some((part) => part === "." || part === "..")) throw new IntegrationTestEscapeError(`${root}${leaf}`);
+  const key = root + leaf;
+  if (!key.startsWith(root)) throw new IntegrationTestEscapeError(key);
+  return key;
+}
+
+export function isLeaf(leaf: string): boolean {
+  try {
+    mintScopedKey("", leaf);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function formatRunId(date: Date): string {
@@ -69,15 +97,19 @@ export class IntegrationTestNamespace {
     return new IntegrationTestNamespace(runId);
   }
 
+  /** `.mineral-sync-test/<runId>/` — both the remote object root and the preferred local root. */
   get root(): string {
     return `${INTEGRATION_TEST_ROOT}${this.runId}/`;
   }
 
-  /** The only supported way to name a test object. */
+  /** The R2 object prefix (relative to the configured prefix) every object must land inside. */
+  get objectRoot(): string {
+    return this.root;
+  }
+
+  /** The only supported way to name a test object under the hidden run root. */
   key(leaf: string): string {
-    const segments = typeof leaf === "string" ? leaf.split("/") : [];
-    if (!LEAF.test(leaf) || segments.some((part) => part === "." || part === "..")) throw new IntegrationTestEscapeError(`${this.root}${leaf}`);
-    const key = this.root + leaf;
+    const key = mintScopedKey(this.root, leaf);
     this.assertOwns(key);
     return key;
   }
@@ -94,5 +126,14 @@ export class IntegrationTestNamespace {
     } catch {
       return false;
     }
+  }
+
+  /** Preferred (hidden) local root; the fallback is `<INTEGRATION_FALLBACK_ROOT><runId>/`. */
+  get preferredLocalBase(): string {
+    return this.root;
+  }
+
+  get fallbackLocalBase(): string {
+    return `${INTEGRATION_FALLBACK_ROOT}${this.runId}/`;
   }
 }

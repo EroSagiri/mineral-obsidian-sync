@@ -4,9 +4,10 @@ import type { R2Configuration } from "../../remote/r2-client";
 import type { R2SyncSettings } from "../../settings";
 import { IndexedDbStateStore } from "../../state/state-store";
 import { ignorePolicyFingerprint } from "../../sync/ignore";
-import { lostResponseClient, runConvergenceScenarios } from "./convergence";
+import { convergenceScenarioNames, lostResponseClient, runConvergenceScenarios } from "./convergence";
 import { GuardedIntegrationClient } from "./guarded-client";
-import { redactReport } from "./result";
+import { resolveLocalScratch } from "./local-scratch";
+import { observation, redactReport, skipScenario } from "./result";
 import type { ScenarioReport, ScenarioResult } from "./result";
 import { runTransportScenarios } from "./scenarios";
 import { IntegrationTestNamespace } from "./test-namespace";
@@ -14,9 +15,9 @@ import { IntegrationTestNamespace } from "./test-namespace";
 /**
  * In-Obsidian runner for Phase 2A.5.
  *
- * This is a diagnostic, not a synchronization feature. It never lists, reads, writes, or
- * deletes anything outside `.mineral-sync-test/<run-id>/`, and it never registers a
- * production UI entry point: the command is added only under `__DEV__`.
+ * This is a diagnostic, not a synchronization feature. It never writes to a canonical R2 key:
+ * every object key is forced inside `.mineral-sync-test/<run-id>/` and verified on the mapped
+ * object key, whatever the local scratch path turns out to be.
  */
 
 /** A separate database keeps the real device baseline completely untouched. */
@@ -44,18 +45,47 @@ export async function runR2SelfTest(app: App, settings: R2SyncSettings, selectio
   const config = configuration(settings);
   const startedAt = Date.now();
   const namespace = IntegrationTestNamespace.mint();
-  const client = new SignedR2ListClient(config);
-  const guarded = new GuardedIntegrationClient(client, namespace, config.remotePrefix);
-  const state = new IndexedDbStateStore(INTEGRATION_STATE_DATABASE);
-  const identity = remoteIdentity(config);
   const ignorePolicy = ignorePolicyFingerprint(settings);
-
   const results: ScenarioResult[] = [];
+
   if (selection.transport) {
-    results.push(...(await runTransportScenarios({ namespace, client: guarded })));
+    const transportClient = new GuardedIntegrationClient(new SignedR2ListClient(config), config.remotePrefix, {
+      configuredPrefix: config.remotePrefix,
+      objectRoot: namespace.objectRoot,
+      localRoot: namespace.root,
+    });
+    results.push(...(await runTransportScenarios({ namespace, client: transportClient })));
   }
+
   if (selection.convergence) {
-    results.push(...(await runConvergenceScenarios({ vault: app.vault, client: guarded, state, namespace, identity, ignorePolicy, ambiguousClient: lostResponseClient(guarded) })));
+    const resolution = await resolveLocalScratch(app.vault, namespace, config.remotePrefix);
+    if (!resolution.ok) {
+      results.push({ name: "local-scratch-root", status: "fail", detail: "no usable Vault scratch root; see the probe trail", observations: resolution.diagnostics.map((entry) => observation("probe", entry)) });
+      results.push(...convergenceScenarioNames().map((name) => skipScenario(name, "no usable local Vault scratch root")));
+    } else {
+      const scratch = resolution.scratch;
+      results.push({
+        name: "local-scratch-root",
+        status: "pass",
+        detail: `using the ${scratch.kind} local scratch root`,
+        observations: [...scratch.diagnostics.map((entry) => observation("probe", entry)), observation("local scratch root", scratch.root), observation("r2 object root", `${config.remotePrefix}${scratch.objectRoot}`)],
+      });
+      const convergenceConfig: R2Configuration = { ...config, remotePrefix: scratch.clientPrefix };
+      const convergenceClient = new GuardedIntegrationClient(new SignedR2ListClient(convergenceConfig), scratch.clientPrefix, {
+        configuredPrefix: config.remotePrefix,
+        objectRoot: scratch.objectRoot,
+        localRoot: scratch.root,
+      });
+      results.push(...(await runConvergenceScenarios({
+        vault: app.vault,
+        client: convergenceClient,
+        state: new IndexedDbStateStore(INTEGRATION_STATE_DATABASE),
+        scratch,
+        identity: remoteIdentity(convergenceConfig),
+        ignorePolicy,
+        ambiguousClient: lostResponseClient(convergenceClient),
+      })));
+    }
   }
 
   return redactReport(

@@ -7,31 +7,41 @@ import { SafeExecutor } from "../../src/sync/executor";
 import { resetRequestUrlHandler } from "../obsidian";
 import type { FakeR2Options } from "./fake-r2";
 import { createFakeVault, createMemoryStateStore } from "./fake-vault";
-import { CONFIG, createHarness } from "./harness";
+import type { FakeVault, FakeVaultOptions } from "./fake-vault";
+import { CONFIG, createConvergenceHarness } from "./harness";
 
 const statuses = (results: Array<{ name: string; status: string }>): string[] => results.map((result) => `${result.name}:${result.status}`);
 
-function build(options: FakeR2Options = { bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId }) {
-  const harness = createHarness(options);
-  const vault = createFakeVault();
+async function build(fakeOptions: FakeR2Options = { bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId }, vaultOptions: FakeVaultOptions = {}) {
+  const vault = createFakeVault({}, vaultOptions);
+  const harness = await createConvergenceHarness(vault, fakeOptions);
   const state = createMemoryStateStore();
   const context: ConvergenceContext = {
     vault: vault as unknown as Vault,
-    client: harness.client,
+    client: harness.convergenceClient,
     state,
-    namespace: harness.namespace,
-    identity: harness.identity,
+    scratch: harness.scratch,
+    identity: harness.convergenceIdentity,
     ignorePolicy: ignorePolicyFingerprint({ ignoredPaths: [] }),
-    ambiguousClient: lostResponseClient(harness.client),
+    ambiguousClient: lostResponseClient(harness.convergenceClient),
   };
-  return { ...harness, vault, state, context };
+  return { ...harness, vault: vault as FakeVault, state, context };
 }
 
 describe("SafeExecutor integration over an in-process R2 emulator", () => {
   beforeEach(() => resetRequestUrlHandler());
 
+  it("creates the hidden scratch folder chain, because Vault.createBinary does not mkdir parents", async () => {
+    const { vault, scratch } = await build();
+    expect(scratch.kind).toBe("hidden");
+    expect(scratch.root).toBe(`.mineral-sync-test/20260922T001500Z/convergence/`);
+    expect(vault.folders.has(".mineral-sync-test")).toBe(true);
+    expect(vault.folders.has(".mineral-sync-test/20260922T001500Z/convergence")).toBe(true);
+    expect(scratch.diagnostics.every((entry) => !entry.includes("FAILED"))).toBe(true);
+  });
+
   it("converges, then treats the second reconciliation as a noop", async () => {
-    const { fake, vault, state, namespace, context } = build();
+    const { fake, vault, state, scratch, context } = await build();
     const results = await runConvergenceScenarios(context);
 
     expect(statuses(results)).toEqual(convergenceScenarioNames().map((name) => `${name}:pass`));
@@ -43,17 +53,20 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(converge.observations.find((entry) => entry.name === "second plan")?.value).toBe("noop:1");
 
     // Only the two successfully reconciled keys hold a baseline.
-    expect([...state.entries.keys()].sort()).toEqual([`${namespace.root}convergence/stale-remote.md`, `${namespace.root}convergence/test-file.md`]);
+    expect([...state.entries.keys()].sort()).toEqual([`${scratch.root}stale-remote.md`, `${scratch.root}test-file.md`]);
 
-    // Every remote object lives inside the run prefix, and every local file inside the run root.
+    // Every remote object stays inside the run prefix, and every local file inside the run base
+    // (the capability probe lives outside the scenario root so it can never enter a plan).
+    const base = scratch.root.slice(0, -"convergence/".length);
     expect(fake.objects.size).toBe(5);
-    expect([...fake.objects.keys()].every((key) => key.startsWith(`sync/${namespace.root}`))).toBe(true);
-    expect([...vault.files.keys()].every((key) => key.startsWith(namespace.root))).toBe(true);
-    expect(scanLocalNamespace(vault as unknown as Vault, namespace.root).size).toBe(5);
+    expect([...fake.objects.keys()].every((key) => key.startsWith(`sync/.mineral-sync-test/20260922T001500Z/`))).toBe(true);
+    expect([...vault.files.keys()].every((key) => key.startsWith(base))).toBe(true);
+    expect([...vault.files.keys()].some((key) => key === `${base}local-probe/probe.bin`)).toBe(true);
+    expect(scanLocalNamespace(vault as unknown as Vault, scratch.root).size).toBe(5);
   });
 
   it("records the stale, unresolved and blocked outcomes it observed", async () => {
-    const { context } = build();
+    const { context } = await build();
     const results = await runConvergenceScenarios(context);
     const observation = (scenario: string, name: string) => results.find((result) => result.name === scenario)?.observations.find((entry) => entry.name === name)?.value;
 
@@ -68,31 +81,48 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(observation("ambiguous-put", "remote object present")).toBe(true);
   });
 
+  it("uses the visible fallback root and still keeps every object key inside the run prefix", async () => {
+    const { fake, vault, scratch, context } = await build({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId }, { refuseDotFolders: true });
+
+    expect(scratch.kind).toBe("fallback");
+    expect(scratch.root).toBe("private/mineral-sync-test-local/20260922T001500Z/convergence/");
+    expect(scratch.clientPrefix).toBe("sync/.mineral-sync-test/20260922T001500Z/");
+
+    const results = await runConvergenceScenarios(context);
+    expect(statuses(results)).toEqual(convergenceScenarioNames().map((name) => `${name}:pass`));
+
+    expect(vault.files.size).toBeGreaterThan(0);
+    const base = scratch.root.slice(0, -"convergence/".length);
+    expect([...vault.files.keys()].every((key) => key.startsWith(base))).toBe(true);
+    expect(fake.objects.size).toBe(5);
+    expect([...fake.objects.keys()].every((key) => key.startsWith("sync/.mineral-sync-test/20260922T001500Z/"))).toBe(true);
+  });
+
   it("fails the stale-remote scenario when the endpoint ignores If-Match", async () => {
-    const { context } = build({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, ignoreIfMatch: true });
+    const { context } = await build({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, ignoreIfMatch: true });
     const results = await runConvergenceScenarios(context);
 
     expect(results.find((result) => result.name === "stale-remote-preserved")?.status).toBe("fail");
     expect(results.find((result) => result.name === "stale-remote-preserved")?.detail).toContain("instead of stale");
-    // The convergence path itself is unaffected, which proves the failure is specific.
     expect(results.find((result) => result.name === "safe-executor-convergence")?.status).toBe("pass");
   });
 
-  it("fails closed instead of overwriting an existing local file at a test key", async () => {
-    const { vault, namespace, context } = build();
-    vault.files.set(namespace.key("convergence/test-file.md"), { bytes: new Uint8Array([9, 9]), mtime: 1 });
+  it("fails closed instead of overwriting an existing local file at a scratch key", async () => {
+    const { vault, scratch, context } = await build();
+    const key = scratch.key("test-file.md");
+    vault.files.set(key, { bytes: new Uint8Array([9, 9]), mtime: 1 });
 
     const results = await runConvergenceScenarios(context);
     const converge = results.find((result) => result.name === "safe-executor-convergence")!;
     expect(converge.status).toBe("fail");
     expect(converge.detail).toContain("refusing to create");
-    expect(vault.files.get(namespace.key("convergence/test-file.md"))!.bytes).toEqual(new Uint8Array([9, 9]));
+    expect(vault.files.get(key)!.bytes).toEqual(new Uint8Array([9, 9]));
   });
 
   it("keeps deletion hard-blocked through the real executor", async () => {
-    const { context } = build();
+    const { context, scratch } = await build();
     const executor = new SafeExecutor(context.vault, context.client, context.state, context.identity, context.ignorePolicy);
-    const key = context.namespace.key("convergence/test-file.md");
+    const key = scratch.key("test-file.md");
 
     await expect(executor.execute({ type: "delete-remote", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "deletion-not-supported-in-phase-2a" });
     await expect(executor.execute({ type: "delete-local", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "deletion-not-supported-in-phase-2a" });

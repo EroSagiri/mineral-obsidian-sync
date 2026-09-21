@@ -36,7 +36,11 @@ describe.skipIf(!configured)("real Cloudflare R2 over Node fetch (diagnostic onl
     installDomParserShim();
     const config: R2Configuration = { ...env };
     const namespace = IntegrationTestNamespace.mint();
-    const client = new GuardedIntegrationClient(new SignedR2ListClient(config, () => new Date(), undefined, new NodeFetchTransport()), namespace, config.remotePrefix);
+    const client = new GuardedIntegrationClient(new SignedR2ListClient(config, () => new Date(), undefined, new NodeFetchTransport()), config.remotePrefix, {
+      configuredPrefix: config.remotePrefix,
+      objectRoot: namespace.objectRoot,
+      localRoot: namespace.root,
+    });
 
     const startedAt = Date.now();
     const results = await runTransportScenarios({ namespace, client });

@@ -8,7 +8,7 @@ import { buildSyncPlan } from "../../sync/planner";
 import type { LocalEntry, PreviousEntry, RemoteEntry, RemoteIdentity, SyncOperation, SyncPlan } from "../../sync/types";
 import { sameBytes, utf8 } from "./bytes";
 import { headOrAbsent } from "./guarded-client";
-import type { IntegrationTestNamespace } from "./test-namespace";
+import type { LocalScratch } from "./local-scratch";
 import { observation, require, runScenario, ScenarioFailure, skipScenario } from "./result";
 import type { ScenarioObservation, ScenarioResult } from "./result";
 
@@ -16,16 +16,17 @@ import type { ScenarioObservation, ScenarioResult } from "./result";
  * Executor-level scenarios. SafeExecutor, the planner and the state store under test are the
  * real product implementations; only the R2 endpoint and (in unit runs) the Vault are stand-ins.
  *
- * The local scan is deliberately restricted to the run namespace, so a personal Vault file can
- * never enter the observed fact map and can never be touched by the executor.
+ * Every local file lives under the resolved scratch root, so a personal Vault file can never
+ * enter the observed fact map and can never be touched by the executor.
  */
 
 export interface ConvergenceContext {
   vault: Vault;
-  /** Already prefix-guarded. */
+  /** Already scoped: it refuses any key outside the scratch root, and any key whose object key escapes the run prefix. */
   client: R2Client;
   state: StateStore;
-  namespace: IntegrationTestNamespace;
+  /** Resolved local root; see `local-scratch.ts`. */
+  scratch: LocalScratch;
   identity: RemoteIdentity;
   ignorePolicy: string;
   /** Fault-injected client whose first delivered PUT loses its response. */
@@ -39,7 +40,7 @@ export interface StepOutcome {
   reason?: string;
 }
 
-/** Read-only local scan limited to the integration namespace. */
+/** Read-only local scan limited to the scratch root. */
 export function scanLocalNamespace(vault: Vault, root: string): Map<string, LocalEntry> {
   const entries = new Map<string, LocalEntry>();
   for (const file of vault.getFiles()) {
@@ -50,9 +51,9 @@ export function scanLocalNamespace(vault: Vault, root: string): Map<string, Loca
   return entries;
 }
 
-/** Baselines from other namespaces must never influence an integration plan. */
-export function namespacePrevious(previous: Map<string, PreviousEntry>, namespace: IntegrationTestNamespace): Map<string, PreviousEntry> {
-  return new Map([...previous].filter(([key]) => namespace.isOwned(key)));
+/** Baselines from outside the scratch root must never influence an integration plan. */
+export function scopedPrevious(previous: Map<string, PreviousEntry>, root: string): Map<string, PreviousEntry> {
+  return new Map([...previous].filter(([key]) => key.startsWith(root)));
 }
 
 export interface NamespaceObservation {
@@ -64,14 +65,14 @@ export interface NamespaceObservation {
 
 /** Local scan + per-key remote HEAD + previous state, then the deterministic planner. */
 export async function observe(context: ConvergenceContext, extraKeys: readonly string[] = []): Promise<NamespaceObservation> {
-  const local = scanLocalNamespace(context.vault, context.namespace.root);
+  const local = scanLocalNamespace(context.vault, context.scratch.root);
   const keys = [...new Set([...local.keys(), ...extraKeys])].sort((a, b) => a.localeCompare(b));
   const remote = new Map<string, RemoteEntry>();
   for (const key of keys) {
     const entry = await headOrAbsent(context.client, key);
     if (entry) remote.set(key, entry);
   }
-  const previous = namespacePrevious(await context.state.loadAll(), context.namespace);
+  const previous = scopedPrevious(await context.state.loadAll(), context.scratch.root);
   return { local, remote, previous, plan: buildSyncPlan(local, remote, previous) };
 }
 
@@ -97,14 +98,14 @@ function typeCount(plan: SyncPlan, type: SyncOperation["type"]): number {
 function requireOperation<T extends SyncOperation["type"]>(plan: SyncPlan, key: string, type: T): Extract<SyncOperation, { type: T }> {
   const operations = plan.operations.filter((operation) => operation.key === key);
   if (operations.length !== 1 || operations[0]!.type !== type) {
-    throw new ScenarioFailure(`expected exactly one ${type} operation for ${key}; plan was ${planSummary(plan)}`);
+    throw new ScenarioFailure(`expected exactly one ${type} operation for the scenario key; plan was ${planSummary(plan)}`);
   }
   return operations[0] as Extract<SyncOperation, { type: T }>;
 }
 
 function requireOutcome(outcomes: readonly StepOutcome[], key: string): StepOutcome {
   const outcome = outcomes.find((entry) => entry.key === key);
-  if (!outcome) throw new ScenarioFailure(`no execution outcome was recorded for ${key}`);
+  if (!outcome) throw new ScenarioFailure("no execution outcome was recorded for the scenario key");
   return outcome;
 }
 
@@ -171,14 +172,14 @@ export async function runConvergenceScenarios(context: ConvergenceContext): Prom
   ];
 }
 
-/** Refuses to write over anything that already exists at the test key. */
+/** Refuses to write over anything that already exists at the scratch key. */
 function requireLocalAbsent(context: ConvergenceContext, key: string): void {
-  require(context.vault.getFileByPath(key) === null, `refusing to create ${key}: a local Vault file already exists there`);
+  require(context.vault.getFileByPath(key) === null, `refusing to create a scratch file: a local Vault file already exists at that run-scoped path`);
 }
 
 /** Phase 12: first reconciliation uploads, commits a baseline, and the next plan is a noop. */
 async function convergenceScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
-  const key = context.namespace.key("convergence/test-file.md");
+  const key = context.scratch.key("test-file.md");
   const body = utf8("mineral sync convergence v1");
   requireLocalAbsent(context, key);
   await context.vault.createBinary(key, body);
@@ -191,7 +192,7 @@ async function convergenceScenario(context: ConvergenceContext): Promise<Scenari
   const firstOutcomes = await executePlan(context, first.plan);
   require(requireOutcome(firstOutcomes, key).status === "applied", `first execution was ${outcomeSummary(firstOutcomes)}`);
 
-  const committed = namespacePrevious(await context.state.loadAll(), context.namespace).get(key);
+  const committed = scopedPrevious(await context.state.loadAll(), context.scratch.root).get(key);
   require(committed, "the upload committed no previous-state entry");
   require(committed.remote?.etag, "the committed entry carried no remote ETag");
   require(committed.local?.size === body.byteLength, "the committed local baseline did not match the uploaded content");
@@ -200,6 +201,7 @@ async function convergenceScenario(context: ConvergenceContext): Promise<Scenari
   requireOperation(second.plan, key, "noop");
 
   return [
+    observation("local scratch root", context.scratch.root),
     observation("first plan", planSummary(first.plan)),
     observation("first execution", outcomeSummary(firstOutcomes)),
     observation("previous-state commit", "1 entry"),
@@ -209,7 +211,7 @@ async function convergenceScenario(context: ConvergenceContext): Promise<Scenari
 
 /** Phase 13: a remote change after planning is stale, and the newer remote body survives. */
 async function staleRemoteScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
-  const key = context.namespace.key("convergence/stale-remote.md");
+  const key = context.scratch.key("stale-remote.md");
   requireLocalAbsent(context, key);
   await context.vault.createBinary(key, utf8("stale remote v1"));
 
@@ -217,12 +219,12 @@ async function staleRemoteScenario(context: ConvergenceContext): Promise<Scenari
   requireOperation(first.plan, key, "upload");
   require(requireOutcome(await executePlan(context, first.plan), key).status === "applied", "the establishing upload did not apply");
 
-  const baseline = namespacePrevious(await context.state.loadAll(), context.namespace).get(key);
+  const baseline = scopedPrevious(await context.state.loadAll(), context.scratch.root).get(key);
   const etagA = baseline?.remote?.etag;
   require(etagA, "the establishing upload produced no committed ETag");
 
   const localFile = context.vault.getFileByPath(key);
-  if (!localFile) throw new ScenarioFailure(`local file ${key} disappeared before the local edit`);
+  if (!localFile) throw new ScenarioFailure("the local scratch file disappeared before the local edit");
   await context.vault.modifyBinary(localFile, utf8("stale remote v2 local edit"));
 
   // The plan is taken after the local edit and *before* the external write, so the external
@@ -234,12 +236,11 @@ async function staleRemoteScenario(context: ConvergenceContext): Promise<Scenari
   const etagB = (await context.client.putObject(key, external, { ifMatch: etagA })).etag;
   require(etagB && etagB !== etagA, "the external write did not advance the remote ETag");
 
-  const outcomes = await executePlan(context, { operations: [stale] });
-  const upload = requireOutcome(outcomes, key);
+  const upload = requireOutcome(await executePlan(context, { operations: [stale] }), key);
   require(upload.status === "stale", `the stale upload returned ${upload.status} instead of stale`);
   require(upload.reason === "remote-changed", `the stale upload was classified as ${upload.reason}`);
 
-  const unchanged = namespacePrevious(await context.state.loadAll(), context.namespace).get(key);
+  const unchanged = scopedPrevious(await context.state.loadAll(), context.scratch.root).get(key);
   require(unchanged?.remote?.etag === etagA, "previous state was mutated by a stale remote precondition failure");
   require(sameBytes(await context.client.getObject(key), external), "the stale upload overwrote newer remote content");
 
@@ -253,7 +254,7 @@ async function staleRemoteScenario(context: ConvergenceContext): Promise<Scenari
 
 /** Phase 14: a local change after planning is stale, and the newer local content survives. */
 async function staleLocalScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
-  const key = context.namespace.key("convergence/stale-local.md");
+  const key = context.scratch.key("stale-local.md");
   requireLocalAbsent(context, key);
 
   const remoteBody = utf8("remote-only content v1");
@@ -265,15 +266,14 @@ async function staleLocalScenario(context: ConvergenceContext): Promise<Scenario
   const localBody = utf8("local content created after the plan");
   await context.vault.createBinary(key, localBody);
 
-  const outcomes = await executePlan(context, { operations: [planned] });
-  const download = requireOutcome(outcomes, key);
+  const download = requireOutcome(await executePlan(context, { operations: [planned] }), key);
   require(download.status === "stale", `the stale download returned ${download.status} instead of stale`);
   require(download.reason === "local-changed", `the stale download was classified as ${download.reason}`);
 
   const localFile = context.vault.getFileByPath(key);
-  if (!localFile) throw new ScenarioFailure("the local file vanished during the stale download");
+  if (!localFile) throw new ScenarioFailure("the local scratch file vanished during the stale download");
   require(sameBytes(await context.vault.readBinary(localFile), localBody), "the download overwrote newer local content");
-  require(!namespacePrevious(await context.state.loadAll(), context.namespace).has(key), "previous state was mutated by a stale local precondition failure");
+  require(!scopedPrevious(await context.state.loadAll(), context.scratch.root).has(key), "previous state was mutated by a stale local precondition failure");
 
   return [
     observation("plan", "download into an absent local target"),
@@ -285,7 +285,7 @@ async function staleLocalScenario(context: ConvergenceContext): Promise<Scenario
 
 /** Phase 16: a successful R2 write with a failed state commit is unresolved and not rolled back. */
 async function stateCommitFailureScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
-  const key = context.namespace.key("convergence/state-failure.md");
+  const key = context.scratch.key("state-failure.md");
   const body = utf8("state failure payload v1");
   requireLocalAbsent(context, key);
   await context.vault.createBinary(key, body);
@@ -297,7 +297,7 @@ async function stateCommitFailureScenario(context: ConvergenceContext): Promise<
   require(upload.status === "unresolved", `a failed state commit returned ${upload.status} instead of unresolved`);
   require(upload.reason === "state-commit-failed", `the unresolved upload was classified as ${upload.reason}`);
   require(sameBytes(await context.client.getObject(key), body), "the successful R2 write was rolled back after the state commit failed");
-  require(!namespacePrevious(await context.state.loadAll(), context.namespace).has(key), "a failed state commit still produced a committed baseline");
+  require(!scopedPrevious(await context.state.loadAll(), context.scratch.root).has(key), "a failed state commit still produced a committed baseline");
 
   return [
     observation("execution", `${upload.status}/${upload.reason}`),
@@ -308,7 +308,7 @@ async function stateCommitFailureScenario(context: ConvergenceContext): Promise<
 
 /** Phase 15: a PUT whose outcome is unknown must not commit previous state. */
 async function ambiguousPutScenario(context: ConvergenceContext, client: R2Client): Promise<ScenarioObservation[]> {
-  const key = context.namespace.key("convergence/ambiguous.md");
+  const key = context.scratch.key("ambiguous.md");
   const body = utf8("ambiguous put payload v1");
   requireLocalAbsent(context, key);
   await context.vault.createBinary(key, body);
@@ -318,7 +318,7 @@ async function ambiguousPutScenario(context: ConvergenceContext, client: R2Clien
   const upload = requireOutcome(await executePlan(context, { operations: [planned] }, client), key);
   require(upload.status === "unresolved", `an ambiguous PUT returned ${upload.status} instead of unresolved`);
   require(upload.reason === "ambiguous-put", `the ambiguous PUT was classified as ${upload.reason}`);
-  require(!namespacePrevious(await context.state.loadAll(), context.namespace).has(key), "an ambiguous PUT committed previous state");
+  require(!scopedPrevious(await context.state.loadAll(), context.scratch.root).has(key), "an ambiguous PUT committed previous state");
 
   const landed = await headOrAbsent(context.client, key);
   require(landed, "the injected fault did not actually deliver the PUT to R2");

@@ -47,12 +47,23 @@ It is not a sync feature. It has no production entry point.
 
 ### Hard test-prefix guard
 
-Every key an integration helper touches must match `.mineral-sync-test/<run-id>/`, for example `.mineral-sync-test/20260922T001500Z/`. The guard is enforced by `GuardedIntegrationClient`, the only R2 client the harness may hold, and by `assertIntegrationTestKey`/`assertIntegrationObjectKey`:
+Two invariants are enforced, and they are deliberately separate.
 
-- Callers never pass a Vault path. They mint a leaf through `IntegrationTestNamespace.key(leaf)`.
-- `putObject`, `getObject`, `headObject`, and `listObjects` all reject or filter anything outside the current run root, before any signing or networking happens.
-- `.mineral-sync-test-evil/…`, `.mineral-sync-test/../…`, an absolute path, a missing run id, and a sibling run directory are all refused.
+**Remote (non-negotiable).** Every R2 object key an integration helper can produce must land inside `<configuredPrefix>.mineral-sync-test/<run-id>/`. `GuardedIntegrationClient` is the only R2 client the harness may hold, and it checks the **mapped object key** — what R2 will actually receive — before any signing or networking happens.
+
+**Local.** Every Vault path must live inside a run-scoped scratch root, and callers never hand-build a path: they mint a leaf through `LocalScratch.key(leaf)` or `IntegrationTestNamespace.key(leaf)`.
+
+- `putObject`, `getObject`, `headObject`, and `listObjects` all reject or filter anything outside the scratch root.
+- `.mineral-sync-test-evil/…`, `.mineral-sync-test/../…`, an absolute path, a missing run id, a sibling run directory, and a sibling run prefix are all refused.
 - Nothing is deleted. Each run leaves its objects under its own run prefix, which the report prints for manual cleanup.
+
+### Local scratch root resolution
+
+`Vault.createBinary` does not create missing parent folders — a real run on 2026-09-21T17:10Z failed with `ENOENT … .mineral-sync-test/<run>/convergence/test-file.md` before writing a single byte. Obsidian may also refuse to create a dot-directory.
+
+So the harness now creates the folder chain explicitly (never relying on `createBinary`), then **probes** the preferred hidden root end-to-end with the exact Vault calls the scenarios use (`createBinary`, `getFileByPath`, `getFiles`, `readBinary`, `adapter.stat`, `modifyBinary`). Only if that probe fails does it fall back to a run-scoped visible root under `private/`. Either way the R2 invariant holds: for the fallback the convergence client's remote prefix already ends in `.mineral-sync-test/<run-id>/`, so object keys still land inside the test root. The report names the chosen root and prints the whole probe trail.
+
+The capability probe writes one file under `<run-base>/local-probe/`, outside the scenario root, so it can never enter a sync plan.
 
 ### In-Obsidian self-test (the only real `requestUrl` evidence)
 
