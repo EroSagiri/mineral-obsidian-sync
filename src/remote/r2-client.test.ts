@@ -28,3 +28,28 @@ describe("SignedR2ListClient.getObject", () => {
     await expect(client().getObject("a.bin", { ifMatch: "old" })).rejects.toMatchObject({ name: "RemoteHttpError", status: 403, operation: "GetObject" });
   });
 });
+
+describe("SignedR2ListClient.putObject", () => {
+  it("records the baseline from the PUT response itself, with no confirmation HEAD", async () => {
+    const methods: string[] = [];
+    setRequestUrlHandler(async (request) => {
+      methods.push((request.method ?? "GET").toUpperCase());
+      return { status: 200, headers: { etag: '"etag-b"' }, text: "", arrayBuffer: new ArrayBuffer(0), json: {} };
+    });
+
+    const body = new Uint8Array([1, 2, 3]).buffer;
+    await expect(client().putObject("folder/a.bin", body, { ifNoneMatch: "*" })).resolves.toEqual({ size: 3, etag: "etag-b" });
+    expect(methods).toEqual(["PUT"]);
+  });
+
+  it("treats a 2xx without an ETag as unresolvable instead of repairing it with a HEAD", async () => {
+    const methods: string[] = [];
+    setRequestUrlHandler(async (request) => {
+      methods.push((request.method ?? "GET").toUpperCase());
+      return { status: 200, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} };
+    });
+
+    await expect(client().putObject("folder/a.bin", new Uint8Array([1]).buffer, { ifMatch: "etag-a" })).rejects.toThrow("returned no ETag");
+    expect(methods).toEqual(["PUT"]);
+  });
+});

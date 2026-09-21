@@ -3,14 +3,15 @@ import { SettingsCredentialProvider } from "./credentials";
 import { Aws4FetchSigner, type RequestSigner } from "./signer";
 import { RequestUrlTransport, type HttpTransport } from "./transport";
 import { normalizePrefix, remoteObjectKey, vaultKeyFromRemote } from "../sync/path";
-import type { RemoteEntry, RemoteIdentity } from "../sync/types";
+import type { RemoteEntry, RemoteIdentity, RemoteVersion } from "../sync/types";
 
 export interface R2Configuration { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; remotePrefix: string; }
 export interface R2Client {
   listObjects(): Promise<RemoteEntry[]>;
+  /** Used for capability probing and diagnostics; the execution path never issues a HEAD. */
   headObject(key: string, options?: { ifMatch?: string }): Promise<RemoteEntry>;
   getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
-  putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteEntry>;
+  putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion>;
 }
 export { RemoteHttpError, RemoteObjectChangedError } from "./errors";
 
@@ -58,9 +59,25 @@ export class SignedR2ListClient implements R2Client {
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
   async getObject(key: string, options: { ifMatch?: string } = {}): Promise<ArrayBuffer> { const response = await this.send("GET", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("GetObject", response.status); return response.arrayBuffer; }
-  async putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteEntry> {
+  /**
+   * Conditional write, recorded **from its own response**.
+   *
+   * A 2xx with an ETag settles the fact this layer is responsible for: the bytes we sent are now the
+   * remote version identified by that ETag. No follow-up HEAD is issued — it would not make the
+   * write more atomic, it would add a second race window (another writer advancing the object
+   * between our PUT and our confirmation), and it would turn a *successful* write into an
+   * `unresolved` one. Any later change to the object is exactly what the next reconciliation's
+   * three-way comparison is for.
+   *
+   * `lastModified` is intentionally not invented: `PutObject` does not return a server timestamp.
+   */
+  async putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion> {
     const headers: Record<string, string> = { "content-type": "application/octet-stream" }; if (options.ifMatch) headers["if-match"] = `"${options.ifMatch}"`; if (options.ifNoneMatch) headers["if-none-match"] = options.ifNoneMatch;
     const response = await this.send("PUT", this.objectUrl(key), headers, body); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("PutObject", response.status);
-    const etag = header(response.headers, "etag")?.replace(/^"|"$/g, ""); if (!etag) throw new Error("R2 PutObject response lacked ETag; outcome requires rescan"); return this.headObject(key, { ifMatch: etag });
+    const etag = header(response.headers, "etag")?.replace(/^"|"$/g, "");
+    // R2 returns the object's ETag on PutObject. Without it the write landed but cannot be recorded,
+    // so the outcome stays unknown: never repair this with a HEAD.
+    if (!etag) throw new Error("R2 PutObject returned no ETag; the baseline cannot be recorded from this response");
+    return { size: body.byteLength, etag };
   }
 }

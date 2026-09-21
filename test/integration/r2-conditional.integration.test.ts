@@ -119,35 +119,33 @@ describe("R2 conditional transport: real signer + real RequestUrlTransport over 
     expect(statuses(results)).toEqual(transportScenarioNames().map((name) => `${name}:pass`));
   });
 
-  it("attributes a fully broken HEAD without blaming the write", async () => {
-    // Reproduces a platform where every HEAD dies: the write itself still lands, and the matrix
-    // must attribute that correctly instead of blaming PUT.
+  it("is independent of HEAD: writes and reads survive a completely broken HEAD", async () => {
+    // The strongest form of the Android finding: with every HEAD failing, the only things that
+    // break are the two HEAD probes. Nothing in the execution path (LIST / PUT / GET) needs HEAD.
     const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHead: true });
     const results = await runTransportScenarios({ namespace, client });
     const matrix = find(results, "transport-primitives");
     const probe = (name: string): string => String(matrix.observations.find((entry) => entry.name === name)?.value);
 
-    expect(matrix.status).toBe("fail");
-    expect(matrix.detail).toContain("primitive probes failed");
-    expect(probe("LIST")).toContain("ok");
     expect(probe("HEAD")).toContain("FAILED");
     expect(probe("HEAD If-Match (matching)")).toContain("FAILED");
-    // The product's putObject confirms with a HEAD, so even a successful write reports failure…
-    expect(probe("PUT If-None-Match:* small")).toContain("FAILED");
-    expect(probe("PUT If-Match (update)")).toContain("FAILED");
-    // …but LIST is a plain GET, and it proves both writes landed.
-    const v1Size = new TextEncoder().encode("primitive probe v1").byteLength;
-    const v2Size = new TextEncoder().encode("primitive probe v2 updated").byteLength;
-    expect(probe("LIST after small PUT")).toContain(`present size=${v1Size}`);
-    expect(probe("LIST after 64 KiB PUT")).toContain("present size=65536");
-    expect(probe("LIST after update")).toContain(`present size=${v2Size}`);
-    // Body-carrying and conditional reads are unaffected by the broken HEAD.
+    expect(probe("HEAD absent → http-404")).toContain("FAILED");
+    expect(probe("HEAD If-Match (stale) → precondition")).toContain("FAILED");
+
+    expect(probe("PUT If-None-Match:* small")).toContain("ok etag=");
+    expect(probe("PUT If-None-Match:* 64 KiB")).toContain("ok etag=");
+    expect(probe("PUT If-Match (update)")).toContain("ok etag=");
     expect(probe("GET")).toContain("ok");
     expect(probe("GET 64 KiB")).toContain("ok");
     expect(probe("GET If-Match (matching)")).toContain("ok");
-    // The guard needs no HEAD, which is why it passed on the real Android device.
-    expect(find(results, "test-prefix-guard").status).toBe("pass");
-    expect(find(results, "conditional-create").detail).toContain("Stream closed");
+    // The writes really landed, and a rejected conditional write left the object untouched.
+    expect(probe("LIST after small PUT")).toContain("present size=18");
+    expect(probe("LIST after 64 KiB PUT")).toContain("present size=65536");
+    expect(probe("LIST after update")).toContain("present size=26");
+    expect(probe("LIST after rejected create")).toContain("present size=26");
+
+    // Exactly the two HEAD-specific checks fail; every scenario the product's paths rely on passes.
+    expect(statuses(results).filter((entry) => entry.endsWith(":fail"))).toEqual(["transport-primitives:fail", "conditional-head:fail"]);
   });
 
   it("fails the create scenario when the endpoint ignores If-None-Match", async () => {

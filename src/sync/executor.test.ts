@@ -44,7 +44,8 @@ function state(fails = false): StateStore & { entries: PreviousEntry[] } {
   return { entries, loadAll: async () => new Map(), saveAll: async () => {}, saveVerified: async () => {}, put: async (entry) => { if (fails) throw new Error("IDB unavailable"); entries.push(entry); } };
 }
 function remote(overrides: Partial<R2Client> = {}): R2Client {
-  return { listObjects: async () => [], headObject: async () => ({ key: "", size: 0, lastModified: 0 }), getObject: async () => bytes([7, 8]), putObject: async (key) => ({ key, size: 3, etag: "new", lastModified: 22 }), ...overrides };
+  // Mirrors the real client: a write response yields only the size we sent and the server ETag.
+  return { listObjects: async () => [], headObject: async () => ({ key: "", size: 0, lastModified: 0 }), getObject: async () => bytes([7, 8]), putObject: async () => ({ size: 3, etag: "new" }), ...overrides };
 }
 const upload = (): Extract<SyncOperation, { type: "upload" }> => ({ type: "upload", key: "a.bin", reason: "test", expectedLocal: { key: "a.bin", size: 3, mtime: 10 }, expectedRemote: { kind: "absent" } });
 const download = (): Extract<SyncOperation, { type: "download" }> => ({ type: "download", key: "a.bin", reason: "test", expectedLocal: { kind: "absent" }, expectedRemote: { key: "a.bin", size: 2, etag: "old", lastModified: 1 } });
@@ -84,6 +85,19 @@ describe("SafeExecutor", () => {
     const failing = remote({ putObject: async () => { throw new RemoteHttpError("PutObject", 503); } });
     await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, failing, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "unresolved", key: "a.bin", reason: "ambiguous-put" });
     expect(saved.entries).toHaveLength(0);
+  });
+  it("reports a 2xx write that carries no ETag as unresolved, without committing a baseline", async () => {
+    const saved = state();
+    const failing = remote({ putObject: async () => { throw new Error("R2 PutObject returned no ETag"); } });
+    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, failing, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "unresolved", key: "a.bin", reason: "ambiguous-put" });
+    expect(saved.entries).toHaveLength(0);
+  });
+  it("commits only what the write response established, without inventing a server timestamp", async () => {
+    const saved = state();
+    const result = await new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, remote(), saved, identity, "[]").execute(upload());
+    expect(result).toEqual({ status: "applied", key: "a.bin" });
+    expect(saved.entries[0]!.remote).toEqual({ size: 3, etag: "new" });
+    expect(saved.entries[0]!.remote!.lastModified).toBeUndefined();
   });
   it("hard-blocks both deletion operations", async () => {
     const executor = new SafeExecutor(vault({}) as never, remote(), state(), identity, "[]");

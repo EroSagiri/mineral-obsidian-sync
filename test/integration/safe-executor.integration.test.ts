@@ -62,6 +62,7 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
       `${scratch.root}existing/parent/kept.md`,
       `${scratch.root}multi/level/deep/foo.md`,
       `${scratch.root}one-level/foo.md`,
+      `${scratch.root}remote-advanced.md`,
       `${scratch.root}root-file.md`,
       `${scratch.root}stale-remote.md`,
       `${scratch.root}test-file.md`,
@@ -70,11 +71,16 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     // Every remote object stays inside the run prefix, and every local file inside the run base
     // (the capability probe lives outside the scenario root so it can never enter a plan).
     const base = scratch.root.slice(0, -"convergence/".length);
-    expect(fake.objects.size).toBe(10);
+    expect(fake.objects.size).toBe(11);
     expect([...fake.objects.keys()].every((key) => key.startsWith(`sync/.mineral-sync-test/20260922T001500Z/`))).toBe(true);
     expect([...vault.files.keys()].every((key) => key.startsWith(base))).toBe(true);
     expect([...vault.files.keys()].some((key) => key === `${base}local-probe/probe.bin`)).toBe(true);
-    expect(scanLocalNamespace(vault as unknown as Vault, scratch.root).size).toBe(10);
+    expect(scanLocalNamespace(vault as unknown as Vault, scratch.root).size).toBe(11);
+
+    // The execution path never issues a HEAD: remote state comes from LIST, writes are recorded
+    // from their own PUT response, and reads are conditional GETs. This is why the Android
+    // limitation on non-2xx HEAD responses cannot affect the product.
+    expect(fake.requests.filter((request) => (request.method ?? "GET").toUpperCase() === "HEAD")).toEqual([]);
   });
 
   it("records the stale, unresolved and blocked outcomes it observed", async () => {
@@ -106,7 +112,7 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(vault.files.size).toBeGreaterThan(0);
     const base = scratch.root.slice(0, -"convergence/".length);
     expect([...vault.files.keys()].every((key) => key.startsWith(base))).toBe(true);
-    expect(fake.objects.size).toBe(10);
+    expect(fake.objects.size).toBe(11);
     expect([...fake.objects.keys()].every((key) => key.startsWith("sync/.mineral-sync-test/20260922T001500Z/"))).toBe(true);
   });
 

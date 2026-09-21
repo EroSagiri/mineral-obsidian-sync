@@ -166,7 +166,7 @@ class FailingStateStore implements StateStore {
 }
 
 export function convergenceScenarioNames(): string[] {
-  return ["safe-executor-convergence", "download-applied", "download-blocked-by-file-parent", "stale-remote-preserved", "stale-local-preserved", "state-commit-failure", "ambiguous-put"];
+  return ["safe-executor-convergence", "download-applied", "download-blocked-by-file-parent", "stale-remote-preserved", "remote-advanced-after-write", "stale-local-preserved", "state-commit-failure", "ambiguous-put"];
 }
 
 export async function runConvergenceScenarios(context: ConvergenceContext): Promise<ScenarioResult[]> {
@@ -176,6 +176,7 @@ export async function runConvergenceScenarios(context: ConvergenceContext): Prom
     await runScenario("download-applied", () => downloadAppliedScenario(context)),
     await runScenario("download-blocked-by-file-parent", () => downloadParentFileScenario(context)),
     await runScenario("stale-remote-preserved", () => staleRemoteScenario(context)),
+    await runScenario("remote-advanced-after-write", () => remoteAdvancedScenario(context)),
     await runScenario("stale-local-preserved", () => staleLocalScenario(context)),
     await runScenario("state-commit-failure", () => stateCommitFailureScenario(context)),
     ambiguous ? await runScenario("ambiguous-put", () => ambiguousPutScenario(context, ambiguous)) : skipScenario("ambiguous-put", "no fault-injected client was supplied"),
@@ -342,6 +343,53 @@ async function staleRemoteScenario(context: ConvergenceContext): Promise<Scenari
     observation("execution", `${upload.status}/${upload.reason}`),
     observation("previous state mutated", false),
     observation("newer remote body preserved", true),
+  ];
+}
+
+/**
+ * Phase 13c: a baseline recorded from a PUT stays valid when the remote advances afterwards.
+ *
+ * This is the scenario that justifies dropping the post-PUT confirmation HEAD. The baseline records
+ * "local L became remote B" — a fact settled the moment the PUT returned. If another device then
+ * moves the object to C, that is *not* a failure of our write, and the three-way planner must
+ * express it as an ordinary remote-only change.
+ */
+async function remoteAdvancedScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
+  const key = context.scratch.key("remote-advanced.md");
+  requireLocalAbsent(context, key);
+  await context.vault.createBinary(key, utf8("remote advanced v1"));
+
+  const planned = requireOperation((await observe(context, [key])).plan, key, "upload");
+  const applied = requireOutcome(await executePlan(context, { operations: [planned] }), key);
+  require(applied.status === "applied", `the establishing upload returned ${applied.status}`);
+
+  const committed = scopedPrevious(await context.state.loadAll(), context.scratch.root).get(key)?.remote;
+  require(committed, "the upload committed no remote baseline");
+  const etagB = committed.etag;
+  require(etagB, "the committed baseline carries no ETag");
+  // The ETag comes from the PUT response; the server timestamp is knowingly unknown, not invented.
+  require(committed.lastModified === undefined, "the committed baseline fabricated a server timestamp");
+
+  const advanced = utf8("remote advanced v2 from another device");
+  const etagC = (await context.client.putObject(key, advanced, { ifMatch: etagB })).etag;
+  require(etagC && etagC !== etagB, "the external write did not advance the ETag");
+
+  // The next reconcile must see a remote-only change, not a stuck or confused state.
+  const followUp = requireOperation((await observe(context, [key])).plan, key, "download");
+  require(followUp.expectedRemote.etag === etagC, `the plan expected ${followUp.expectedRemote.etag} instead of the observed ${etagC}`);
+  require(requireOutcome(await executePlan(context, { operations: [followUp] }), key).status === "applied", "the follow-up download did not apply");
+
+  const file = context.vault.getFileByPath(key);
+  if (!file) throw new ScenarioFailure("the follow-up download created no local file");
+  require(sameBytes(await context.vault.readBinary(file), advanced), "the follow-up download did not converge to the newer remote content");
+  requireOperation((await observe(context, [key])).plan, key, "noop");
+
+  return [
+    observation("baseline ETag source", "the PUT response (no confirmation HEAD)"),
+    observation("committed lastModified", "unknown — not fabricated"),
+    observation("external advance", `${etagB.slice(0, 8)}… → ${etagC.slice(0, 8)}…`),
+    observation("next plan", "download (remote-only change)"),
+    observation("converged", "noop"),
   ];
 }
 

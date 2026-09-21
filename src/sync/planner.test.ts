@@ -8,6 +8,31 @@ const remote = (key = "note.md", size = 10, etag: string | undefined = "etag-a",
 const previous = (key = "note.md", size = 10, mtime = 100, etag: string | undefined = "etag-a", lastModified = 1000): PreviousEntry => ({ key, local: { size, mtime }, remote: { size, etag, lastModified }, syncedAt: 1 });
 const plan = (l?: LocalEntry, r?: RemoteEntry, p?: PreviousEntry): SyncOperation | undefined => buildSyncPlan(new Map(l ? [[l.key, l]] : []), new Map(r ? [[r.key, r]] : []), new Map(p ? [[p.key, p]] : [])).operations[0];
 
+describe("buildSyncPlan with a baseline recorded from a write", () => {
+  const baseline = (etag: string | undefined, lastModified: number | undefined): PreviousEntry => ({ key: "note.md", local: { size: 10, mtime: 100 }, remote: { size: 10, etag, lastModified }, syncedAt: 1 });
+  /** The shared `remote()` helper cannot express "no ETag": passing undefined there triggers its default. */
+  const scanned = (etag: string | undefined, lastModified: number): RemoteEntry => ({ key: "note.md", size: 10, etag, lastModified });
+
+  it("prefers the ETag when the baseline carries no server timestamp", () => {
+    // Recorded from a PUT: ETag known, lastModified unknown. The scan's real timestamp must not be
+    // mistaken for a change.
+    expect(plan(local(), scanned("etag-a", 999_999), baseline("etag-a", undefined))?.type).toBe("noop");
+    expect(plan(local(), scanned("etag-b", 1000), baseline("etag-a", undefined))?.type).toBe("download");
+  });
+
+  it("treats a baseline with neither ETag nor timestamp as changed rather than as unchanged", () => {
+    // Without any identifier the safe direction is "changed": it can cost a redundant download or a
+    // conflict report, but it can never hide a real remote change.
+    expect(plan(local(), scanned(undefined, 1000), baseline(undefined, undefined))?.type).toBe("download");
+    expect(plan(local(), scanned(undefined, 1000), baseline(undefined, 1000))?.type).toBe("noop");
+  });
+
+  it("falls back to the server timestamp only when both sides lack an ETag", () => {
+    expect(plan(local(), scanned(undefined, 2000), baseline(undefined, 1000))?.type).toBe("download");
+    expect(plan(local(), scanned(undefined, 1000), baseline(undefined, 1000))?.type).toBe("noop");
+  });
+});
+
 describe("buildSyncPlan decision matrix", () => {
   it.each([
     ["new local", local(), undefined, undefined, "upload"],

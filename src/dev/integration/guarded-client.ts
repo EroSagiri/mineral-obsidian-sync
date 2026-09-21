@@ -1,6 +1,6 @@
 import type { R2Client } from "../../remote/r2-client";
 import { remoteObjectKey } from "../../sync/path";
-import type { RemoteEntry } from "../../sync/types";
+import type { RemoteEntry, RemoteVersion } from "../../sync/types";
 import { IntegrationTestEscapeError, assertIntegrationLocalKey, assertIntegrationObjectKey } from "./test-namespace";
 
 export { IntegrationTestEscapeError };
@@ -53,7 +53,7 @@ export class GuardedIntegrationClient implements R2Client {
     return this.inner.getObject(this.guard(key), options);
   }
 
-  async putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteEntry> {
+  async putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion> {
     return this.inner.putObject(this.guard(key), body, options);
   }
 }

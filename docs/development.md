@@ -16,6 +16,43 @@
 
 ---
 
+## 执行语义（SafeExecutor）
+
+`SafeExecutor` 一次只执行一个操作，每成功一个操作只提交该 key 的历史状态。
+
+```text
+upload
+  planner 依据 LIST 结果给出前置条件
+  ├ 远端不存在 → PUT If-None-Match: *
+  └ 远端存在   → PUT If-Match: <观测到的 ETag>
+  412                        → stale（绝不覆盖）
+  收到的 4xx                  → failed（明确的否定答案）
+  5xx / 429 / 没有收到响应     → unresolved（不提交 state）
+  2xx + ETag                 → 从【该响应本身】记录 baseline：etag + 写出的字节数
+  2xx 但没有 ETag             → unresolved（不提交 state，也不用 HEAD 去补）
+
+download
+  复查本地前置条件
+  → GET If-Match: <观测到的 ETag>
+     ├ 412        → stale（且不返回正文）
+     └ 其他失败    → failed（不提交 state）
+  → 再复查本地前置条件
+  → 目标已存在   → modifyBinary
+  → 目标不存在   → ensureParentFolders
+                  （逐级创建、绝不回滚；父路径被文件占用 → parent-path-is-file；
+                    目标被文件夹占用 → target-path-is-folder）
+  → 再次复查本地前置条件（创建目录放宽了 race 窗口）
+  → createBinary
+  → adapter.stat → 提交 baseline
+
+blocked
+  delete-local / delete-remote   → 永远不会执行
+```
+
+本地副作用刻意推到尽可能晚：下载失败时**不会**创建任何目录。
+
+`PreviousEntry` 只表示"本客户端最后一次成功同步过的 local/remote 版本对"，不表示"提交那一纳秒远端绝对仍是该版本"。提交之后远端若被其他设备推进，由下一轮三方 planner 表达为 remote-only change —— 这也是 `remote-advanced-after-write` 场景所验证的。
+
 ## 代码结构
 
 ```text
@@ -457,17 +494,44 @@ Phase 3A（自动调度器）开工前的两项前置条件均已满足：
 1. ~~收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。~~ 已于 2026-09-21T17:30:31Z（桌面）与 18:01:52Z（Android）满足。
 2. ~~移动端验证。~~ Android 传输 9/9 + 收敛 8/8 均已通过；iOS 从未运行，属于已知未覆盖面。
 
-Phase 3A 的已知前置技术项（不是阻塞项，但应在实现中一并处理）：
+Phase 3A 的已知前置技术项：
 
 ```text
-a. putObject 的确认 HEAD：目前 PUT 成功后再发一次条件 HEAD 取 canonical 元数据。
-   Android 上若该 HEAD 返回非 2xx（仅在其他写者抢改的窄窗口内可能），会变成 opaque →
-   unresolved（安全但不收敛）。可选做法是让 baseline 直接取自 PUT 响应的 ETag + 已知
-   body 长度，从而两平台完全一致且每次上传少一次往返；代价是 lastModified 只能用本地时钟
-   （两侧都有 ETag 时 remoteChanged() 不看它，故实际无害）。
+a. ~~putObject 的确认 HEAD~~ 已移除（2026-09-21）。baseline 直接取自 PUT 响应。
 b. 模糊结果的自愈：ambiguous PUT / state 提交失败后，下一轮可以通过"远端内容与本地一致"
    的哈希比对重新收敛 baseline。该能力已在 buildBootstrapResult 中存在，目前只接在
    Inspect 路径上，尚未接入执行后的重规划。
+```
+
+### baseline 的 schema 与"执行路径不发 HEAD"
+
+移除 post-PUT 确认 HEAD 之后，写入路径记录的远端版本用了一个比"扫描观测"更窄的类型：
+
+```text
+RemoteEntry    （扫描观测）  key / size / etag? / lastModified      每条都是服务器给出的事实
+RemoteVersion  （写入响应）  size / etag? / lastModified?           lastModified 通常【不存在】
+```
+
+理由：`PutObject` 的响应里没有服务器时间戳。用 `Date.now()` 填进去，等于把一个"已知的未知"
+替换成一个谎言；而下一轮 `ListObjectsV2` 会给出真值。`remoteChanged()` 在任一侧有 ETag 时
+只看 ETag，因此这个缺口不影响判定；若两侧都没有 ETag 且 baseline 无时间戳，则保守判定为
+"已变化"——代价是多一次下载或一次 conflict 报告，绝不会漏掉真实的远端变化。
+
+为什么移除确认 HEAD 不降低安全性：PUT 返回 2xx + ETag 的那一刻，"本地 L 已成为远端 B"就是
+确定事实。确认 HEAD 只回答"B 现在还在吗"，它不增加原子性，却新增一个 race window，并把
+"我们的写成功了"与"远端之后又变了"两件不同的事混成一个 `unresolved`。后者属于下一次
+reconciliation 的职责。
+
+移除之后的实测性质（有测试断言，不是推断）：
+
+```text
+1. 收敛自检整轮的请求里 HEAD 数量为 0
+   → executor 的远端状态来自 LIST、写入取自 PUT 响应、读取用条件 GET
+   → 因此 Android 上"非 2xx HEAD 被平台丢弃"这条限制【不可能】影响产品
+2. 把所有 HEAD 变成失败后，唯一报错的是两项 HEAD 探测本身，其余场景全过
+3. 新增收敛场景 remote-advanced-after-write：
+   上传提交 baseline(B) → 外部写者把远端推进到 C → 下一轮计划为 download(C)
+   → 应用后本地收敛到 C → 再一轮 noop
 ```
 
 Phase 3A 本身仍受以下约束：删除保持 BLOCKED；不实现 Gateway、临时凭据端点、队列、Cloudflare Worker、Durable Object、WebSocket。
