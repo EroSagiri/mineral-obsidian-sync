@@ -16,9 +16,9 @@
 ## 现在还不能做什么
 
 - 没有手动同步、没有 push / pull 按钮。
-- 没有自动同步：不监听 Vault 文件变化、不轮询、没有调度器、没有 WebSocket。
+- 自动同步：相关 Vault 文件事件会经过全局 trailing debounce，随后完整扫描本地、远端与基线；planner 决策后由条件执行器顺序上传或下载。
 - **不会删除任何东西** —— 本地不删、远端也不删。`delete-local` 与 `delete-remote` 在代码里被硬阻断。
-- 上传与下载的执行器已经实现（含条件写、stale 保护、状态提交），但**目前没有任何对外入口**，所以它不会被触发。真实环境验证状态见 [`docs/development.md`](docs/development.md)。
+- 自动同步不轮询，也不会按事件直接上传或下载；事件只表示状态可能已变化。重命名会上传新路径，但旧远端对象会作为已阻断的删除候选保留。真实环境验证状态见 [`docs/development.md`](docs/development.md)。
 
 ## 安装
 
@@ -37,7 +37,7 @@ npm run build          # 产出 main.js
 
 最后在 Obsidian 里：**设置 → 第三方插件 → 启用 “Mineral Obsidian Sync”**。
 
-最低 Obsidian 版本 1.5.0。桌面端与移动端共用同一套传输实现，移动端尚未经过实机验证。
+最低 Obsidian 版本 1.5.0。桌面端与移动端共用同一套传输实现；自动调度仍需分别进行真实设备验证。
 
 ## 设置
 
@@ -52,7 +52,7 @@ npm run build          # 产出 main.js
 
 内置排除项（无需手写）：`.obsidian/plugins/mineral-obsidian-sync/`、名为 `.ds_store` / `thumbs.db` 的文件、以 `~` 结尾的文件、以 `.tmp` 结尾的文件。
 
-关于 R2 token 权限：如果你只想用当前的检查功能，**只读权限就够了**（List + Get）。只有将来真正启用写入时，才需要给该 bucket 的 Object 写权限。建议使用权限范围尽量窄的 token。
+关于 R2 token 权限：自动同步需要该 bucket 的 Object 读写权限（List + Get + 条件 Put）；插件仍不会请求或执行删除权限。建议使用权限范围尽量窄的 token。
 
 > 调试日志开关（`debugLogging`）目前没有在设置界面提供，需要手动在插件的 `data.json` 里加 `"debugLogging": true`。
 
@@ -70,6 +70,7 @@ npm run build          # 产出 main.js
 - Vault 侧不删除文件。写入只会发生在被证明可行的下载路径上，并且会先创建缺失的父目录。
 - IndexedDB 只写入"已证明一致"或"已证明完成传输"的 key，不会写入推测性的状态。
 - 状态栏只做被动显示，永远不会触发同步。
+- 自动调度在后台时不会发起新周期；恢复可见后会执行一次完整 reconciliation。认证失败（401/403）会暂停自动网络请求，直到配置变更或插件重新加载。
 
 ## 数据落在哪里
 
@@ -99,7 +100,7 @@ token 权限不足，或只给了错误 bucket 的权限。
 列取会整体失败。这是刻意的 fail-closed 行为：无法映射成合法 Vault 路径的 key 会被拒绝，而不是被静默跳过。需要先在 bucket 里清理掉这类对象。
 
 **移动端**
-传输层与桌面端是同一份实现，但目前**尚未在 Android 真机上验证**。桌面端已在真实 R2 上验证通过，具体验证范围见 [`docs/development.md`](docs/development.md)。
+传输层与桌面端是同一份实现，Android 的传输与执行器路径已在真机验证；自动调度仍需真机验证。具体验证范围见 [`docs/development.md`](docs/development.md)。
 
 ## 更多文档
 

@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TFolder } from "obsidian";
 import { scanLocal } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
@@ -9,12 +9,17 @@ import { buildBootstrapResult } from "./bootstrap/bootstrap";
 import { DryRunModal } from "./ui/dry-run-modal";
 import { createVaultPathFilter, ignorePolicyFingerprint } from "./sync/ignore";
 import { registerDevelopmentSelfTests } from "./dev/self-test-command";
+import { SafeExecutor } from "./sync/executor";
+import { buildSyncPlan } from "./sync/planner";
+import { SyncScheduler } from "./scheduler/scheduler";
+import type { ResultCounts, SchedulerState } from "./scheduler/types";
 
 export default class R2PersonalSyncPlugin extends Plugin {
   settings: R2SyncSettings = { ...DEFAULT_SETTINGS };
   private readonly stateStore = new IndexedDbStateStore();
   private activeAnalysis?: AbortController;
   private statusBar?: HTMLElement;
+  private scheduler?: SyncScheduler;
 
   async onload(): Promise<void> {
     const persisted = (await this.loadData() ?? {}) as Partial<R2SyncSettings> & { ignoredFolders?: unknown; ignoredFiles?: unknown };
@@ -43,14 +48,57 @@ export default class R2PersonalSyncPlugin extends Plugin {
     }
     this.statusBar = this.addStatusBarItem();
     this.setStatus("✓ idle");
+    this.scheduler = new SyncScheduler({
+      visible: () => typeof document === "undefined" || document.visibilityState !== "hidden",
+      captureCycle: () => this.captureSchedulerCycle(),
+      onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
+      debug: (message) => this.debug(message),
+    });
+    this.app.workspace.onLayoutReady(() => {
+      this.registerVaultListeners();
+      this.registerDomEvent(document, "visibilitychange", () => this.scheduler?.visibilityChanged(document.visibilityState !== "hidden"));
+      this.scheduler?.requestReconcile("startup");
+    });
   }
 
-  onunload(): void { this.activeAnalysis?.abort(); }
+  onunload(): void { this.activeAnalysis?.abort(); this.scheduler?.stop(); }
 
-  async saveSettings(): Promise<void> { await this.saveData(this.settings); }
+  async saveSettings(): Promise<void> { await this.saveData(this.settings); this.scheduler?.configChanged(); }
   private client(): SignedR2ListClient { return new SignedR2ListClient(this.settings); }
   private debug(message: string): void { if (this.settings.debugLogging) console.debug(`[Mineral Obsidian Sync] ${message}`); }
   private setStatus(text: string): void { this.statusBar?.setText(`Mineral Sync ${text}`); }
+  private setSchedulerStatus(state: SchedulerState, counts: ResultCounts): void {
+    if (state === "running") return this.setStatus("… syncing");
+    if (state === "debouncing" || state === "rerun-pending") return this.setStatus("… pending");
+    if (state === "blocked-by-auth") return this.setStatus("○ auth blocked");
+    if (counts.conflict) return this.setStatus(`! conflicts (${counts.conflict})`);
+    if (counts.unresolved || counts.failed) return this.setStatus("○ offline/error");
+    this.setStatus("✓ idle");
+  }
+  private registerVaultListeners(): void {
+    const mark = (path: string) => this.scheduler?.markLocalPaths([path], (key) => createVaultPathFilter(this.settings).ignores(key));
+    this.registerEvent(this.app.vault.on("create", (file) => { if (!(file instanceof TFolder)) mark(file.path); }));
+    this.registerEvent(this.app.vault.on("modify", (file) => { if (!(file instanceof TFolder)) mark(file.path); }));
+    // A deleted folder cannot be reliably distinguished after removal; treating it as dirty is the safe side.
+    this.registerEvent(this.app.vault.on("delete", (file) => mark(file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => { if (!(file instanceof TFolder)) this.scheduler?.markLocalPaths([oldPath, file.path], (key) => createVaultPathFilter(this.settings).ignores(key)); }));
+  }
+  private captureSchedulerCycle() {
+    const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
+    const filter = createVaultPathFilter(settings);
+    const ignorePolicy = ignorePolicyFingerprint(settings);
+    const identity = remoteIdentity(settings);
+    const client = new SignedR2ListClient(settings);
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy);
+    return {
+      scanLocal: () => scanLocal(this.app.vault, filter),
+      scanRemote: () => scanRemote(client, filter),
+      loadPrevious: () => this.stateStore.loadAll(),
+      filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
+      buildPlan: buildSyncPlan,
+      execute: (operation: Parameters<SafeExecutor["execute"]>[0]) => executor.execute(operation),
+    };
+  }
   private safeConnectionDiagnostic(error: unknown): string {
     if (!(error instanceof Error) || !error.message) return "unknown error";
     return error.message
@@ -98,6 +146,6 @@ export default class R2PersonalSyncPlugin extends Plugin {
       console.error("[Mineral Obsidian Sync] sync inspection failed", error instanceof Error ? error.message : "unknown error");
       this.setStatus("○ offline/error");
       new Notice("Sync inspection failed. Check settings, network, and R2 access.");
-    } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; }
+    } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; this.scheduler?.refreshStatus(); }
   }
 }

@@ -14,7 +14,7 @@ export type OperationResult =
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" }
   | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" }
   /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
-  | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure }
+  | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure; httpStatus?: number }
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
   | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed" };
 
@@ -27,7 +27,7 @@ export type OperationResult =
 function uploadFailure(operation: string, key: string, error: unknown): OperationResult {
   if (error instanceof RemoteObjectChangedError) return { status: "stale", key, reason: "remote-changed" };
   if (error instanceof RemoteHttpError) {
-    if (error.status < 500 && error.status !== 429) return { status: "failed", key, error: `R2 ${operation} failed with HTTP ${error.status}` };
+    if (error.status < 500 && error.status !== 429) return { status: "failed", key, error: `R2 ${operation} failed with HTTP ${error.status}`, httpStatus: error.status };
     return { status: "unresolved", key, reason: "ambiguous-put" };
   }
   // No response was received, so the write may or may not have landed. The same applies to any
@@ -73,7 +73,12 @@ export class SafeExecutor {
     if (!operation.expectedRemote.etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
     let bytes: ArrayBuffer;
-    try { bytes = await this.r2.getObject(operation.key, { ifMatch: operation.expectedRemote.etag }); } catch (error) { return error instanceof RemoteObjectChangedError ? { status: "stale", key: operation.key, reason: "remote-changed" } : { status: "failed", key: operation.key, error: message(error) }; }
+    try { bytes = await this.r2.getObject(operation.key, { ifMatch: operation.expectedRemote.etag }); } catch (error) {
+      if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
+      return error instanceof RemoteHttpError
+        ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status }
+        : { status: "failed", key: operation.key, error: message(error) };
+    }
     // Local side effects stay as late as possible: a failed download must not create folders.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
     try {

@@ -77,7 +77,7 @@ describe("SafeExecutor", () => {
   it("classifies a received auth failure as failed instead of an ambiguous write", async () => {
     const saved = state();
     const failing = remote({ putObject: async () => { throw new RemoteHttpError("PutObject", 403); } });
-    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, failing, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "failed", key: "a.bin", error: "R2 PutObject failed with HTTP 403" });
+    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, failing, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "failed", key: "a.bin", error: "R2 PutObject failed with HTTP 403", httpStatus: 403 });
     expect(saved.entries).toHaveLength(0);
   });
   it("keeps a 5xx write response fail-safe as unresolved", async () => {

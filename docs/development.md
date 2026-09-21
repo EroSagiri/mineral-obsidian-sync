@@ -482,7 +482,7 @@ stale remote / stale local / state 提交失败 / PUT 结果不明       已验�
 
 ```text
 iOS                                                                       从未运行
-自动调度、事件监听、任何后台行为                                            尚未实现
+Phase 3A 自动调度的真实 Obsidian 验证                                             尚未执行
 ```
 
 ---
