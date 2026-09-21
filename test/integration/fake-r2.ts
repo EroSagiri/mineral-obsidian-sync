@@ -26,6 +26,8 @@ export interface FakeR2Options {
   ignoreConditionalHead?: boolean;
   /** Reproduces Obsidian on Android (2026-09-21): HEAD throws at the transport layer. */
   failHead?: boolean;
+  /** Reproduces the measured Android case: a HEAD whose 404 response has no body throws. */
+  failHeadMissing?: boolean;
 }
 
 const EMPTY = new ArrayBuffer(0);
@@ -60,6 +62,7 @@ export class FakeR2 {
       ignoreIfMatch: options.ignoreIfMatch ?? false,
       ignoreConditionalHead: options.ignoreConditionalHead ?? false,
       failHead: options.failHead ?? false,
+      failHeadMissing: options.failHeadMissing ?? false,
     };
     setRequestUrlHandler((request) => this.handle(request));
   }
@@ -146,7 +149,11 @@ export class FakeR2 {
       return { status: 200, headers: this.metadata(stored), text: "", arrayBuffer: EMPTY };
     }
 
-    if (!current) return this.error(404, "NoSuchKey");
+    if (!current) {
+      // A 404 HEAD carries no response body, and Obsidian on Android throws for exactly that.
+      if (method === "HEAD" && this.settings.failHeadMissing) throw new Error("Request Failed. IOException Stream closed");
+      return this.error(404, "NoSuchKey");
+    }
     const conditionalHead = method === "HEAD" && this.settings.ignoreConditionalHead;
     if (ifMatch && !conditionalHead && !this.settings.ignoreIfMatch && ifMatch !== current.etag) return this.error(412, "PreconditionFailed");
     if (method === "HEAD") return { status: 200, headers: this.metadata(current), text: "", arrayBuffer: EMPTY };

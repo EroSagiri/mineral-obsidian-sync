@@ -1,10 +1,9 @@
-import { RemoteHttpError, RemoteObjectChangedError } from "../../remote/errors";
 import type { R2Client } from "../../remote/r2-client";
 import { sha256 } from "../../sync/fingerprint";
 import { randomBytes as secureRandomBytes, sameBytes, toArrayBuffer, utf8 } from "./bytes";
+import { classifyTransportError } from "./classify";
 import type { TransportScenarioContext } from "./context";
 import { primitivesScenario } from "./primitives";
-import { IntegrationTestEscapeError } from "./test-namespace";
 import { observation, require, runScenario } from "./result";
 import type { ScenarioObservation, ScenarioResult } from "./result";
 
@@ -28,26 +27,20 @@ export function transportScenarioNames(): string[] {
   return ["test-prefix-guard", "transport-primitives", "conditional-create", "conditional-update", "conditional-get", "conditional-head", "list-scoped", "binary-roundtrip-64k", "binary-roundtrip-1m"];
 }
 
-/** Maps a thrown error onto a stable category so a report never depends on message text. */
-function classify(error: unknown): string {
-  if (error instanceof RemoteObjectChangedError) return "precondition-failed";
-  if (error instanceof RemoteHttpError) return `http-${error.status}`;
-  if (error instanceof IntegrationTestEscapeError) return "guard-rejected";
-  return error instanceof Error ? error.name : "unknown";
-}
 
 function preconditionFailed(outcome: string): boolean {
   return outcome === "precondition-failed" || outcome === "http-412" || outcome === "http-409";
 }
 
+/**
+ * Absence is established with `ListObjectsV2`, not with a per-key HEAD.
+ *
+ * A 404 HEAD carries no response body, and Obsidian on Android throws
+ * `Request Failed. IOException Stream closed` for it (measured 2026-09-21). The product itself
+ * never HEADs a key it has not just written, so this is a harness constraint, not a product one.
+ */
 async function absent(client: R2Client, key: string): Promise<boolean> {
-  try {
-    await client.headObject(key);
-    return false;
-  } catch (error) {
-    if (error instanceof RemoteHttpError && error.status === 404) return true;
-    throw error;
-  }
+  return !(await client.listObjects()).some((entry) => entry.key === key);
 }
 
 export async function runTransportScenarios(context: TransportScenarioContext): Promise<ScenarioResult[]> {
@@ -88,7 +81,7 @@ async function guardScenario(context: TransportScenarioContext): Promise<Scenari
     try {
       await call();
     } catch (error) {
-      outcome = classify(error);
+      outcome = classifyTransportError(error);
     }
     require(outcome === "guard-rejected", `the test-prefix guard did not reject ${label} (${outcome})`);
   }
@@ -115,7 +108,7 @@ async function createScenario(context: TransportScenarioContext): Promise<Scenar
   try {
     await context.client.putObject(key, utf8(SHOULD_NOT_OVERWRITE), { ifNoneMatch: "*" });
   } catch (error) {
-    secondCreate = classify(error);
+    secondCreate = classifyTransportError(error);
   }
   require(preconditionFailed(secondCreate), `a second conditional create was not rejected (${secondCreate})`);
   require(sameBytes(await context.client.getObject(key), v1), "the rejected conditional create overwrote the existing object");
@@ -148,7 +141,7 @@ async function updateScenario(context: TransportScenarioContext): Promise<Scenar
   try {
     await context.client.putObject(key, utf8("stale-v4"), { ifMatch: etagB });
   } catch (error) {
-    staleUpdate = classify(error);
+    staleUpdate = classifyTransportError(error);
   }
   require(preconditionFailed(staleUpdate), `a stale If-Match update was not rejected (${staleUpdate})`);
   require(sameBytes(await context.client.getObject(key), utf8("v3")), "the stale conditional update overwrote newer remote content");
@@ -178,7 +171,7 @@ async function conditionalGetScenario(context: TransportScenarioContext): Promis
   try {
     staleBody = await context.client.getObject(key, { ifMatch: etagA });
   } catch (error) {
-    staleGet = classify(error);
+    staleGet = classifyTransportError(error);
   }
   require(preconditionFailed(staleGet), `a conditional GET with a stale ETag was not rejected (${staleGet})`);
   require(staleBody === undefined, "conditional GET returned a body despite a precondition failure");
@@ -211,7 +204,7 @@ async function conditionalHeadScenario(context: TransportScenarioContext): Promi
     await context.client.headObject(key, { ifMatch: BOGUS_ETAG });
     outcome = "ignored (200)";
   } catch (error) {
-    outcome = classify(error);
+    outcome = classifyTransportError(error);
   }
   require(outcome !== "http-501" && outcome !== "http-400" && !outcome.startsWith("http-5"), `conditional HEAD is not usable (${outcome}); post-PUT confirmation would fail`);
   require(outcome === "precondition-failed" || outcome === "ignored (200)", `conditional HEAD behaved unexpectedly (${outcome})`);

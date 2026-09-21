@@ -1,27 +1,31 @@
 import type { RemoteEntry } from "../../sync/types";
 import { randomBytes as secureRandomBytes, toArrayBuffer, utf8 } from "./bytes";
+import { classifyTransportError, describeTransportError } from "./classify";
 import type { TransportScenarioContext } from "./context";
 import { observation, ScenarioFailure } from "./result";
 import type { ScenarioObservation } from "./result";
 
 /**
- * Per-primitive capability matrix.
+ * Per-primitive capability matrix: happy paths **and** error paths.
  *
- * The scenario-style tests abort at their first failed request, which is exactly the wrong shape
- * for diagnosing a platform: on Android (2026-09-21) every transport scenario died at its first
- * `HEAD`, so PUT, conditional PUT and conditional GET were never reached at all.
- *
- * This matrix probes each primitive independently and never aborts.
+ * The scenario-style tests abort at their first failed request, which is the wrong shape for
+ * diagnosing a platform, and a matrix of only successful calls is worse: on Obsidian for Android
+ * (2026-09-21) all twelve happy-path probes passed while every scenario still failed, because
+ * every scenario begins by HEADing a key that does not exist yet. A 404 HEAD carries no body and
+ * Android's transport throws `Request Failed. IOException Stream closed` for it, so the matrix now
+ * probes the error paths too.
  *
  * It also solves the attribution problem: the product's `putObject` confirms a write with a
- * conditional `HEAD`, so a broken HEAD makes a *successful* PUT look failed. `ListObjectsV2` is a
- * plain GET, so after each write the matrix lists the run root and records whether the object
+ * conditional `HEAD`, so a broken HEAD would make a *successful* PUT look failed. `ListObjectsV2`
+ * is a plain GET, so after each write the matrix lists the run root and records whether the object
  * actually landed. That separates "the write failed" from "the confirmation failed".
  */
 
 const UPDATE_V1 = "primitive probe v1";
 const UPDATE_V2 = "primitive probe v2 updated";
 const BIG_SIZE = 64 * 1024;
+/** Never a real ETag, so every If-Match built from it must be rejected as stale. */
+const STALE_ETAG = "0000000000000000000000000000dead";
 
 export async function primitivesScenario(context: TransportScenarioContext): Promise<ScenarioObservation[]> {
   const observations: ScenarioObservation[] = [];
@@ -34,7 +38,17 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
     try {
       record(name, await action());
     } catch (error) {
-      record(name, `FAILED: ${error instanceof Error ? error.message.replace(/\s+/g, " ").slice(0, 160) : "unknown error"}`);
+      record(name, `FAILED: ${describeTransportError(error)}`);
+    }
+  };
+  /** An error path is "ok" only when it produces the expected *typed* error, not a transport throw. */
+  const expectError = async (name: string, expected: string, action: () => Promise<unknown>): Promise<void> => {
+    try {
+      await action();
+      record(name, `FAILED: expected ${expected}, but the call succeeded`);
+    } catch (error) {
+      const kind = classifyTransportError(error);
+      record(name, kind === expected ? `ok: ${kind}` : `FAILED: expected ${expected}, got ${kind} (${describeTransportError(error)})`);
     }
   };
 
@@ -52,10 +66,12 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
 
   const smallKey = context.namespace.key("primitives/small.txt");
   const bigKey = context.namespace.key("primitives/large.bin");
+  const absentKey = context.namespace.key("primitives/absent.txt");
   const v1 = utf8(UPDATE_V1);
   const v2 = utf8(UPDATE_V2);
   const big = toArrayBuffer((context.randomBytes ?? secureRandomBytes)(BIG_SIZE));
 
+  // ---- happy paths ----
   await attempt("LIST", async () => `ok, ${(await list()).size} object(s) under the run root`);
 
   await attempt("PUT If-None-Match:* small", async () => `ok etag=${(await context.client.putObject(smallKey, v1, { ifNoneMatch: "*" })).etag ?? "none"}`);
@@ -76,8 +92,19 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
     await attempt("PUT If-Match (update)", async () => `ok etag=${(await context.client.putObject(smallKey, v2, { ifMatch: etag })).etag ?? "none"}`);
     await presence("LIST after update", smallKey, v2.byteLength);
   } else {
-    record("conditional primitives", "skipped: LIST returned no ETag, so If-Match cannot be probed");
+    record("conditional happy paths", "skipped: LIST returned no ETag, so If-Match cannot be probed");
   }
+
+  // ---- error paths: 404 and 412 on every method the product uses ----
+  await expectError("HEAD absent → http-404", "http-404", () => context.client.headObject(absentKey));
+  await expectError("GET absent → http-404", "http-404", () => context.client.getObject(absentKey));
+  await expectError("HEAD If-Match (stale) → precondition", "precondition-failed", () => context.client.headObject(smallKey, { ifMatch: STALE_ETAG }));
+  await expectError("GET If-Match (stale) → precondition", "precondition-failed", () => context.client.getObject(smallKey, { ifMatch: STALE_ETAG }));
+  await expectError("PUT If-None-Match:* on existing → precondition", "precondition-failed", () => context.client.putObject(smallKey, v1, { ifNoneMatch: "*" }));
+  await expectError("PUT If-Match (stale) → precondition", "precondition-failed", () => context.client.putObject(smallKey, v1, { ifMatch: STALE_ETAG }));
+  // A rejected conditional write must leave the object exactly as it was.
+  await presence("LIST after rejected create", smallKey, v2.byteLength);
+  await presence("LIST after rejected stale write", smallKey, v2.byteLength);
 
   if (failures.length) throw new ScenarioFailure(`${failures.length} of ${observations.length} primitive probes failed: ${failures.join(", ")}`, observations);
   return observations;

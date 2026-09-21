@@ -1,4 +1,3 @@
-import { RemoteHttpError } from "../../remote/errors";
 import type { R2Client } from "../../remote/r2-client";
 import { remoteObjectKey } from "../../sync/path";
 import type { RemoteEntry } from "../../sync/types";
@@ -56,15 +55,5 @@ export class GuardedIntegrationClient implements R2Client {
 
   async putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteEntry> {
     return this.inner.putObject(this.guard(key), body, options);
-  }
-}
-
-/** Narrowed head: a 404 means "absent" for planning purposes; every other status propagates. */
-export async function headOrAbsent(client: R2Client, key: string): Promise<RemoteEntry | undefined> {
-  try {
-    return await client.headObject(key);
-  } catch (error) {
-    if (error instanceof RemoteHttpError && error.status === 404) return undefined;
-    throw error;
   }
 }

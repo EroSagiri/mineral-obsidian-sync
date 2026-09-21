@@ -7,7 +7,6 @@ import { canonicalKey } from "../../sync/path";
 import { buildSyncPlan } from "../../sync/planner";
 import type { LocalEntry, PreviousEntry, RemoteEntry, RemoteIdentity, SyncOperation, SyncPlan } from "../../sync/types";
 import { sameBytes, utf8 } from "./bytes";
-import { headOrAbsent } from "./guarded-client";
 import { ensureFolder, ensureFolderTree } from "./local-scratch";
 import type { LocalScratch } from "./local-scratch";
 import { observation, require, runScenario, ScenarioFailure, skipScenario } from "./result";
@@ -64,17 +63,25 @@ export interface NamespaceObservation {
   plan: SyncPlan;
 }
 
-/** Local scan + per-key remote HEAD + previous state, then the deterministic planner. */
+/**
+ * Local scan + one scoped remote `ListObjectsV2` + previous state, then the deterministic planner.
+ *
+ * The remote scan uses LIST rather than a per-key HEAD for two reasons: it is the same primitive
+ * the product's own remote scan uses, and a HEAD that returns 404 throws at the transport layer on
+ * Obsidian for Android (measured 2026-09-21), which would have made this whole harness unusable
+ * there. One scoped LIST also replaces N conditional HEADs.
+ */
 export async function observe(context: ConvergenceContext, extraKeys: readonly string[] = []): Promise<NamespaceObservation> {
   const local = scanLocalNamespace(context.vault, context.scratch.root);
-  const keys = [...new Set([...local.keys(), ...extraKeys])].sort((a, b) => a.localeCompare(b));
-  const remote = new Map<string, RemoteEntry>();
-  for (const key of keys) {
-    const entry = await headOrAbsent(context.client, key);
-    if (entry) remote.set(key, entry);
-  }
+  const wanted = new Set<string>([...local.keys(), ...extraKeys]);
+  const remote = new Map((await context.client.listObjects()).filter((entry) => wanted.has(entry.key)).map((entry) => [entry.key, entry]));
   const previous = scopedPrevious(await context.state.loadAll(), context.scratch.root);
   return { local, remote, previous, plan: buildSyncPlan(local, remote, previous) };
+}
+
+/** Ground truth for a single key, using the same LIST primitive. */
+async function remoteExists(client: R2Client, key: string): Promise<boolean> {
+  return (await client.listObjects()).some((entry) => entry.key === key);
 }
 
 export function planSummary(plan: SyncPlan): string {
@@ -406,7 +413,7 @@ async function ambiguousPutScenario(context: ConvergenceContext, client: R2Clien
   require(upload.reason === "ambiguous-put", `the ambiguous PUT was classified as ${upload.reason}`);
   require(!scopedPrevious(await context.state.loadAll(), context.scratch.root).has(key), "an ambiguous PUT committed previous state");
 
-  const landed = await headOrAbsent(context.client, key);
+  const landed = await remoteExists(context.client, key);
   require(landed, "the injected fault did not actually deliver the PUT to R2");
   require(sameBytes(await context.client.getObject(key), body), "the delivered PUT stored unexpected bytes");
 

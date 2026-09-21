@@ -77,9 +77,33 @@ describe("R2 conditional transport: real signer + real RequestUrlTransport over 
     expect(statuses(results)).toEqual(transportScenarioNames().map((name) => `${name}:pass`));
   });
 
-  it("separates a broken HEAD from a working write, the way Android behaves", async () => {
-    // Reproduces the real Android signature: every scenario that starts with HEAD dies, but the
-    // write itself lands. The matrix must attribute that correctly instead of blaming PUT.
+  it("documents a body-less 404 HEAD as a transport error, while every scenario still runs", async () => {
+    // The measured Android signature. Only the missing-object HEAD is affected: every other error
+    // path carries a response body, and no scenario depends on a 404 HEAD any more.
+    const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHeadMissing: true });
+    const results = await runTransportScenarios({ namespace, client });
+    const matrix = find(results, "transport-primitives");
+    const probe = (name: string): string => String(matrix.observations.find((entry) => entry.name === name)?.value);
+
+    expect(matrix.status).toBe("fail");
+    expect(matrix.detail).toContain("HEAD absent → http-404");
+    expect(probe("HEAD absent → http-404")).toContain("got transport-error");
+    expect(probe("HEAD absent → http-404")).toContain("Stream closed");
+    // Error paths whose response carries a body are unaffected.
+    expect(probe("GET absent → http-404")).toBe("ok: http-404");
+    expect(probe("HEAD If-Match (stale) → precondition")).toBe("ok: precondition-failed");
+    expect(probe("GET If-Match (stale) → precondition")).toBe("ok: precondition-failed");
+    expect(probe("PUT If-None-Match:* on existing → precondition")).toBe("ok: precondition-failed");
+    expect(probe("PUT If-Match (stale) → precondition")).toBe("ok: precondition-failed");
+    // A rejected conditional write leaves the object untouched.
+    expect(probe("LIST after rejected create")).toContain("present size=26");
+    // And the harness itself no longer depends on a 404 HEAD, so the scenarios pass here.
+    expect(statuses(results).filter((entry) => entry.endsWith(":fail"))).toEqual(["transport-primitives:fail"]);
+  });
+
+  it("attributes a fully broken HEAD without blaming the write", async () => {
+    // Reproduces a platform where every HEAD dies: the write itself still lands, and the matrix
+    // must attribute that correctly instead of blaming PUT.
     const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHead: true });
     const results = await runTransportScenarios({ namespace, client });
     const matrix = find(results, "transport-primitives");

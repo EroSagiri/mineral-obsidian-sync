@@ -120,7 +120,7 @@ Mineral Sync (dev): R2 Convergence Self-Test
 
 ```text
 test-prefix-guard        15 次越界尝试必须在发网前被拒，list 不得暴露 run 目录外的 key
-transport-primitives     逐原语能力矩阵，永不因第一个失败而中止（见下）
+transport-primitives     逐原语能力矩阵，happy path 12 项 + 错误路径 6 项，永不中止（见下）
 conditional-create       If-None-Match:* 成功 → 第二次 412 → 原内容未被覆盖
 conditional-update       If-Match 成功且 ETag 前进 → 过时 ETag 412 → 新内容保留
 conditional-get          匹配 ETag 成功 → 过时 ETag 412 且不返回正文
@@ -130,7 +130,20 @@ binary-roundtrip-64k     64 KiB 二进制逐字节 + SHA-256
 binary-roundtrip-1m      1 MiB 同上
 ```
 
-场景式测试在第一个失败请求处就会中止，这对定位平台问题是最差的形状：Android 上每个场景都死在第一次 `HEAD`，导致 PUT、条件 PUT、条件 GET 根本没被触达。`transport-primitives` 因此逐个原语独立探测，并且解决了归因问题 —— 产品的 `putObject` 用条件 `HEAD` 确认写入，HEAD 坏掉会让一次**成功的** PUT 看起来失败；矩阵在每次写入后用 `ListObjectsV2`（普通 GET）回查该对象是否真的落盘，从而把"写入失败"与"确认失败"分开。
+场景式测试在第一个失败请求处就会中止，这对定位平台问题是最差的形状；而只测 happy path 的矩阵更糟 —— 它可以在一个平台上全绿却什么都不解释。`transport-primitives` 因此逐个原语独立探测、永不中止，并且**成功路径与错误路径都测**：
+
+```text
+happy path (12)   LIST / PUT If-None-Match:*(small, 64KiB) / GET(small, 64KiB) / HEAD /
+                  GET If-Match / HEAD If-Match / PUT If-Match
+error path (6)    HEAD absent → 404      GET absent → 404
+                  HEAD If-Match(stale) → 412    GET If-Match(stale) → 412
+                  PUT If-None-Match:* on existing → 412    PUT If-Match(stale) → 412
+                  （错误路径只有在产生【类型化错误】时才算 ok，传输层抛错算失败）
+ground truth      LIST after small PUT / after 64 KiB PUT / after update /
+                  after rejected create / after rejected stale write
+```
+
+最后那几行 `LIST after …` 解决归因问题：产品的 `putObject` 用条件 `HEAD` 确认写入，HEAD 若坏掉会让一次**成功的** PUT 看起来失败，而 `ListObjectsV2` 是普通 GET，用它回查对象是否真的落盘，才能把"写入失败"与"确认失败"分开。
 
 收敛自检（7 个场景，使用真实 Vault 与真实 IndexedDB）：
 
@@ -205,31 +218,36 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T17:17:50Z | Convergence Self-Test | **6 / 6 PASS**，本地 scratch 回退到可见根目录 |
 | 2026-09-21T17:29:18Z | Transport Self-Test | **8 / 8 PASS** |
 | 2026-09-21T17:30:31Z | Convergence Self-Test（含 `download-applied`、`download-blocked-by-file-parent`） | **8 / 8 PASS**，成功下载写盘路径的真实 Vault 验证完成 |
-| 2026-09-21T17:32:35Z | Transport Self-Test（**Android**） | 1 / 9 PASS：仅 `test-prefix-guard` 通过，其余全部在首个 `HEAD` 处 `Request Failed. IOException Stream closed` |
-| 2026-09-21T17:32:58Z | Convergence Self-Test（**Android**） | 1 / 8 PASS：`local-scratch-root` 通过（纯本地），其余全部在首次远端 `HEAD` 处同样失败 |
+| 2026-09-21T17:32:35Z | Transport Self-Test（**Android**，无矩阵） | 1 / 8 PASS：仅 `test-prefix-guard` 通过，其余全部在首个 `HEAD` 处 `Request Failed. IOException Stream closed` |
+| 2026-09-21T17:32:58Z | Convergence Self-Test（**Android**，无矩阵） | 1 / 8 PASS：`local-scratch-root` 通过（纯本地），其余全部在首次远端 `HEAD` 处同样失败 |
+| 2026-09-21T17:40:27Z | Transport Self-Test（桌面，含 `transport-primitives`） | **9 / 9 PASS** |
+| 2026-09-21T17:40:57Z | Convergence Self-Test（桌面） | **8 / 8 PASS** |
+| 2026-09-21T17:42:08Z | Transport Self-Test（**Android**，含 `transport-primitives`） | 2 / 9 PASS：矩阵 12 项 happy path **全部通过**；7 个场景仍全部失败 |
 
-### 已知问题：Android 上 HEAD 不可用
+### 已定位：Android 上"无响应体的错误响应"在传输层抛错
+
+上表 17:32 那两轮曾让我判断为"Android 上 HEAD 不可用"。17:42 引入 `transport-primitives` 矩阵后，这个判断被**推翻**：
 
 ```text
-症状    Android 上所有 HEAD 请求在传输层抛错：Request Failed. IOException Stream closed
-        （不是 HTTP 状态码，因此不是鉴权、不是 412、不是 R2 侧问题）
+症状    对【不存在的对象】发 HEAD（R2 返回 404，而没有响应体）时，Android 上的 requestUrl 抛
+        Request Failed. IOException Stream closed。这不是 HTTP 状态码。
 
-证据    1. test-prefix-guard 通过 —— 它唯一的网络调用是 listObjects()，即一个普通 GET
-        2. 上面每一个失败场景的"第一个 HTTP 调用"都是 headObject()，没有任何一个走到 PUT 或条件 GET
-        3. 报错文本来自 Obsidian 的 requestUrl 实现本身，而非 R2 响应
+证据    1. 矩阵的 12 项 happy path 在 Android 上全部通过 —— 包含 HEAD、条件 HEAD、
+           PUT 64 KiB、GET 64 KiB。它们没有任何一项产生非 2xx 响应。
+        2. 每个失败场景的"第一个 HTTP 调用"都是对不存在的 key 发 HEAD，也就是 404。
+        3. test-prefix-guard 通过（只有 200 的 LIST），local-scratch-root 通过（纯本地）。
+        ⇒ Android 的失败与"方法"无关，与"响应体为空的错误响应"有关。
 
-影响    产品的 R2Client.putObject 在 PUT 成功后用条件 HEAD 确认写入。Android 上这会抛错，
-        执行器把它归为 unresolved/ambiguous-put：对象其实已经写入 R2，但 baseline 永不提交，
-        下一次扫描看到"本地与远端都存在、却没有 previous" → conflict（both-created-different）。
-        也就是说：移动端上传永远不会收敛。
-        下载路径使用 GET If-Match，理论上不受 HEAD 影响，但同样尚未在 Android 上走到过。
+影响    产品的调用序列不受影响：R2Client.headObject 只在 PUT 成功之后被调用，那时对象必然
+        存在（200）；产品从不 HEAD 一个可能不存在的 key。因此这是脚手架的约束，
+        不是产品缺陷。
+        待确认：HEAD 的 412（同样没有响应体）是否也受影响 —— 由矩阵的错误路径探测回答。
 
-待确认  PUT 本身、条件 PUT、条件 GET 在 Android 上是否可用 —— 由 transport-primitives 矩阵回答。
-        矩阵用 LIST（Android 上可用）回查写入是否落盘，因此即使确认用的 HEAD 坏掉，
-        也能判断 PUT 到底是成功还是失败。
+修复    脚手架改用 ListObjectsV2 判断远端存在性（与产品 scanRemote 用的是同一个原语），
+        不再依赖 404 HEAD；矩阵新增 6 项错误路径探测，把这条平台约束变成可测量的事实。
 ```
 
-如果矩阵显示 PUT 与条件 GET 正常、只有 HEAD 坏掉，那么修复方向是明确的：让 `putObject` 的 baseline 直接取自 PUT 响应（R2 在 PUT 响应里返回 ETag）与已知的 body 长度，不再依赖写入后的 HEAD。
+教训记在这里：只测 happy path 的矩阵可以在一个平台上全绿而什么都不解释。错误路径必须一起测。
 
 ### 真实端点确认的行为
 

@@ -5,6 +5,7 @@ import type { ConvergenceContext } from "../../src/dev/integration/convergence";
 import { ignorePolicyFingerprint } from "../../src/sync/ignore";
 import { SafeExecutor } from "../../src/sync/executor";
 import { resetRequestUrlHandler } from "../obsidian";
+import { installDomParserShim } from "./dom-parser-shim";
 import type { FakeR2Options } from "./fake-r2";
 import { createFakeVault, createMemoryStateStore } from "./fake-vault";
 import type { FakeVault, FakeVaultOptions } from "./fake-vault";
@@ -29,7 +30,11 @@ async function build(fakeOptions: FakeR2Options = { bucket: CONFIG.bucket, acces
 }
 
 describe("SafeExecutor integration over an in-process R2 emulator", () => {
-  beforeEach(() => resetRequestUrlHandler());
+  beforeEach(() => {
+    // The harness observes remote state with ListObjectsV2, so the XML parser shim is needed.
+    installDomParserShim();
+    resetRequestUrlHandler();
+  });
 
   it("creates the hidden scratch folder chain, because Vault.createBinary does not mkdir parents", async () => {
     const { vault, scratch } = await build();
