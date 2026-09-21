@@ -104,3 +104,4 @@ token 权限不足，或只给了错误 bucket 的权限。
 ## 更多文档
 
 - [`docs/development.md`](docs/development.md) —— 阶段状态、代码结构、开发命令、集成自检脚手架、真实验证记录、Android 待办清单。
+- [`docs/scheduler-semantics.md`](docs/scheduler-semantics.md) —— Phase 3A 自动调度器的语义规格（触发时机、single-flight、dirty 模型、rerun 规则、MUST / MUST NOT）。设计文档，尚未实现。
