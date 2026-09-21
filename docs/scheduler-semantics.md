@@ -5,8 +5,8 @@
 审计基准：
 
 ```text
-base commit   971dfa8445ddf04b4fe431df586e850f9bac739d
-              "docs: close Phase 2A / 2A.5 and freeze the network layer"
+base commit   305eec4a7b0c8f58d4067d724a639aa0ade3b7b1
+              "docs: define autonomous scheduler semantics"
 typecheck     通过
 tests         106 passed | 1 skipped
 build         通过，生产产物 24.2 KB
@@ -24,15 +24,15 @@ working tree  clean
 事件语义           事件 = "state may now be dirty"，仅此而已
 决策主体           永远只有 scan + previous + 纯 planner
 debounce           global trailing 1200 ms（local / startup），800 ms（focus / resume）
-dirty 模型         monotonic 全局 version + Map<key, version>（coalescing hint，不是事实库）
+dirty 模型         monotonic syncDirtyVersion + Map<key, version>（只由 relevant file event 推进）
 single-flight      cycle 并发 = 1，executor 并发 = 1
 reconcile 范围     full reconciliation（full local scan + full remote scan + planner）
-rerun 规则         stale → 立即；unresolved → backoff 5s→60s；failed → backoff 15s→5m；
-                   blocked / conflict → 只等新事件
+rerun 规则         普通 local dirty → trailing 1200ms；stale 且无 pending local dirty → 0ms；
+                   retryable → backoff 5s→60s；stable / blocked / conflict → 只等外部触发
 startup            一次 full reconciliation（onLayoutReady 之后 debounce 1200 ms）
-focus / resume     触发，但带 ≥30 s 最小间隔
+focus / resume     hidden→visible 必触发；额外 desktop focus 信号带 ≥30 s 最小间隔
 网络失败           limited backoff，不做 retry framework
-认证失败           进入 blocked-by-auth，停止自动 cycle，只等配置变化 / 新本地事件
+认证失败           cycle-global stop，进入 blocked-by-auth，只能由配置变化 / plugin reload 恢复
 self-write event   **不抑制**（接受多一轮廉价 noop cycle）
 delete             全程 BLOCKED，scheduler 不补能力
 ```
@@ -379,32 +379,43 @@ backoff 不是状态，是 `idle` 上的一个定时器 + 一个原因标签（�
       成功的一轮
 ```
 
-另有一条**与状态正交**的布尔量（不是状态）：
+另有两条**与状态正交**的 lifecycle guard（不是状态）：
 
 ```text
 stopped = false   插件已卸载 / 已禁用 → 拒绝一切新 cycle 与新 debounce
+visible = true    document hidden → 取消 timer，拒绝新 cycle / operation，等待 visible
 ```
 
-`stopped` 不做成状态，因为它必须能在**任何**状态下被置位，且置位后不可恢复。
+`stopped` 不做成状态，因为它必须能在**任何**状态下被置位，且置位后不可恢复；
+visibility 也不做成第六个状态，因为它同样可以在 idle / debouncing / running /
+blocked-by-auth 的任一时刻变化。
 
 ### 状态转移表
 
 | 当前 | 输入 | 下一状态 | 动作 |
 | --- | --- | --- | --- |
-| idle | 任何 `requestReconcile` | debouncing | 打 dirty 标记、启动/重置 trailing debounce |
+| idle | 任何 `requestReconcile` | debouncing | 记录 global reconcile intent，启动/重置 trailing debounce；只有 relevant local event 推进 `syncDirtyVersion` |
 | idle | backoff 到期 | debouncing | 同上（backoff 到期的动作就是 `requestReconcile("retry")`） |
-| debouncing | 又来事件 | debouncing | 重置 debounce 计时（coalesce） |
+| debouncing | 又来有效 reconcile 请求 | debouncing | 重置 debounce 计时（coalesce）；ignored / folder-only event 不算有效请求 |
 | debouncing | debounce 到期 | running | 捕获 config/generation 快照、开跑 cycle |
 | debouncing | `stopped` | — | 清掉 timer，回到 idle，不再进入 running |
-| running | 事件到达 | running | **只打 dirty 标记**（version++），不动 timer |
-| running | config 改变 | running | 标记代际过期，**让当前 cycle 跑完**；结束后按 rerun |
+| running | relevant local file event 到达 | running | `syncDirtyVersion++` 并打 dirty 标记；当前 cycle 继续，不动 timer |
+| running | config 改变 | running | `configGeneration++`；当前 operation 可完成，operation 返回后停止旧 cycle，丢弃 plan 余项并安排 400 ms 新配置 reconciliation |
+| running | visibility → hidden | idle | 当前 operation 可完成，operation 返回后停止余项；保留 dirty / retry intent，visible 后重新 reconcile |
 | running | cycle 正常结束，无新增 dirtiness | idle | 清 cycle 期前已见的 dirty 标记 |
-| running | cycle 正常结束，有新增 dirtiness | rerun-pending → running | 启动一次 trailing debounce，到期后开下一轮 |
+| running | cycle 正常结束，有新增 local dirtiness | rerun-pending → running | 启动一次 1200 ms trailing debounce，到期后开下一轮 |
 | running | cycle 抛未预期异常 | idle | 记录 `lastError`、按 §5 决定 backoff、状态栏 error |
 | running | 认证失败（401/403） | blocked-by-auth | 停止自动 cycle，状态栏 `○ auth`，**不**注册 retry timer |
 | blocked-by-auth | config 改变 | debouncing | 重新尝试一轮 |
 | blocked-by-auth | 新本地事件 | blocked-by-auth | 只更新状态栏为 pending，**不**开 cycle |
+| idle / debouncing | visibility → hidden | idle | 取消 debounce 与 retry timer；保留 dirty、版本与 retry intent，hidden 期间不跑 cycle |
+| idle（此前因 hidden 暂停） | visibility → visible | debouncing | 若非 blocked-by-auth，`requestReconcile("focus-resume")`，按正常 debounce 做 full reconciliation |
+| blocked-by-auth | visibility 变化 | blocked-by-auth | 不发请求；visibility 不能解除 auth block |
 | 任意 | `stopped` | — | 禁止启动后续 operation 与后续 cycle |
+
+表中所有“进入 debouncing”的转移都受 `visible` gate 约束：hidden 时只保留 reconcile /
+retry intent，不创建 timer；即使一个已到期 callback 恰好排队，也必须在启动 cycle 前再次
+检查 visibility。visible 后统一由 focus-resume full reconciliation 吸收这些 intent。
 
 ### 为什么 backoff 不是独立状态
 
@@ -437,13 +448,13 @@ cycle C
 ```text
 不要启动第二轮
 ↓
-mark dirty（version++，累积到集合）
+mark dirty（syncDirtyVersion++，累积到集合）
 ↓
-current cycle continues（绝不打断、绝不影响）
+current cycle continues（普通 dirty 不打断当前 cycle）
 ↓
 current cycle finishes
 ↓
-run another cycle
+trailing debounce 1200 ms 后 run another cycle
 ```
 
 ### rerun 是"立即"还是"再 debounce 一次"？
@@ -462,9 +473,9 @@ run another cycle
 4. **它天然处理了"cycle 结束瞬间又来事件"**（Case 14）：dirty 标记是 version 化的，
    debounce 只是启动方式，不承担正确性。
 
-**唯一例外：`stale`。** §4.2 说明为什么 `stale` 走"0 延迟路径" ——
-因为它意味着"执行时观测已被证伪"，此时用户刚刚停止编辑的概率极高，
-而且不重跑就等于把工作留到下一个随机事件。
+**唯一例外：没有 pending local dirty 的 `stale`。** §4.2 说明为什么它走
+"0 延迟路径"。若本轮期间已经观察到 local dirty，则 stale **不得**绕过
+typing debounce：cycle 结束后仍走普通 1200 ms trailing rerun。
 
 ## 3.3 DirtySet 语义
 
@@ -483,8 +494,9 @@ DirtySet ≠ scan 的替代品
 ### 数据结构（语义，不是实现）
 
 ```text
-version      单调递增整数。任何一次"状态可能变脏"的请求都 ++
+syncDirtyVersion  单调递增整数。只在 relevant local file event 被接受时 ++
 dirty        Map<canonicalKey, version>   —— 记录该 key 最后一次被标记时的 version
+observedEventCount 可选诊断计数；可统计被丢弃的事件，但不参与 clear / rerun 判定
 ```
 
 ### key canonicalize
@@ -506,14 +518,15 @@ canonicalKey 抛错（空路径 / `.` / `..` 段）→ 丢弃该事件，不 fal
 
 ### ignored key 是否进入 DirtySet
 
-**决定：不进入 `dirty` map，但 `version++` 照常。**
+**决定：直接丢弃，不进入 `dirty` map，也不推进 `syncDirtyVersion`。**
 
 ```text
 ignored key 的 event
-  → version++          （必须：见 §3.9 的 clear 语义）
+  → 不增加 syncDirtyVersion
   → 不写入 dirty map   （因为"ignored 变化"永远不可能改变任何 planner 结果：
                         scanLocal/scanRemote 两侧都套同一份 filter）
   → 不启动 debounce / 不请求 cycle
+  → 可选 observedEventCount++，仅用于诊断
 ```
 
 唯一例外：**ignore policy 本身变化**（§6.6）—— 那时不是"某个 key 脏了"，
@@ -523,9 +536,9 @@ ignored key 的 event
 
 ```text
 rename(oldPath, newPath)
-  → oldPath 若可 canonicalize 且未被忽略 → dirty.set(oldPath, version)
-  → newPath 若解析为文件且未被忽略       → dirty.set(newPath, version)
-  → version++
+  → 先收集 oldPath / newPath 中可 canonicalize、未被忽略的 relevant file key
+  → 集合非空时 syncDirtyVersion++，并用同一新 version 标记这些 key
+  → 集合为空（ignored / confirmed folder-only）时不推进 syncDirtyVersion
 ```
 
 **Phase 3A 不实现 rename inference。** 也就是说：
@@ -574,7 +587,8 @@ dirty = { "a.md" → v''' }
 ### running 中新事件如何累积
 
 ```text
-一律 version++ 并 dirty.set(key, version)
+relevant file event 一律 syncDirtyVersion++ 并 dirty.set(key, version)
+ignored / confirmed folder-only event 一律丢弃，不影响 correctness version
 不重置任何 timer（timer 在 running 期间不允许启动，见 §3.4）
 不影响当前 cycle 的任何一步
 ```
@@ -590,8 +604,8 @@ cycle 结束 → dirty.clear()      ← 会吞掉 cycle 运行期间到达的事
 正确语义（version 化 clear）：
 
 ```text
-cycle 开始时：  startVersion = version          （快照）
-cycle 结束时：  if (version === startVersion) dirty.clear()
+cycle 开始时：  startVersion = syncDirtyVersion          （快照）
+cycle 结束时：  if (syncDirtyVersion === startVersion) dirty.clear()
                 else dirty = { k → v ∈ dirty | v > startVersion }
 ```
 
@@ -625,7 +639,7 @@ planner
 Scheduler 的义务只有一条：
 
 ```text
-scan 期间出现 event → version++，本轮结束必然进入 rerun
+scan 期间出现 relevant file event → syncDirtyVersion++，本轮结束必然进入 trailing rerun
 ```
 
 **即使本轮最后全部是 noop，也必须再跑一轮。** 这是非常重要的 race：
@@ -638,8 +652,8 @@ noop 只说明"用**旧**观测看，没有差异"，不说明"用**新**观测�
 **决定：global trailing debounce，单一计时器。**
 
 ```text
-任何被接受的 dirty 请求 → 重置这唯一的计时器
-计时器到期                → 开一轮 cycle（full reconciliation）
+任何被接受的 reconcile 请求 → 重置这唯一的计时器
+计时器到期                  → 开一轮 cycle（full reconciliation）
 ```
 
 理由：
@@ -657,8 +671,9 @@ local Vault event（create / modify / delete / rename）   1200 ms
 startup（onLayoutReady 之后的首次）                       1200 ms
 focus / resume                                           800 ms
 config change                                            400 ms
-rerun-pending（cycle 结束后的跟进）                        1200 ms
-stale 触发的 rerun                                        0 ms（见 §4.2）
+rerun-pending（cycle 结束后的 ordinary local dirty）       1200 ms
+stale 且无 pending local dirty                            0 ms（见 §4.2）
+stale + pending local dirty                               1200 ms
 ```
 
 **为什么是 1.2 s 而不是机械地取 1–2 s 的中点：**
@@ -688,7 +703,7 @@ MUST: running 期间计时器不启动（见下）
 ### running 时事件是否重新 debounce
 
 ```text
-不。running 期间一切事件只 version++ / dirty.set()，不触碰计时器。
+不。running 期间 relevant file event 只做 syncDirtyVersion++ / dirty.set()，不触碰计时器。
 rerun 的计时器在 cycle **结束**并且判定需要 rerun 之后才启动。
 ```
 
@@ -771,14 +786,16 @@ vault.on('rename', (file: TAbstractFile, oldPath: string) => …)
 
 | 事件 | 回调参数 | Scheduler 语义 |
 | --- | --- | --- |
-| `create` | `TAbstractFile`（**可能是 TFolder**） | 解析为 `TFile` → `dirty.set(canonicalKey(path))`；解析为 `TFolder` → 忽略（§3.6.2） |
+| `create` | `TAbstractFile`（**可能是 TFolder**） | 解析为 relevant `TFile` → `syncDirtyVersion++` + `dirty.set(canonicalKey(path))`；ignored / `TFolder` → 丢弃（§3.6.2） |
 | `modify` | `TAbstractFile`（实际只对文件触发） | 同上 |
 | `delete` | `TAbstractFile`（**可能是 TFolder**） | 无法解析实体（已不存在）。见 §3.6.1 |
 | `rename` | `(file, oldPath)` | 若 `file` 是文件 → 新路径 + 旧路径都 dirty；若是文件夹 → 见 §3.6.2 |
 | 加载期的 `create` | 每个已存在文件一次 | **不注册监听器于 onload**，因此收不到；startup 走一次全局 reconcile |
 
-**统一规则：所有事件无论类型，都先 `version++`，再做"是否写入 dirty map"的判断。**
-事件类型（create/modify/delete/rename）在 Phase 3A 里**不写入 DirtySet、不参与任何决策**。
+**统一规则：先判断事件是否代表 relevant file key；只有答案为是才推进
+`syncDirtyVersion` 并写入 dirty map。** 事件类型（create/modify/delete/rename）
+在 Phase 3A 里**不写入 DirtySet、不参与任何同步决策**。若需要统计所有回调，使用
+独立的 `observedEventCount`，不得让它参与 rerun。
 
 ### 3.6.1 delete 事件与"文件夹删除 vs 文件删除"
 
@@ -786,8 +803,8 @@ vault.on('rename', (file: TAbstractFile, oldPath: string) => …)
 所以**无法**通过 vault 查询判断它是文件还是文件夹。处理方式：
 
 ```text
-若该 path 是某个【已知文件夹路径】→ 忽略（不写 dirty map，version 照常 ++）
-否则                              → dirty.set(canonicalKey(path))
+若该 path 是某个【已知文件夹路径】→ 忽略（不写 dirty map，不推进 syncDirtyVersion）
+否则                              → syncDirtyVersion++；dirty.set(canonicalKey(path))
 ```
 
 "已知文件夹路径"的判定语义（实现细节留待 Phase 3A 决定，但语义必须如此）：
@@ -822,9 +839,10 @@ vault.on('rename', (file: TAbstractFile, oldPath: string) => …)
 
 ```text
 create/modify/delete/rename 中，凡是解析为 TFolder 的事件：
-  → version++                （保守，无害）
+  → 不增加 syncDirtyVersion
   → 不写入 dirty map         （写入也没有任何 planner 意义）
   → 不启动 debounce          （避免"下载时建两个父目录 ⇒ 两次无意义 cycle"）
+  → 可选 observedEventCount++（仅诊断）
 ```
 
 判定方式（实现语义，不在本阶段写代码）：
@@ -891,7 +909,7 @@ git checkout            → 可能 100–1000 个 create/modify/delete 事件
 处理：
 
 ```text
-100 events → 100 × version++ → dirty map 收敛到 ≤100 个 key
+100 relevant file events → 100 × syncDirtyVersion++ → dirty map 收敛到 ≤100 个 key
            → 单一 global debounce 被重置 100 次
            → 用户/批量操作停止后 1.2 s
            → 【1】轮 cycle
@@ -912,7 +930,8 @@ git checkout            → 可能 100–1000 个 create/modify/delete 事件
 
 一个值得注意的细节：**批量操作期间 cycle 可能已经在跑**（用户先改了 1 个文件触发
 debounce，cycle 开跑，随后 `git checkout` 灌入 500 个事件）。
-此时 500 个事件只做 `version++` + `dirty.set`，cycle 跑完 → 判定脏 → 再 debounce
+此时 500 个 relevant file events 只做 `syncDirtyVersion++` + `dirty.set`，
+cycle 跑完 → 判定脏 → 再 debounce
 1.2 s → 第二轮 cycle 看到全部 500 个变化。**总轮数 = 2，不是 501。**
 
 ### 3.8 插件自己的本地写入事件（最重要的一节）
@@ -1026,21 +1045,24 @@ Cycle start
 2. 捕获 cycle 快照：
      configToken     = { endpoint, bucket, prefix, ignorePolicyFingerprint,
                          accessKeyId, generation }
-     startVersion    = version
+     startVersion    = syncDirtyVersion
      一个 client 实例（绑定上面的 config 快照，绝不在 cycle 中途重新读 settings）
 3. 检查 config 是否仍然是当前配置 → 否则立即结束（不写任何东西）
 4. scan local（同步，无 await）
 5. scan remote（await，可能多页）
 6. load previous（await）+ 按 identity / ignorePolicy 过滤
 7. planner（纯函数，同步）
-8. 顺序执行 plan 中【可执行的】operation：
+8. 顺序执行 plan 中【可执行的】operation；每条开始前先检查 operation-boundary gate：
+     stopped / configGeneration 已变化 / document hidden → 不启动下一条，丢弃 plan 余项
      upload / download → SafeExecutor.execute()
      noop / conflict   → 不送 executor，直接计入结果
      delete-*          → 不送 executor 也可以（结果相同），但送进去会得到 blocked；
                          语义上二者等价，实现时择一即可（见下）
-9. 每条成功 operation 的 previous-state 由 executor 自己 per-key 提交
-10. 收集结果：applied / stale / failed / unresolved / blocked / conflict
-11. cycle end
+9. operation 返回后分类结果；若为 auth failure，立即停止 cycle 并丢弃 plan 余项；
+   否则继续 unrelated operations
+10. 每条成功 operation 的 previous-state 由 executor 自己 per-key 提交
+11. 收集结果：applied / stale / failed / unresolved / blocked / conflict
+12. cycle end
 ↓
 decide：rerun / idle / backoff / blocked-by-auth
 ```
@@ -1048,6 +1070,51 @@ decide：rerun / idle / backoff / blocked-by-auth
 关于第 8 步的 delete：推荐**把 delete candidate 送进 executor 并如实记录它的 `blocked`**，
 因为这样"删除被阻断"是一个**被执行的、有记录的结论**，而不是 scheduler 偷偷过滤掉的东西。
 scheduler 不得依赖"我知道它会被 block 所以我不送"。
+
+### Operation-boundary gate（语义伪代码）
+
+```text
+for operation of plan:
+    before starting operation:
+        if stopped:
+            stop cycle
+
+        if configGeneration !== cycle.configGeneration:
+            stop cycle
+            discard remaining plan
+            request config-change reconciliation
+
+        if document is hidden:
+            stop cycle
+            keep dirty / retry intent for visible reconciliation
+
+    result = await executor.execute(operation)
+    classify(result)
+
+    if stopped:
+        stop cycle
+
+    if configGeneration !== cycle.configGeneration:
+        stop cycle
+        discard remaining plan
+        request config-change reconciliation
+
+    if result is auth failure under the still-current config:
+        stop cycle
+        discard remaining plan
+        enter blocked-by-auth
+
+    if document is hidden:
+        stop cycle
+        keep dirty / retry intent for visible reconciliation
+
+    otherwise:
+        continue unrelated operations
+```
+
+“stop after current operation”只描述 gate 失效时恰有 operation 在飞的情况；若仍在
+scan / plan 或恰好位于两条 operation 之间，则立即停止，绝不再启动一条旧 operation。
+这是启动下一条有副作用 operation 的唯一许可边界，不要求也不假装能在 operation 内取消。
 
 ### cycle = optimistic reconciliation attempt，不是事务
 
@@ -1128,38 +1195,76 @@ executor 结果： applied | stale | failed | unresolved | blocked
 planner 结论：  noop   | conflict        （不送 executor）
 ```
 
+现有 `OperationResult.status` 的 `failed` 过粗，不能直接决定 scheduler 是否注册 timer。
+下一阶段实现必须引入最小的 typed failure classification（可以是独立分类层，不要求改名
+`OperationResult.status`）：
+
+```text
+retryable  RemoteTransportError、429、5xx、ambiguous / unresolved outcome、临时网络失败
+stable     parent-path-is-file 等确定性本地文件系统失败、definitive non-auth 4xx、
+           invalid remote response / mapping problem
+auth       401 / 403 / 明确无效凭据
+```
+
+分类必须来自 typed cause / status，不得靠解析日志字符串。`auth` 是 cycle-global；
+`retryable` 与 `stable` 是 per-key / per-cycle failure behavior，仍允许 unrelated keys 继续。
+
 ## 4.2 结果处理表
 
-| Result | 本轮继续执行其他 key | 自动 rerun | backoff | 用户可见 |
-| --- | --- | --- | --- | --- |
-| `applied` | ✅ 继续 | 不需要（但若有 dirty 则照常 rerun） | 无 | 计入 `lastResultCounts`；状态栏在 cycle 结束时汇总 |
-| `stale` | ✅ 继续 | ✅ **是，立即**（0 ms，跳过 debounce） | 无 | 不单独提示（这是正常竞争，不是错误）；debug 日志记录 |
-| `unresolved`（ambiguous-put / state-commit-failed） | ✅ 继续 | ✅ 是，经过 **backoff** | 初始 5 s，倍增至上限 60 s | 状态栏 `○ error`；debug 日志；**不弹 Notice** |
-| `failed`（4xx / Vault 落盘失败） | ✅ 继续 | ✅ 是，经过 **backoff** | 初始 15 s，倍增至上限 5 min | 状态栏 `○ error`；同一 key 连续失败才值得一次 Notice |
-| `blocked`（delete / missing-remote-etag） | ✅ 继续 | ❌ **否**（只等新事件 / config-change） | 无 | 计入 `blocked` 计数；`delete-*` 的存在应可在 Inspect 里看到 |
-| `conflict` | ✅ **继续**（其他 key 正常收敛） | ❌ 否（只等新事件） | 无 | 状态栏 `! conflicts` + 冲突数；细节留给 Inspect |
+| Situation | Continue current cycle | Rerun | Timer | 用户可见 |
+| --- | ---: | --- | --- | --- |
+| `applied` | yes | only if local dirty | none | 计入 `lastResultCounts`；cycle 结束时汇总 |
+| `stale`，无 pending local dirty | yes | immediate full rescan / replan | 0 ms | 正常竞争；debug 日志记录 |
+| `stale` + pending local dirty | yes | normal trailing rerun | 1200 ms | 同上；不得绕过 typing debounce |
+| unresolved / ambiguous outcome | yes | retry | exponential 5 s → 60 s | `○ error`；debug 日志；不弹 Notice |
+| retryable transport / 429 / 5xx | yes | retry | exponential 5 s → 60 s | `○ error`；脱敏诊断 |
+| stable per-key failure | yes | wait external trigger | none | `○ error`；暴露脱敏原因 |
+| stable scan / mapping failure | no plan 可继续 | wait external trigger | none | `○ error`；暴露脱敏原因 |
+| `blocked` delete / missing ETag | yes | wait external trigger | none | 计入 `blocked`；Inspect 可见 |
+| `conflict` | yes | wait external trigger | none | `! conflicts` + 数量；细节留给 Inspect |
+| auth 401 / 403 | **stop cycle** | config change / plugin reload only | none | 进入 `blocked-by-auth` |
+| config generation changed | **stop after current operation** | new-config reconciliation | 400 ms | 旧配置已成功 per-key commit 保留 |
+| app becomes hidden | **stop after current operation** | visible reconciliation | none while hidden | 保留 dirty / retry intent |
 
-"本轮继续执行其他 key" 对所有结果是 **YES**：**没有任何单 key 结果可以中止整轮 cycle。**
+除 auth、config generation change、`stopped` 与 hidden 这些 **cycle-global stop
+conditions** 外，per-key 结果都继续 unrelated keys。不能再使用“所有结果都继续其他 key”
+的绝对说法。scan 在 plan 生成前失败时自然没有 unrelated operation 可继续；其 failure
+classification 仍决定是否注册 timer。
 
-### 4.3 为什么 `stale` 走 0 延迟路径
+### 4.2.1 组合情况的优先级
+
+一轮可能同时观察到多个结果或 lifecycle change。决策顺序必须唯一：
+
+```text
+1. stopped                         → stop；无后续 timer / cycle
+2. configGeneration changed       → stop at boundary；新 config reconciliation
+3. auth under still-current config → stop；blocked-by-auth
+4. hidden                          → stop at boundary；visible reconciliation
+5. pending local dirty             → trailing 1200 ms（即使同时 stale）
+6. retryable / unresolved          → exponential backoff（即使同时有 stale）
+7. stale, no local dirty           → 0 ms full rescan / replan
+8. stable / blocked / conflict     → 无 timer，等待外部触发
+```
+
+generation 必须先于 auth：旧 config 的 operation 在返回 401/403 前若配置已经改变，
+该结果不能证明新 config 也无效。retryable 必须先于 stale：stale 只证明 plan 失效，
+不能成为绕过已知网络退避的理由。
+
+### 4.3 `stale` 的 0 ms 路径受 local dirty gate 约束
 
 ```text
 stale 的含义：执行器在【即将写】的那一刻发现观测已被证伪。
 ```
 
-这个信号的价值在于它的**即时性**：用户刚刚改完文件、或另一台设备刚刚写完 R2，
-而我们的 plan 已经过期。此时：
+这个信号证明 plan 已经过期，但**不证明网络必须立即重试，也不证明用户已经停止输入**。
+因此先看本轮期间是否观察到 active / pending local dirty：
 
 ```text
-1. 新状态极可能【已经稳定】（用户停手了，远端写者写完了一次 PUT）。
-   debounce 的存在意义是"等编辑停下来"，而 stale 本身已经证明
-   "在观测之后发生过一次完整的写"。
-2. 不立即重跑的唯一后果是"把收敛推迟到下一个随机事件" —— 可能几分钟。
-   对一个以"改完就能在另一台设备看到"为目标的插件，这是最差的行为。
-3. 风险极低：立即重跑就是一次 full scan + plan。如果又 stale，还会再触发一次。
-   这就是为什么必须有 §5 的循环保护 —— 但 stale 的循环风险远低于 unresolved：
-   stale 要求"远端/本地在两次观测之间真的变了"，这在真实环境里不可能持续发生；
-   unresolved 只要求"写请求没有完成"，那在断网时可以【每一轮】都发生。
+1. 没有 pending local dirty：0 ms 启动下一轮 full scan + replan，避免把已知过期的
+   plan 留到未来随机事件。
+2. 已有 pending local dirty：走普通 1200 ms trailing debounce。用户可能仍在持续打字；
+   若 stale 永远绕过 debounce，会形成 cycle → stale → 0 ms cycle 的紧密循环。
+3. 无论哪条路径，都丢弃旧 plan；0 ms 不是重试旧 operation。
 ```
 
 ### 4.4 Conflict 语义
@@ -1277,11 +1382,13 @@ lastCycleFinishedAt     number | undefined
 lastCycleReason         "startup" | "local-event" | "focus-resume" | "stale" |
                         "retry" | "config-change" | "remote-change"
 lastResultCounts        { applied, stale, unresolved, failed, blocked, conflict, noop }
+lastFailureClass        "retryable" | "stable" | "auth" | undefined
 lastError               { at, kind: "auth" | "transport" | "http" | "vault" | "state",
                           message: string }   ← 必须脱敏（复用 main.ts 的
                                                 safeConnectionDiagnostic 策略）
 pendingDirtyCount       number             ← dirty map 大小
-dirtyVersion            number
+syncDirtyVersion        number             ← correctness / rerun 使用
+observedEventCount      number | undefined ← 可选诊断；不得参与 rerun
 currentState            "idle" | "debouncing" | "running" | "rerun-pending" | "blocked-by-auth"
 configGeneration        number
 stopped                 boolean
@@ -1339,23 +1446,24 @@ scheduler 的日志必须复用它，不得另起一套。
 cycle → same result → immediate cycle → same result → 100% CPU / network storm
 ```
 
-四种可能触发它的结果：
+可能触发它的结果：
 
 ```text
-failed       例如 403 / Vault 路径被文件占用
-unresolved   例如断网、PUT 结果不明
+stable failure  例如 parent-path-is-file / definitive non-auth 4xx / invalid mapping
+retryable       例如断网、429 / 5xx、PUT 结果不明
 blocked      delete candidate、missing-remote-etag
 conflict     两侧持续都变
 ```
 
-**关键观察：这四种结果有一个共同特征 —— 它们在"输入完全没变"的情况下会稳定复现。**
-（`stale` 不在其中：stale 要求输入端真的发生了写。）
+**关键观察：stable / blocked / conflict 在输入没变时会稳定复现，因此不能注册 timer；
+retryable 可能随网络恢复而改变，但只能经过有限 backoff 再试。** `stale` 证明 plan 已失效，
+但是否 0 ms 仍取决于有没有 pending local dirty。
 
 所以防止 loop 的**唯一**原则是：
 
 ```text
-一次 cycle 之后，只有当【有理由相信输入已经变了】时才自动再跑。
-否则只等新的外部触发。
+一次 cycle 之后，只有当【输入已变】或【retryable 外部条件可能恢复】时才自动再跑。
+前者按 stale / dirty 规则，后者必须 backoff；stable / blocked / conflict 只等外部触发。
 ```
 
 ## 5.2 明确的 rerun 触发规则
@@ -1363,15 +1471,20 @@ conflict     两侧持续都变
 ```text
 应该 immediate rerun（0 ms）：
   - 出现至少一个 stale
-  - 本轮运行期间有新的 dirty 事件（version 前进）
+  - 且本轮运行期间没有 active / pending local dirty（syncDirtyVersion 未前进）
+  - 且没有更高优先级的 retryable / lifecycle / auth 条件（§4.2.1）
+
+应该 trailing rerun（1200 ms）：
+  - 本轮运行期间有新的 relevant local dirty（syncDirtyVersion 前进）
+  - 包括 stale + local dirty 的组合
 
 应该 rerun with backoff：
-  - 出现 unresolved（ambiguous-put / state-commit-failed）
-  - 出现 failed（4xx / Vault 落盘失败）
-  - 传输失败（RemoteTransportError）
+  - unresolved（ambiguous-put / state-commit-failed）
+  - retryable transport failure（RemoteTransportError）
   - 5xx / 429
 
 不应该自动 rerun（只等新事件 / config-change / focus-resume / 未来 remoteDirty）：
+  - stable failure（确定性本地文件系统失败、definitive non-auth 4xx、invalid response / mapping）
   - blocked（delete-local / delete-remote / missing-remote-etag）
   - conflict
   - 全部 noop 且无 dirty
@@ -1399,34 +1512,28 @@ blocked / conflict 不自动 rerun 的正确性依赖一条不变式：
 要么因为 remote 未变而进入 delete/conflict 分支，要么因为 ETag 出现了
 而变成可执行的 upload/download。**它不会在同一状态上无限复现。**
 
-## 5.4 Backoff 参数（Phase 3A 第一版，刻意简单）
+## 5.4 Backoff 参数（仅 retryable，Phase 3A 第一版）
 
 ```text
-unresolved：
+retryable（含 unresolved / ambiguous）：
   initial     5 s
   倍数        ×2
   max         60 s
-  重置条件    一次 cycle 结束时 unresolved 计数为 0
+  重置条件    一次 cycle 结束时 retryable failure 计数为 0
 
-failed：
-  initial     15 s
-  倍数        ×2
-  max         5 min
-  重置条件    一次 cycle 结束时 failed 计数为 0
-
-传输类失败（RemoteTransportError）算 unresolved 路径，不算 failed。
+stable / auth / blocked / conflict：不注册 backoff timer。
 ```
 
 **为什么两类分开：**
 
 ```text
-unresolved 是"我们不知道发生了什么" —— 它可能是瞬时的（一次丢包），
+retryable 是"输入不变但外部条件可能恢复" —— 它可能是瞬时的（一次丢包），
   也可能是持久的（真的断网）。5 s 起步能在短暂抖动后快速恢复，
   而 ×2 到 60 s 意味着持续断网时每分钟只尝试一次，不会形成网络风暴。
 
-failed 是"服务器或本地明确拒绝了" —— 4xx 与 Vault 落盘失败都不会
-  因为多等几秒而变好（403 需要改配置，parent-path-is-file 需要用户改文件系统）。
-  所以起步更慢（15 s），上限更长（5 min），避免无意义的重复请求。
+stable 是"服务器或本地已经给出稳定否定答案" —— definitive non-auth 4xx、
+  parent-path-is-file、invalid mapping 都不会因为多等几秒而变好，所以完全不设 timer。
+auth 单独进入 blocked-by-auth，也完全不设 timer。
 ```
 
 **为什么不做成状态机（指数退避的状态）**：
@@ -1464,16 +1571,12 @@ rerun-pending 有 backoff"三向组合爆炸，而它对语义没有任何贡献
 4. 只等：
      a. 配置变化（endpoint / bucket / prefix / credentials / ignore policy）
      b. 插件重新加载（onload → startup cycle）
-     c. 【可选】一个新的本地事件到达时，允许【一次】探测性 cycle
-        —— 但探测失败必须立刻回到 blocked-by-auth，且不得注册下一次
 5. 仍然不能增加 Sync Now
 ```
 
-关于 (c) 的选择：推荐 **允许一次探测性 cycle，但严格限流**（例如距上次
-auth 失败至少 60 s 才允许一次）。理由：用户在手机上遇到临时
-token 过期后重新登录、或网络策略短暂失效，是真实场景；
-完全不给任何恢复路径会要求用户必须重启插件。
-但限流是硬要求 —— 这是唯一一条"错误状态下仍然发起请求"的规则。
+普通 local event 在 blocked-by-auth 中只记录 dirty，不发网络请求。Phase 3A 不增加
+“60 s auth probe”这套第二 retry policy。未来若有 temporary credential refresh hook，
+它可以作为第三个显式解除入口，但当前阶段没有该调用点。
 
 **传输层依据**（`errors.ts`）：401/403 是**完成的 HTTP 交换**，
 因此它们是 `RemoteHttpError`（→ `failed`），而不是 `RemoteTransportError`。
@@ -1484,13 +1587,14 @@ executor 会把 upload 的 403 归为 `failed`（`executor.ts:30`），
 ```text
 LIST 抛 RemoteHttpError(status 401|403)  →  blocked-by-auth
 LIST 抛 RemoteTransportError             →  unresolved 类 backoff
-LIST 抛其他 RemoteHttpError(4xx/5xx)     →  failed / unresolved 类 backoff
-LIST 抛 "R2 returned an invalid ListObjectsV2 response" 等解析错误 → failed 类 backoff
+LIST 抛其他 RemoteHttpError(4xx)         →  stable，不注册 timer
+LIST 抛 RemoteHttpError(429|5xx)          →  retryable backoff
+LIST 抛 "R2 returned an invalid ListObjectsV2 response" 等解析错误 → stable，不注册 timer
 ```
 
 最后一类（fail-closed 的解析/映射错误，例如 bucket 里有目录占位对象）
 必须在文档里点明：**它不是认证问题、不是网络问题，重试不会变好。**
-应当走 failed 的长 backoff，并把脱敏后的原因暴露到状态栏 / 日志。
+应当走 stable failure，**不注册 retry timer**，并把脱敏后的原因暴露到状态栏 / 日志。
 
 ## 5.6 Config change（含 generation token 语义）
 
@@ -1506,12 +1610,14 @@ endpoint / bucket / remote prefix / credentials / ignoredPaths
 1. 配置变化 → configGeneration++
 2. 取消 pending debounce（清 timer，dirty 标记保留）
 3. 【不尝试取消】正在运行的 cycle —— 技术上做不到（见 §1.9：requestUrl 无 AbortSignal）
-4. 让运行中的旧 cycle 自行跑完
-5. 旧 cycle 结束后：
-     - 它捕获的 configToken 与当前不一致 → 丢弃其结果（不进入诊断计数）
-     - 它的 previous-state 提交带的 remoteIdentity / ignorePolicy 是【旧】的
-       → 因此下次 loadAll 的过滤会自然让它们失效（main.ts:85 的同一套过滤）
-6. 立即 requestReconcile("config-change")（400 ms debounce）
+4. 若旧 cycle 的一条 operation 已开始，允许【仅该 operation】完成
+5. operation 返回后（或下一条 operation 开始前）检查 generation：
+     - generation 已变化 → 停止旧 cycle，不再启动下一条 operation
+     - 当前 plan 剩余 operation 全部丢弃
+     - 旧 config 下已经成功的 per-key commit 保留；它们带旧 remoteIdentity / ignorePolicy，
+       新配置 loadAll 时会自然过滤
+6. requestReconcile("config-change")（visible 时 400 ms debounce），用新 config full scan + replan；
+   hidden 时只保留该 intent，visible 后由 full reconciliation 吸收
 ```
 
 ### generation token 的确切内容
@@ -1537,23 +1643,18 @@ configGeneration 在每次 saveSettings() 时递增，因此覆盖了这种情�
 **为什么 secretAccessKey 本身不进 token**：不必要地把密钥复制进内存里的多个对象，
 违反"最少持有"原则。generation 已经足够。
 
-### running 中配置改变时，旧 cycle 是否应该继续？
+### running 中配置改变时，旧 cycle 在什么边界停止？
 
 ```text
-继续 —— 这不是妥协，而是因为它不可能造成跨 identity 的污染：
+在 **operation 之间停止**，不是让旧 plan 跑完，也不在 operation 内强行取消：
 ```
 
 ```text
-1. 旧 cycle 的 PUT 目标 URL 来自旧 endpoint/bucket/prefix。
-   如果用户改的是 identity，那么旧 cycle 写的是【旧 namespace】——
-   那是它自己观测过的 namespace，不是新 namespace。不存在"写错地方"。
-2. 旧 cycle 的 previous-state 提交带有旧的 remoteIdentity / ignorePolicy 字段，
-   因此新配置下的过滤（main.ts:85 的同一套）会让它们失效。
-   代价是"旧 cycle 的 baseline 白写了"，不是"新 namespace 被污染"。
-3. 旧 cycle 的 upload 前置条件来自旧 namespace 的 ETag。写到新 namespace
-   时它压根不会执行（因为 URL 已经变了 —— 这也是为什么必须冻结
-   client 而不是在 cycle 中途重新读 settings）。
-4. 强行"取消"在技术上不可行（无 AbortSignal），假装取消只会让状态更难推理。
+1. 已开始的 operation 使用冻结的旧 client；requestUrl 无 AbortSignal，允许它完成。
+2. 完成后的成功 commit 带旧 remoteIdentity / ignorePolicy，必须保留；新配置会过滤它。
+3. generation 失效后不得启动更多旧 operation。尤其 ignoredPaths 改变时，继续旧 plan
+   可能把新近被忽略的私有路径上传出去，这是不可接受的。
+4. 新配置必须重新 full scan + replan；绝不把旧 plan 搬到新 client 上继续。
 ```
 
 **必须写死的一条**：
@@ -1562,7 +1663,8 @@ configGeneration 在每次 saveSettings() 时递增，因此覆盖了这种情�
 MUST NOT: 让一个 cycle 在运行中途重新读取 settings 并切换 identity
 ```
 
-这从正面强制了"一个 cycle 一个 config 快照"。当前 `main.ts:51` 的
+这从正面强制了"一个 cycle 一个 config 快照"；generation gate 则限制该快照失效后
+还能走到哪一个 operation 边界。当前 `main.ts:51` 的
 `client()` 每次新建实例、`inspectSyncState` 一次流程造两个 client
 就是这个陷阱的前身 —— Phase 3A 的 cycle 必须持有**一个** client。
 
@@ -1595,7 +1697,27 @@ unload / disable 时：
 Phase 3A 必须在这里加上 `stopped = true` + 清 timer。
 `abort()` 可以保留给 Inspect（它有自己的语义），但**不能**指望它中止 cycle。
 
-## 5.8 Pause 是否需要
+## 5.8 Hidden / background lifecycle
+
+```text
+visibility → hidden：
+1. 取消 pending debounce timer 与 retry/backoff timer。
+2. 保留 dirty map、syncDirtyVersion、pending retry intent 与 last failure classification。
+3. 不开始新 cycle。
+4. 若 cycle 正在执行 operation，允许当前 operation 完成；返回后在 operation boundary
+   停止本 cycle，丢弃 plan 余项。若还在 scan / plan，则在第一条 operation 前停止。
+
+visibility → visible：
+1. 若不在 blocked-by-auth，requestReconcile("focus-resume")；auth block 仍只由 config / reload 解除。
+2. 按正常 focus/resume debounce 做一次 full reconciliation。
+3. 不恢复旧 timer，也不复用旧 plan；本轮 full reconciliation 已覆盖 retry、remote
+   change discovery 与 local change discovery。
+```
+
+这与 unload / config change 使用同一个停止粒度：**不强行取消已开始的 operation，
+但禁止在条件失效后启动下一条有副作用的 operation。** hidden 期间 timer 不得触发 cycle。
+
+## 5.9 Pause 是否需要
 
 ```text
 当前用户原则：插件启用 = 同步运行。
@@ -1637,7 +1759,7 @@ workspace/layout ready（this.app.workspace.onLayoutReady）
 ↓
 注册 Vault listeners        ← 必须在 onLayoutReady 之后，见下
 ↓
-把 startup 视为【global dirty】
+记录一次 global reconcile intent（不推进 syncDirtyVersion）
 ↓
 requestReconcile("startup")  → 1200 ms debounce
 ↓
@@ -1666,13 +1788,13 @@ obsidian.d.ts:7552-7554 明确写着：
 而且会让第一次 cycle 的 reason 变得不可解释。
 ```
 
-**为什么把 startup 表达为 "global dirty" 而不是伪造所有 key 的 modify 事件：**
+**为什么把 startup 表达为 global reconcile intent，而不是伪造所有 key 的 modify 事件：**
 
 ```text
 1. 伪造事件意味着伪造的 key 集合 —— 而那个集合并不存在
    （还没 scan，不知道有哪些 key）。这会把"我需要跑一轮"这个纯粹的
    意图，扭曲成"这些具体 key 脏了"，而后者是错的（它们可能一个都没变）。
-2. global dirty 的语义是"我的全部观测都不可信，重扫"，
+2. global reconcile intent 的语义是"我的全部观测都不可信，重扫"，
    这正是 startup 的真实含义。
 3. 它天然覆盖"插件被禁用期间磁盘上发生的变化"。
 ```
@@ -1695,56 +1817,25 @@ obsidian.d.ts:7552-7554 明确写着：
    而 conflict 在 §4.4 里是【不执行】的。
 ```
 
-**但 Phase 3A 第一版仍然决定：startup cycle 不执行 upload / download。**
+**Phase 3A V1 不设置 `previous.size > 0` gate。** startup 与后续 cycle 使用同一份
+planner 语义：local-only / remote-only 可以安全执行，both-exist 保持 conflict。
 
 ```text
-理由：
-1. 与当前已收口的行为保持一致。今天 Inspect 是唯一的入口，
-   而它【不执行任何写】。让"启用插件"这个动作第一次就产生写操作，
-   会让 Phase 3A 的三个变化（自动触发 + 自动执行 + 删除仍阻断）同时上线，
-   一旦有问题无法归因。
-2. 现有的 bootstrap 机制（buildBootstrapResult + saveVerified）就是为
-   "首次会话先建立基线"设计的。startup 直接跳过它，等于绕开一个
-   已经验证过的、更保守的路径。
-3. "先看清，再动手"是这个插件的产品原则（README 第一段）。
-   首次启动应该是"看清"的时刻。
+empty local + empty remote  → 空 plan / noop，自动结束
+local-only                  → upload If-None-Match: *，自动执行
+remote-only                 → download If-Match，自动执行
+both-exist                  → conflict "both-created-different"，不执行、不猜测
 ```
 
-**startup 第一轮 cycle 的确切语义（V1）：**
-
-```text
-scan local / scan remote / load previous / plan
-↓
-记录诊断（plan 的各类型计数）
-↓
-【不执行】任何 operation
-↓
-状态栏：
-   有 conflict        → "! conflicts"（并把 conflict 计数放进 diagnostics）
-   只有 upload/download → "○ error"? 不 —— 用一个明确的"需要人工建立基线"状态
-                        （建议 "! baseline" 或复用 "✓ idle" + 诊断计数）
-                        ← 具体文案是实现细节，语义是"有一批操作等待首次确认"
-   全部 noop          → "✓ synced"
-```
-
-**这条"首次会话不自动执行"的规则如何解除**（必须在文档里明确，否则实现时会变成永久禁令）：
-
-```text
-条件：previous state 非空（即 IndexedDB 里存在至少一条通过
-      identity/ignorePolicy 过滤的 baseline 条目）
-⇒ 从那一刻起，后续 cycle 正常执行 upload / download。
-```
-
-也就是说，解除条件不是"运行了几轮"，也不是"用户点了什么"，
-而是**"本 namespace 已经有可信基线"**这个客观事实。
-
-**这与"startup = global dirty"并不冲突**：startup 依然是一轮
-full reconciliation，只是这一轮在"无基线"时的执行策略是"只观察"。
+`previous.size > 0` 不能代表 namespace 已初始化：合法的 local-only 或 remote-only
+namespace 可能永远没有 verified-identical 条目，使用它会造成 first-start 永久死锁。
+如果部署时仍希望第一版上线先观察一轮，那只能是**临时 development rollout policy**，
+不能进入长期 scheduler protocol；若未来确需产品级 gate，必须设计独立、显式的
+`namespaceInitialized` 状态，而不是拿 previous 条目数量做代理。
 
 **明确禁止：**
 
 ```text
-MUST NOT: 因为"要自动同步"而改变 first-sync 的保守语义
 MUST NOT: 在两侧都有文件且无 baseline 时自动挑选一方（无论按 mtime、size 还是内容）
 MUST NOT: 自动调用 buildBootstrapResult 建立基线 —— 那需要读内容 + 哈希，
           属于 Inspect 路径的职责，且它有自己的并发与信号语义
@@ -1774,22 +1865,25 @@ Phase 3A 没有 remote push / pulse / 持续 polling。
 focus / resume 是目前唯一一个"用户回来了，值得再看一眼远端"的自然信号。
 ```
 
-**决定：Phase 3A 让 focus / resume 触发 reconciliation，但带最小间隔。**
+**决定：Phase 3A 让 focus / resume 触发 reconciliation。真实的 hidden → visible
+resume 必须补回被取消的工作；额外的 desktop focus 等价信号带最小间隔。**
 
 ```text
-触发条件：visibilitychange → visible（两端通用；桌面 focus 亦可用
-          app.workspace.on('active-leaf-change')? 不 —— 那个语义是切换笔记，
-          与"应用获得焦点"无关，不要用它）
-debounce：800 ms
-最小间隔：两次 focus/resume 触发的 cycle 之间至少 30 s
-          （若上一轮 cycle 在 30 s 内结束过，则本次触发只 version++，
-            不启动 debounce，直到 interval 满足）
+resume 触发：visibilitychange hidden → visible（两端通用）
+           → 总是 requestReconcile("focus-resume")，因为 hidden 已取消 timer / 停止 cycle
+额外 focus：若平台还提供可靠的 desktop focus 等价信号，可触发同一 reason；
+           app.workspace.on('active-leaf-change')? 不 —— 那个语义是切换笔记，
+           与"应用获得焦点"无关，不要用它
+额外 focus debounce：800 ms
+额外 focus 最小间隔：两次额外 focus 触发的 cycle 之间至少 30 s
+           （间隔内忽略请求，不推进 syncDirtyVersion）
+resume debounce：800 ms，不被上述最小间隔抑制
 ```
 
 理由与成本：
 
 ```text
-成本：桌面端每次 focus 都多一次 LIST。用 30 s 最小间隔把
+成本：桌面端额外 focus 信号可能多一次 LIST。用 30 s 最小间隔把
       "频繁 alt-tab" 压成"最多每 30 s 一次"。
       注意：即使触发了 debounce，dirty 与 single-flight 仍然生效 ——
       短时间内的多次 focus 会 coalesce；正在跑的 cycle 不会被叠加。
@@ -1814,9 +1908,11 @@ debounce：800 ms
 ```text
 MUST NOT: 在"不可见 / 后台"状态下跑 cycle
           （后台跑没有意义：用户看不到结果；移动端还可能被系统限制）
+MUST: 进入 hidden 时取消 debounce / retry timer；正在执行的 operation 返回后停止余项
+MUST: visible 后通过 focus-resume debounce 做 full reconciliation，不恢复旧 timer / plan
 MUST NOT: 用一个高频 timer 去检查可见性
 MUST: visibilitychange 的原生事件（或 Obsidian 的等价事件）是唯一入口
-MUST NOT: 把 focus/resume 当作"绕过最小间隔"的借口
+MUST NOT: 让额外 desktop focus 绕过最小间隔；hidden → visible resume 不受该间隔抑制
 ```
 
 ## 6.4 Remote polling（明确禁止）
@@ -1878,12 +1974,13 @@ MUST NOT: 为了"验证这个 hook 可用"而伪造一个 remote-change 触发�
 | temporary 5xx | `RemoteHttpError(5xx)` | unresolved | 同上 |
 | 429 | `RemoteHttpError(429)` | unresolved | 同上 |
 | 401 / 403 | `RemoteHttpError(401/403)` | failed → **auth** | blocked-by-auth（§5.5） |
-| 其他 4xx | `RemoteHttpError(4xx)` | failed | backoff 15 s → 5 min |
+| 其他 definitive 4xx | `RemoteHttpError(4xx)` | stable | 不注册 timer；等待外部触发 |
+| invalid response / mapping | 解析或映射错误 | stable | 不注册 timer；等待外部触发 |
 
 **Phase 3A 第一版最保守方案（推荐）：**
 
 ```text
-failed / unresolved cycle
+retryable cycle（unresolved / transport / 429 / 5xx）
 ↓
 limited backoff（§5.4 的参数）
 ↓
@@ -1893,18 +1990,18 @@ retry（经由 requestReconcile("retry")，走正常状态机）
 同时保留一条**逃生路径**（不需要额外机制，因为它天然存在）：
 
 ```text
-任何新的本地事件 / focus / resume / config-change
-都会立刻 requestReconcile，并【清掉】正在等待的 backoff timer
+在非 auth 的 retryable backoff 中，任何被接受的新本地事件 / focus / resume / config-change
+都会 requestReconcile，并【清掉】正在等待的 backoff timer
 （理由：那些信号说明"输入确实变了"，而 backoff 的前提是"输入没变"）。
 ```
 
 明确写下来的参数（避免实现时再决定）：
 
 ```text
-initial delay      unresolved 5 s / failed 15 s
-max delay          unresolved 60 s / failed 5 min
+initial delay      retryable 5 s
+max delay          retryable 60 s
 倍数               ×2
-reset condition    一次 cycle 结束时该类计数为 0
+reset condition    一次 cycle 结束时 retryable failure 计数为 0
 ```
 
 **不做的事：**
@@ -1917,7 +2014,7 @@ MUST NOT: 把 offline 检测做成主动探测（不做 ping、不做 HEAD 探�
 
 **一个必须承认的确定性问题**：在持续离线的环境下，最终稳定形态是
 "每 60 s 一次失败的 LIST"。这是**有意**的（它保证网络恢复后最多 60 s 内自动收敛），
-而不是缺陷。如果用户在意这 60 s 一次的失败请求，禁用插件是唯一手段（§5.8）。
+而不是缺陷。如果用户在意这 60 s 一次的失败请求，禁用插件是唯一手段（§5.9）。
 
 ## 6.6 未来接口预留（不改状态机）
 
@@ -1935,7 +2032,7 @@ Phase 4 remote pulse        → requestReconcile("remote-change")
 
 ## 第七部分 时序案例（14 个）
 
-以下 timeline 中，`v` 表示全局 dirty version，`dirty` 表示 dirty map。
+以下 timeline 中，`v` 是 `syncDirtyVersion` 的简写，`dirty` 表示 dirty map。
 
 ### Case 1 — 普通编辑
 
@@ -1969,7 +2066,7 @@ t=1600    executor: readStableLocalBytes(a.md) 复查 stat
           → stale(local-changed)                       ← 前置条件保护生效
           如果没改过 → PUT a.md → applied
 t=1700    cycle end：v(2) > startVersion(1) → 不清 b.md → rerun-pending
-          启动 trailing debounce → 2900ms
+          即使 a.md 同时得到 stale，也启动 trailing debounce → 2900ms
 t=2900    running（startVersion=2）
 t=3100    scan local → 看到 a.md（新 baseline，noop）+ b.md（新文件）
           plan → upload b.md（If-None-Match: *）
@@ -2000,10 +2097,10 @@ executor:
   vault.modifyBinary(file, bytes)
   ↓
   【Obsidian emits 'modify' a.md】
-  → scheduler: v++，dirty.set("a.md")          ← 见 §3.8 方案 A
+   → scheduler: syncDirtyVersion++，dirty.set("a.md") ← 见 §3.8 方案 A
   executor: adapter.stat(a.md) → commit baseline { size, mtime_new }
 cycle end：
-  v 前进了 → 不清 a.md → rerun-pending → debounce 1200ms
+  syncDirtyVersion 前进了 → 不清 a.md → rerun-pending → debounce 1200ms
 ↓
 第二轮 running（startVersion=N+1）
 scan local  → a.md @ (size, mtime_new)
@@ -2022,8 +2119,8 @@ cycle end：v 未变 → dirty.clear() → idle
 
 ```text
 t=0     sync running（处理 a.md 的 upload）
-t=100   user modify b.md    v++  dirty.set("b.md")
-t=200   user modify b.md    v++  dirty.set("b.md")
+t=100   user modify b.md    syncDirtyVersion++  dirty.set("b.md")
+t=200   user modify b.md    syncDirtyVersion++  dirty.set("b.md")
 t=800   a.md applied，cycle end
         → 检测到 v 前进 → rerun-pending → debounce 1200ms
 t=2000  running（startVersion = 最新 v）
@@ -2049,8 +2146,9 @@ executor: PUT If-Match: A → 412 → RemoteObjectChangedError
         → stale(remote-changed)
         → 不提交 state、不覆盖 B
 cycle end：
-  stale 存在 → 【0 ms immediate rerun】（§4.3）
-  不清 dirty（version 前进了）→ rerun-pending
+  stale 存在，且本轮没有 pending local dirty
+  → 清除 <= startVersion 的旧标记
+  → 【0 ms immediate full rescan / replan】（§4.3）
 ↓
 第二轮：scan remote → a.md @ ETag B
         previous → { local:(本地版), remote:{etag:A} }
@@ -2059,11 +2157,11 @@ cycle end：
         → 若两侧都变          → conflict "both-modified" → surface only
 ```
 
-**stale 是否必然触发 rerun？**
+**stale 是否必然走 0 ms？**
 
 ```text
-是。stale 是本设计中唯一走 0 ms 立即重跑的本地结果。
-理由见 §4.3：它证明"输入真的变了"，因此不适用"只等新事件"的抑制逻辑。
+不是。stale 必然使旧 plan 失效并要求新一轮，但只有在没有 pending local dirty 时
+走 0 ms；若本轮已有 local dirty，则使用普通 1200 ms trailing debounce。
 ```
 
 ### Case 6 — conflict
@@ -2151,9 +2249,10 @@ cycle end：unresolved 计数为 0 → backoff 重置
 +1200ms（debounce）
 running（reason="startup"）
   scan local / scan remote / load previous / plan
-  ↓
-  previous 为空（首次会话）→ 【不执行任何 operation】，只记录诊断
-  previous 非空            → 正常执行（§6.2 的解除条件）
+  → empty/empty 结束为空 plan
+  → local-only 自动 upload（If-None-Match: *）
+  → remote-only 自动 download（If-Match）
+  → both-exist 保持 conflict，不执行
 cycle end → 按结果决定 idle / rerun / backoff / blocked-by-auth
 ```
 
@@ -2161,12 +2260,14 @@ cycle end → 按结果决定 idle / rerun / backoff / blocked-by-auth
 
 ```text
 前台 → 后台（visibilitychange → hidden）
-  （不做任何事：不跑 cycle、不注册 timer）
+  → 取消 pending debounce / retry timer
+  → 保留 dirty、syncDirtyVersion、retry intent
+  → 若 operation 正在执行，允许该 operation 完成，随后停止 plan 余项
+  → hidden 期间不跑 cycle、不注册 timer
 其他设备写入 R2（本地完全不可见 —— 没有 pulse、没有 polling）
 后台 → 前台（visibilitychange → visible）
-  → 最小间隔检查：距上次 focus/resume cycle ≥ 30 s？
-      否 → 只 v++，不启动 debounce
-      是 → requestReconcile("focus-resume") → 800ms debounce
+  → requestReconcile("focus-resume") → 800ms debounce
+  → 不受额外 desktop focus 的 30 s 限流抑制
 ↓
 running → scan remote → 发现远端新 ETag
   → plan → download（或 upload，取决于本地是否也变了）
@@ -2188,24 +2289,21 @@ t=300   用户改 remote prefix → saveSettings()
         → configGeneration=8
         → 清 pending debounce
         → 【不尝试取消当前 cycle】
-t=800   旧 cycle 继续跑（用旧 client、旧 identity、旧 filter）
-        → 它的 upload 写的是【旧 namespace】
-        → 它的 previous.commit 带 remoteIdentity_old
-t=1200  旧 cycle 结束：
-        capturedGeneration(7) ≠ currentGeneration(8)
-        → 丢弃结果（不进 lastResultCounts）
-        → 提交过的 baseline 带 remoteIdentity_old
-          → 下一次 loadAll 的过滤会让它们失效（main.ts:85 的同一套过滤）
+t=800   当前已开始的 operation 返回（仍使用旧 client / identity / filter）
+        → 若成功，其 previous.commit 带 remoteIdentity_old / ignorePolicy_old，保留
+        → operation loop 检查 generation：7 ≠ 8
+        → 停止旧 cycle，不再启动下一条 operation
+        → 当前 plan 剩余 operation 全部丢弃
         → requestReconcile("config-change") → 400ms debounce
-t=1600  running（configGeneration=8，新 client、新 identity、新 filter）
+t=1200  running（configGeneration=8，新 client、新 identity、新 filter）
         → previous 里旧 identity 的条目已被过滤掉
-        → planner 把新 namespace 当作"没有 previous"
-        → 又见 §6.2 的 first-sync 保守语义（如果新 namespace 没有 baseline）
+        → full scan + replan；若新 namespace 没有 baseline，直接使用 §6.2 的
+          conservative planner 语义（local-only / remote-only 可执行，both-exist conflict）
 ```
 
 ```text
-关键点：旧 cycle 的写入落在旧 namespace（它观测过的那个），
-        它【不可能】污染新 namespace 的 state —— 因为 state 条目自带 identity 字段。
+关键点：已开始的 operation 可以在旧 namespace 完成，但 generation 改变后绝不再启动
+        旧 plan 的下一条 operation。这样 ignoredPaths 改变后不会继续上传新近被忽略的路径。
 ```
 
 ### Case 12 — plugin unload mid-cycle
@@ -2253,7 +2351,8 @@ t=…      cycle end：
 总轮数 = 1。绝不会 100 个 cycle。
 
 如果用户在 executor 跑第 37 条时又改了别的文件：
-  v++ → cycle end 时 v > startVersion → rerun-pending → 第二轮处理剩余变化。
+  syncDirtyVersion++ → cycle end 时 syncDirtyVersion > startVersion
+  → rerun-pending → 第二轮处理剩余变化。
   第二轮也会重新 scan 全部 100+1 个 key —— 第 1..36 条已经是 noop，
   第 37..100 条依赖它们各自的 ETag 前置条件，而 baseline 已经提交，
   所以它们会被 planner 重新判定（noop 或 upload）。
@@ -2261,15 +2360,15 @@ t=…      cycle end：
 
 ### Case 14 — cycle 结束瞬间又来事件（**证明不会丢事件**）
 
-这是必须证明的案例。关键在于 **clear 的 version 语义**（§3.3）。
+这是必须证明的案例。关键在于 **clear 的 syncDirtyVersion 语义**（§3.3）。
 
 ```text
-t=0      running（startVersion = 42）
+t=0      running（startVersion = syncDirtyVersion = 42）
 t=100    executor 完成最后一条 operation
 t=110    ★ user modify c.md
-           → 事件 handler 执行：v 42→43，dirty.set("c.md", 43)
+           → relevant event handler：syncDirtyVersion 42→43，dirty.set("c.md", 43)
 t=120    cycle 的收尾代码开始执行：
-           if (v === startVersion)  → 43 !== 42 → 不清空
+           if (syncDirtyVersion === startVersion) → 43 !== 42 → 不清空
            清除 dirty 中 version <= 42 的项：
              { "a.md" → 41, "c.md" → 43 }
            → { "c.md" → 43 }               ← a.md 被清、c.md 存活
@@ -2288,8 +2387,8 @@ t=1320   （没有 rerun，因为没有 dirty）
 **为什么"事件在 cycle 收尾之后到达"也安全**：
 
 ```text
-t=120    cycle 收尾：v === startVersion(42) → dirty.clear() → idle
-t=121    ★ event：v 43，dirty.set("c.md", 43) → 正常 requestReconcile
+t=120    cycle 收尾：syncDirtyVersion === startVersion(42) → dirty.clear() → idle
+t=121    ★ event：syncDirtyVersion=43，dirty.set("c.md", 43) → 正常 requestReconcile
          → debounce → 新一轮
 ```
 
@@ -2298,10 +2397,14 @@ t=121    ★ event：v 43，dirty.set("c.md", 43) → 正常 requestReconcile
    唯一会丢的实现是"无条件 clear"，而那正是必须被禁止的写法。
 ```
 
+ignored / confirmed folder-only event 不属于这个证明里的 dirty event：即使它恰好在
+`t=110` 到达，也只可增加 `observedEventCount`，`syncDirtyVersion` 仍为 42，因而不会
+制造无意义 rerun。
+
 **实现层面必须遵守的一条（否则 version 语义会被绕过）**：
 
 ```text
-MUST: "比较 version" 与 "清除 dirty 中 <= startVersion 的项" 必须在
+MUST: "比较 syncDirtyVersion" 与 "清除 dirty 中 <= startVersion 的项" 必须在
       同一个同步块内完成，两者之间不得有 await。
       （否则事件可能插在两者之间，而这个插入【恰好】是安全的 —— 
         因为 version 已经前进、不会被本次 clear 影响 —— 
@@ -2355,42 +2458,44 @@ telemetry / 上报 / 远端日志
 Sources（触发源）：
   - startup          （onLayoutReady 之后，reason="startup"）
   - local Vault file events（create/modify/delete/rename，onLayoutReady 之后注册）
-  - focus / resume   （visibilitychange → visible，≥30 s 最小间隔）
+  - focus / resume   （hidden→visible 总是触发；额外 desktop focus ≥30 s 最小间隔）
   - future remoteDirty hook（requestReconcile("remote-change")，Phase 4 接入，现在无调用点）
 
 Mechanism（机制）：
-  - global dirty version（单调递增）
+  - syncDirtyVersion（只由 relevant local file event 单调递增）
   - dirty: Map<canonicalKey, version>     ← coalescing hint，不是事实库
+  - ignored / confirmed folder-only event 不推进 syncDirtyVersion；可选 observedEventCount 仅诊断
   - 唯一入口 requestReconcile(reason)
   - global trailing debounce：local 1200ms / startup 1200ms / focus-resume 800ms /
-                              config-change 400ms / rerun 1200ms / stale 0ms
+                              config-change 400ms / local-dirty rerun 1200ms /
+                              stale-without-local-dirty 0ms
   - single-flight：任意时刻至多一个 cycle
   - full scan / replan 每一轮（不做 key-scoped）
-  - cycle 期间的事件累积为 dirty，cycle 结束后按 version 判定是否 rerun
+  - cycle 期间的 relevant local events 累积为 dirty，cycle 结束后按 syncDirtyVersion 判定
   - clear 只清 <= startVersion 的项
   - SafeExecutor 是唯一写入者；scheduler 不写 Vault、不写 R2、不发 LIST 以外的远端请求
   - delete 全程 BLOCKED（不补能力、不绕过）
-  - 结果处理：applied 继续 / stale 立即 rerun / unresolved backoff 5s→60s /
-              failed backoff 15s→5m / blocked 只等新事件 / conflict 只等新事件
-  - 认证失败 → blocked-by-auth（不注册 retry timer）
-  - config change → generation++，旧 cycle 跑完但结果丢弃，随后强制新一轮
+  - 结果处理：applied 继续 / stale 按 §4.2.1 priority 选择 0ms 或 1200ms /
+              retryable backoff 5s→60s / stable、blocked、conflict 只等外部触发
+  - 认证失败 → cycle-global stop + blocked-by-auth（只由 config change / reload 恢复）
+  - config change → generation++；当前 operation 可完成，边界处停止旧 cycle并丢弃余项，
+                     随后用新 config 强制 full reconciliation
+  - hidden → 取消 debounce / retry timer；当前 operation 可完成，边界处停止余项；
+             visible 后 full reconciliation，不恢复旧 timer / plan
   - unload → stopped=true，清 timer，移除 listeners，允许飞行中的 operation 完成，
              但不再启动后续 operation 与 cycle
-  - 状态栏只读、不触发同步；无 Sync Now；“首次会话无 baseline”时 startup 只观察不执行
+  - 状态栏只读、不触发同步；无 Sync Now；first-start 直接服从 planner，
+    不使用 previous.size > 0 gate
 ```
 
-相对于提示词里建议形状的**三处主动偏离**（审计后决定）：
+经交叉审计后，V1 的三个易混淆边界是：
 
 ```text
-1. rerun 采用"cycle 结束后再 debounce 一次"，而不是"结束后立即重跑"。
-   理由：100 文件 burst 下"立即"会让排队深度等于事件数（§3.2）。
+1. ordinary local dirty 采用 cycle 结束后 1200 ms trailing debounce；它不排队多个 cycle。
 
-2. stale 采用 0 ms 立即重跑，与 unresolved / failed 的 backoff 分开。
-   理由：stale 证明输入真的变了，不适用"只等新事件"的抑制逻辑（§4.3）。
+2. stale 只有在没有 pending local dirty 时采用 0 ms；stale + dirty 仍等待 trailing debounce。
 
-3. startup 在"没有可信 baseline"时【不执行】任何 operation。
-   这是唯一一条"比提示词更保守"的偏离，理由见 §6.2
-   （三个变化同时上线无法归因 + bootstrap 机制已存在且已验证）。
+3. first-start 不设 previous-size gate：local-only / remote-only 安全执行，both-exist conflict。
 ```
 
 ---
@@ -2406,23 +2511,29 @@ Mechanism（机制）：
 3.  MUST 每一轮 cycle 都重新 scan local + scan remote + load previous + 由 planner 决策。
 4.  MUST 在 stale 之后重新 scan / 重新 plan；绝不重试旧 operation、绝不移除条件。
 5.  MUST 保留运行期间到达的事件（version 化 clear：只清 <= startVersion 的项）。
-6.  MUST 允许与 conflict 无关的其他 key 正常收敛（单 key 结果不得中止整轮 cycle）。
+6.  MUST 允许与 conflict / stable failure / blocked 无关的其他 key 正常收敛；
+        auth、config change、stopped、hidden 是明确的 cycle-global stop conditions。
 7.  MUST 保持 delete-local / delete-remote 为 BLOCKED，且不绕过 SafeExecutor 补删除能力。
 8.  MUST 让 SafeExecutor 成为唯一写入者（Vault 内容写入 + R2 写入）。
 9.  MUST 让每个 cycle 持有冻结的 config 快照（endpoint/bucket/prefix/ignorePolicy/
         accessKeyId/configGeneration）与单一 client 实例。
-10. MUST 对 unresolved 与 failed 使用有限退避（5s→60s / 15s→5m，×2，计数归零重置）。
-11. MUST 在认证失败（401/403）时进入 blocked-by-auth 并停止自动重试（不注册 timer）。
-12. MUST 让 blocked 与 conflict 只等待新的外部触发，不自动 rerun。
+10. MUST 只对 retryable / unresolved 使用有限退避（5s→60s，×2，计数归零重置）；
+        stable failure 不注册 timer。
+11. MUST 把认证失败（401/403）作为 cycle-global stop：当前 operation 返回后停止余项，
+        进入 blocked-by-auth，且不注册 timer。
+12. MUST 让 stable failure、blocked 与 conflict 只等待新的外部触发，不自动 rerun。
 13. MUST 在 dispose/unload 时：置 stopped、清 timer、移除 listeners；
         允许飞行中的 operation 完成，但不再启动后续 operation 与 cycle。
-14. MUST 把"仍有 pending dirty"作为 cycle 结束后 rerun 的判定依据（而不是"上一轮有没有操作"）。
-15. MUST 在 cycle 的每个写入步骤之前确认代际 / stopped / config 仍然有效。
+14. MUST 把"仍有 pending local dirty"作为 1200ms trailing rerun 的判定依据；
+        stale 仅在没有 pending local dirty 且没有更高优先级 retryable / global condition 时走 0ms。
+15. MUST 在每条 operation 开始前检查 stopped / configGeneration / visibility；
+        已开始的 operation 可完成，条件失效后不得启动下一条。
 16. MUST 让状态栏保持只读（无点击处理器、不触发同步）。
 17. MUST 让所有路径过滤复用 createVaultPathFilter 与 ignorePolicyFingerprint。
 18. MUST 复用 existing 的脱敏策略记录错误，绝不记录凭据、签名头、文件正文。
 19. MUST 在 onLayoutReady 之后才注册 Vault listeners。
-20. MUST 让 startup 在没有可信 baseline 时只观察、不执行任何 operation。
+20. MUST 让 first-start 直接服从 planner：local-only upload、remote-only download、
+        both-exist conflict；不得用 previous.size > 0 作为初始化 gate。
 21. MUST 保持 operation 顺序 = planner 的 deterministic 顺序，逐条顺序执行。
 22. MUST 让一轮 cycle 被理解为 optimistic reconciliation attempt（不是事务、不是快照）。
 ```
@@ -2434,7 +2545,7 @@ Mechanism（机制）：
 2.  MUST NOT 在 stale 之后使用无条件写（绝不去掉 If-Match / If-None-Match）。
 3.  MUST NOT 从状态栏触发同步。
 4.  MUST NOT 新增 Sync Now / Push Now / Pull Now / Retry Now。
-5.  MUST NOT 在 blocked / conflict / failed / unresolved 上忙循环（busy-loop）。
+5.  MUST NOT 在 stable failure / blocked / conflict 上注册 timer，或在 retryable / stale 上忙循环。
 6.  MUST NOT 让 Vault event 直接产生 operation（绕过 planner）。
 7.  MUST NOT 实现 key-scoped / partial reconciliation。
 8.  MUST NOT 实现 self-write suppression（时间窗 / 标记 / generation 抑制）。
@@ -2446,12 +2557,14 @@ Mechanism（机制）：
 14. MUST NOT 让 Inspect Sync State / Test Connection 调用 scheduler 或触发同步。
 15. MUST NOT 把 noop / conflict 送进 SafeExecutor 当作可执行操作。
 16. MUST NOT 因为"更快"而扩大 Phase 3A 范围（不做 multipart、不做并行、不做优先级队列）。
-17. MUST NOT 在启动的第一轮（无 baseline 时）自动执行 upload / download。
+17. MUST NOT 用 previous 条目数量代理 namespace 初始化状态；first-start 不得因此停死。
 18. MUST NOT 在两侧都有文件且无 baseline 时自动挑选一方（按 mtime / size / 内容都不行）。
 19. MUST NOT 让 cycle 里跑内容哈希（不接 buildBootstrapResult 到执行路径）。
 20. MUST NOT 把 blocked delete 变成自动清理远端孤儿对象的借口。
 21. MUST NOT 记录文件正文、credentials、signed headers 到日志或诊断。
 22. MUST NOT 在不可见 / 后台状态下跑 cycle。
+23. MUST NOT 让 ignored / confirmed folder-only event 推进 syncDirtyVersion 或触发 rerun。
+24. MUST NOT 让 blocked-by-auth 被普通 local event 或周期性 auth probe 解除。
 ```
 
 ---
@@ -2468,7 +2581,7 @@ Mechanism（机制）：
    在验证之前，实现应采用"默认按文件处理"的安全侧。
 
 2. **`focus` 状态的观测手段。**
-   语义已定（≥30 s 最小间隔 + visibilitychange），但 Obsidian 在桌面与移动端
+   语义已定（hidden→visible 必触发；额外 desktop focus ≥30 s 最小间隔），但 Obsidian 在桌面与移动端
    是否都可靠地触发 `document.visibilitychange`（而不是仅触发 Electron 的
    `browser-window-focus`）需要真机验证。若移动端不触发，需要另找等价入口 ——
    这会影响 Case 10 的可用性，但不影响其他任何语义。
