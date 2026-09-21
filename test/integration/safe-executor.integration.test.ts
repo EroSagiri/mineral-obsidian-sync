@@ -54,10 +54,10 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
 
     // Baselines exist for the reconciled uploads and for every applied download.
     expect([...state.entries.keys()].sort()).toEqual([
-      `${scratch.root}downloaded/a/b/c/deep.md`,
-      `${scratch.root}downloaded/existing/parent/kept.md`,
-      `${scratch.root}downloaded/nested/new/note.md`,
-      `${scratch.root}downloaded/root-file.md`,
+      `${scratch.root}existing/parent/kept.md`,
+      `${scratch.root}multi/level/deep/foo.md`,
+      `${scratch.root}one-level/foo.md`,
+      `${scratch.root}root-file.md`,
       `${scratch.root}stale-remote.md`,
       `${scratch.root}test-file.md`,
     ]);

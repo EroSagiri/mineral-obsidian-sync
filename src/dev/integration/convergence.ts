@@ -221,10 +221,14 @@ async function convergenceScenario(context: ConvergenceContext): Promise<Scenari
  */
 async function downloadAppliedScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
   const cases: Array<{ leaf: string; preCreatedParent: string[] }> = [
-    { leaf: "downloaded/root-file.md", preCreatedParent: [] },
-    { leaf: "downloaded/nested/new/note.md", preCreatedParent: [] },
-    { leaf: "downloaded/a/b/c/deep.md", preCreatedParent: [] },
-    { leaf: "downloaded/existing/parent/kept.md", preCreatedParent: ["downloaded/existing/parent"] },
+    // 1. remote-only file directly in the existing scratch root: no folder is needed at all.
+    { leaf: "root-file.md", preCreatedParent: [] },
+    // 2. one missing level.
+    { leaf: "one-level/foo.md", preCreatedParent: [] },
+    // 3. a fully missing chain.
+    { leaf: "multi/level/deep/foo.md", preCreatedParent: [] },
+    // 4. the parent already exists.
+    { leaf: "existing/parent/kept.md", preCreatedParent: ["existing/parent"] },
   ];
   let parentFoldersCreated = false;
 
@@ -249,11 +253,11 @@ async function downloadAppliedScenario(context: ConvergenceContext): Promise<Sce
     if (!parentExistedBefore && context.vault.getAbstractFileByPath(parentPath) !== null) parentFoldersCreated = true;
   }
 
-  const nestedKey = context.scratch.key("downloaded/nested/new/note.md");
+  const nestedKey = context.scratch.key("multi/level/deep/foo.md");
   requireOperation((await observe(context, [nestedKey])).plan, nestedKey, "noop");
 
   return [
-    observation("remote-only nested file", "downloaded/nested/new/note.md"),
+    observation("remote-only nested file", "multi/level/deep/foo.md"),
     observation("missing parent folders created", parentFoldersCreated),
     observation("local bytes exact", true),
     observation("previous state committed", true),
