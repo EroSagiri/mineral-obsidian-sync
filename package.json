@@ -1,0 +1,23 @@
+{
+  "name": "mineral-obsidian-sync",
+  "version": "0.1.0",
+  "description": "Read-only dry-run planner for R2-backed Obsidian vault sync.",
+  "private": true,
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.2",
+    "obsidian": "^1.8.7",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  }
+}

@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output
+main.js
+
+# Local plugin/runtime data
+data.json
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test / coverage output
+coverage/
+.vitest/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# TypeScript / build caches
+*.tsbuildinfo
+
+# Optional local test artifacts
+test-output/
+tmp/
