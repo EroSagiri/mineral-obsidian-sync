@@ -54,6 +54,7 @@ export async function runR2SelfTest(app: App, settings: R2SyncSettings, selectio
   const config = configuration(settings);
   const startedAt = Date.now();
   const namespace = IntegrationTestNamespace.mint();
+  const platform = platformLabel();
   const ignorePolicy = ignorePolicyFingerprint(settings);
   const results: ScenarioResult[] = [];
 
@@ -63,7 +64,7 @@ export async function runR2SelfTest(app: App, settings: R2SyncSettings, selectio
       objectRoot: namespace.objectRoot,
       localRoot: namespace.root,
     });
-    results.push(...(await runTransportScenarios({ namespace, client: transportClient })));
+    results.push(...(await runTransportScenarios({ namespace, client: transportClient, platform })));
   }
 
   if (selection.convergence) {
@@ -98,7 +99,7 @@ export async function runR2SelfTest(app: App, settings: R2SyncSettings, selectio
   }
 
   return redactReport(
-    { runId: namespace.runId, root: namespace.root, environment: `obsidian-requesturl/${platformLabel()}`, startedAt, finishedAt: Date.now(), results },
+    { runId: namespace.runId, root: namespace.root, environment: `obsidian-requesturl/${platform}`, startedAt, finishedAt: Date.now(), results },
     [settings.accessKeyId, settings.secretAccessKey],
   );
 }

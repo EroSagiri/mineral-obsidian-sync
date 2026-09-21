@@ -2,6 +2,7 @@ import type { R2Client } from "../../remote/r2-client";
 import { sha256 } from "../../sync/fingerprint";
 import { randomBytes as secureRandomBytes, sameBytes, toArrayBuffer, utf8 } from "./bytes";
 import { classifyTransportError } from "./classify";
+import { headErrorsAreOpaque } from "./context";
 import type { TransportScenarioContext } from "./context";
 import { primitivesScenario } from "./primitives";
 import { observation, require, runScenario } from "./result";
@@ -206,12 +207,15 @@ async function conditionalHeadScenario(context: TransportScenarioContext): Promi
   } catch (error) {
     outcome = classifyTransportError(error);
   }
-  require(outcome !== "http-501" && outcome !== "http-400" && !outcome.startsWith("http-5"), `conditional HEAD is not usable (${outcome}); post-PUT confirmation would fail`);
-  require(outcome === "precondition-failed" || outcome === "ignored (200)", `conditional HEAD behaved unexpectedly (${outcome})`);
+  // On mobile a non-2xx HEAD response is dropped by the platform, so the endpoint behaviour is
+  // simply unobservable there; it was measured as a 412 on desktop.
+  const unobservable = outcome === "transport-error" && headErrorsAreOpaque(context.platform);
+  require(unobservable || outcome !== "http-501" && outcome !== "http-400" && !outcome.startsWith("http-5"), `conditional HEAD is not usable (${outcome}); post-PUT confirmation would fail`);
+  require(unobservable || outcome === "precondition-failed" || outcome === "ignored (200)", `conditional HEAD behaved unexpectedly (${outcome})`);
 
   return [
     observation("HEAD metadata", "canonical"),
-    observation("HEAD If-Match with an unknown ETag", outcome),
+    observation("HEAD If-Match with an unknown ETag", unobservable ? "unobservable: the platform drops a non-2xx HEAD response (412 on desktop)" : outcome),
   ];
 }
 

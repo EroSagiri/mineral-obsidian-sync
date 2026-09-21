@@ -77,10 +77,10 @@ describe("R2 conditional transport: real signer + real RequestUrlTransport over 
     expect(statuses(results)).toEqual(transportScenarioNames().map((name) => `${name}:pass`));
   });
 
-  it("documents a body-less 404 HEAD as a transport error, while every scenario still runs", async () => {
-    // The measured Android signature. Only the missing-object HEAD is affected: every other error
-    // path carries a response body, and no scenario depends on a 404 HEAD any more.
-    const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHeadMissing: true });
+  it("documents a body-less non-2xx HEAD as a transport error on a strict platform", async () => {
+    // A desktop-like platform must never turn a typed error into an opaque throw: the matrix fails
+    // loudly, while every error path the product depends on stays typed and all scenarios pass.
+    const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHeadNon2xx: true });
     const results = await runTransportScenarios({ namespace, client });
     const matrix = find(results, "transport-primitives");
     const probe = (name: string): string => String(matrix.observations.find((entry) => entry.name === name)?.value);
@@ -88,17 +88,35 @@ describe("R2 conditional transport: real signer + real RequestUrlTransport over 
     expect(matrix.status).toBe("fail");
     expect(matrix.detail).toContain("HEAD absent → http-404");
     expect(probe("HEAD absent → http-404")).toContain("got transport-error");
-    expect(probe("HEAD absent → http-404")).toContain("Stream closed");
+    expect(probe("HEAD If-Match (stale) → precondition")).toContain("got transport-error");
     // Error paths whose response carries a body are unaffected.
     expect(probe("GET absent → http-404")).toBe("ok: http-404");
-    expect(probe("HEAD If-Match (stale) → precondition")).toBe("ok: precondition-failed");
     expect(probe("GET If-Match (stale) → precondition")).toBe("ok: precondition-failed");
     expect(probe("PUT If-None-Match:* on existing → precondition")).toBe("ok: precondition-failed");
     expect(probe("PUT If-Match (stale) → precondition")).toBe("ok: precondition-failed");
     // A rejected conditional write leaves the object untouched.
     expect(probe("LIST after rejected create")).toContain("present size=26");
-    // And the harness itself no longer depends on a 404 HEAD, so the scenarios pass here.
-    expect(statuses(results).filter((entry) => entry.endsWith(":fail"))).toEqual(["transport-primitives:fail"]);
+    // And no scenario depends on a 404 HEAD any more, so only the HEAD-specific probes complain.
+    expect(statuses(results).filter((entry) => entry.endsWith(":fail"))).toEqual(["transport-primitives:fail", "conditional-head:fail"]);
+  });
+
+  it("accepts the documented mobile limitation without losing any product-critical check", async () => {
+    const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHeadNon2xx: true });
+    const results = await runTransportScenarios({ namespace, client, platform: "android" });
+    const matrix = find(results, "transport-primitives");
+    const probe = (name: string): string => String(matrix.observations.find((entry) => entry.name === name)?.value);
+
+    // The limitation is recorded verbatim, never hidden…
+    expect(matrix.status).toBe("pass");
+    expect(probe("HEAD absent → http-404")).toContain("ok on mobile: transport-error");
+    expect(probe("HEAD If-Match (stale) → precondition")).toContain("ok on mobile: transport-error");
+    // …and every check the product's correctness depends on is still strict.
+    expect(probe("GET absent → http-404")).toBe("ok: http-404");
+    expect(probe("GET If-Match (stale) → precondition")).toBe("ok: precondition-failed");
+    expect(probe("PUT If-None-Match:* on existing → precondition")).toBe("ok: precondition-failed");
+    expect(probe("PUT If-Match (stale) → precondition")).toBe("ok: precondition-failed");
+    expect(probe("LIST after small PUT")).toContain("present size=18");
+    expect(statuses(results)).toEqual(transportScenarioNames().map((name) => `${name}:pass`));
   });
 
   it("attributes a fully broken HEAD without blaming the write", async () => {

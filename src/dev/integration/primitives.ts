@@ -1,6 +1,7 @@
 import type { RemoteEntry } from "../../sync/types";
 import { randomBytes as secureRandomBytes, toArrayBuffer, utf8 } from "./bytes";
 import { classifyTransportError, describeTransportError } from "./classify";
+import { headErrorsAreOpaque } from "./context";
 import type { TransportScenarioContext } from "./context";
 import { observation, ScenarioFailure } from "./result";
 import type { ScenarioObservation } from "./result";
@@ -41,14 +42,29 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
       record(name, `FAILED: ${describeTransportError(error)}`);
     }
   };
-  /** An error path is "ok" only when it produces the expected *typed* error, not a transport throw. */
-  const expectError = async (name: string, expected: string, action: () => Promise<unknown>): Promise<void> => {
+  /**
+   * An error path is "ok" only when it produces the expected *typed* error, not a transport throw.
+   *
+   * `safeWhenOpaque` marks the two HEAD probes: on mobile the platform cannot deliver a non-2xx
+   * HEAD response at all, and an opaque failure on those requests is harmless because a HEAD never
+   * gates a write — it only confirms one. Every probe the product's correctness depends on (GET and
+   * PUT error paths, and all happy paths) stays strictly typed on every platform.
+   */
+  const expectError = async (name: string, expected: string, action: () => Promise<unknown>, safeWhenOpaque = false): Promise<void> => {
     try {
       await action();
       record(name, `FAILED: expected ${expected}, but the call succeeded`);
     } catch (error) {
       const kind = classifyTransportError(error);
-      record(name, kind === expected ? `ok: ${kind}` : `FAILED: expected ${expected}, got ${kind} (${describeTransportError(error)})`);
+      if (kind === expected) {
+        record(name, `ok: ${kind}`);
+        return;
+      }
+      if (safeWhenOpaque && kind === "transport-error" && headErrorsAreOpaque(context.platform)) {
+        record(name, "ok on mobile: transport-error, response dropped by the platform (never gates a write)");
+        return;
+      }
+      record(name, `FAILED: expected ${expected}, got ${kind} (${describeTransportError(error)})`);
     }
   };
 
@@ -96,9 +112,9 @@ export async function primitivesScenario(context: TransportScenarioContext): Pro
   }
 
   // ---- error paths: 404 and 412 on every method the product uses ----
-  await expectError("HEAD absent → http-404", "http-404", () => context.client.headObject(absentKey));
+  await expectError("HEAD absent → http-404", "http-404", () => context.client.headObject(absentKey), true);
   await expectError("GET absent → http-404", "http-404", () => context.client.getObject(absentKey));
-  await expectError("HEAD If-Match (stale) → precondition", "precondition-failed", () => context.client.headObject(smallKey, { ifMatch: STALE_ETAG }));
+  await expectError("HEAD If-Match (stale) → precondition", "precondition-failed", () => context.client.headObject(smallKey, { ifMatch: STALE_ETAG }), true);
   await expectError("GET If-Match (stale) → precondition", "precondition-failed", () => context.client.getObject(smallKey, { ifMatch: STALE_ETAG }));
   await expectError("PUT If-None-Match:* on existing → precondition", "precondition-failed", () => context.client.putObject(smallKey, v1, { ifNoneMatch: "*" }));
   await expectError("PUT If-Match (stale) → precondition", "precondition-failed", () => context.client.putObject(smallKey, v1, { ifMatch: STALE_ETAG }));

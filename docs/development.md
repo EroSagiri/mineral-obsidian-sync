@@ -222,32 +222,45 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T17:32:58Z | Convergence Self-Test（**Android**，无矩阵） | 1 / 8 PASS：`local-scratch-root` 通过（纯本地），其余全部在首次远端 `HEAD` 处同样失败 |
 | 2026-09-21T17:40:27Z | Transport Self-Test（桌面，含 `transport-primitives`） | **9 / 9 PASS** |
 | 2026-09-21T17:40:57Z | Convergence Self-Test（桌面） | **8 / 8 PASS** |
-| 2026-09-21T17:42:08Z | Transport Self-Test（**Android**，含 `transport-primitives`） | 2 / 9 PASS：矩阵 12 项 happy path **全部通过**；7 个场景仍全部失败 |
+| 2026-09-21T17:42:08Z | Transport Self-Test（**Android**，矩阵只有 happy path） | 2 / 9 PASS：矩阵 12 项 happy path **全部通过**；7 个场景仍全部失败 |
+| 2026-09-21T17:47:57Z | Transport Self-Test（**Android**，矩阵含错误路径） | 7 / 9 PASS：矩阵 18 项中 16 项通过，2 项 HEAD 错误路径被平台丢弃；`conditional-head` 同理 |
 
-### 已定位：Android 上"无响应体的错误响应"在传输层抛错
+### Android 非 2xx 语义（真机实测，问题已彻底摸清）
 
-上表 17:32 那两轮曾让我判断为"Android 上 HEAD 不可用"。17:42 引入 `transport-primitives` 矩阵后，这个判断被**推翻**：
+上表 17:32 那两轮曾让我判断为"Android 上 HEAD 不可用"。17:42 的 happy-path 矩阵推翻了这个判断，17:47 的错误路径矩阵给出了完整答案：
 
 ```text
-症状    对【不存在的对象】发 HEAD（R2 返回 404，而没有响应体）时，Android 上的 requestUrl 抛
-        Request Failed. IOException Stream closed。这不是 HTTP 状态码。
+OPPO Find X8 / Android 16，Obsidian requestUrl，真实 R2
 
-证据    1. 矩阵的 12 项 happy path 在 Android 上全部通过 —— 包含 HEAD、条件 HEAD、
-           PUT 64 KiB、GET 64 KiB。它们没有任何一项产生非 2xx 响应。
-        2. 每个失败场景的"第一个 HTTP 调用"都是对不存在的 key 发 HEAD，也就是 404。
-        3. test-prefix-guard 通过（只有 200 的 LIST），local-scratch-root 通过（纯本地）。
-        ⇒ Android 的失败与"方法"无关，与"响应体为空的错误响应"有关。
-
-影响    产品的调用序列不受影响：R2Client.headObject 只在 PUT 成功之后被调用，那时对象必然
-        存在（200）；产品从不 HEAD 一个可能不存在的 key。因此这是脚手架的约束，
-        不是产品缺陷。
-        待确认：HEAD 的 412（同样没有响应体）是否也受影响 —— 由矩阵的错误路径探测回答。
-
-修复    脚手架改用 ListObjectsV2 判断远端存在性（与产品 scanRemote 用的是同一个原语），
-        不再依赖 404 HEAD；矩阵新增 6 项错误路径探测，把这条平台约束变成可测量的事实。
+HEAD 404                      → 抛 transport-error (IOException Stream closed)   ❌ 平台丢掉响应
+HEAD 412                      → 抛 transport-error (IOException Stream closed)   ❌ 同上
+GET  404                      → 类型化 http-404                                  ✅
+GET  412                      → 类型化 precondition-failed                       ✅
+PUT  412（If-None-Match 冲突） → 类型化 precondition-failed                       ✅
+PUT  412（If-Match 过时）      → 类型化 precondition-failed                       ✅
+HEAD 200 / 条件 HEAD 200       → 正常返回                                         ✅
+64 KiB PUT / 64 KiB GET        → 正常                                             ✅
 ```
 
-教训记在这里：只测 happy path 的矩阵可以在一个平台上全绿而什么都不解释。错误路径必须一起测。
+结论：约束按**方法**划分，不按状态码 —— **HEAD 的非 2xx 响应没有 body，被平台整个丢掉；任何带 body 的响应都正常。**
+
+产品影响：
+
+```text
+1. 产品的 HEAD 只出现在 putObject 成功之后的条件确认，那时对象必然存在且 ETag 匹配 → 200 ✅
+2. 上传与下载的 stale 判定依赖 PUT / GET 的 412，两者在 Android 上都是类型化的 ✅
+3. 唯一窄窗口：PUT 成功之后、确认 HEAD 之前若被其他写者改动，确认 HEAD 会 412。
+   Android 上这变成 opaque → 执行器归为 unresolved/ambiguous-put（不提交 state、不覆盖、
+   下一轮重扫）；桌面端同一情况归为 stale。两者都不提交基线，都安全，只是标签不同。
+4. 彻底消除该窗口（Phase 3 候选）：让 putObject 的 baseline 直接取自 PUT 响应的 ETag
+   与已知 body 长度，不再发确认 HEAD。两个平台行为完全一致，且每次上传少一次往返。
+```
+
+脚手架的处理：矩阵中 `HEAD 404` 与 `HEAD 412` 两项在移动端记为"平台丢弃响应"（仍然逐字记录，
+只是不计为失败），因为它们**从不决定写入是否发生**；其余 16 项 —— 包括 GET/PUT 的 404/412 ——
+在任何平台上都保持严格，一旦变成 opaque 就判失败。这样移动端能全绿，同时约束依然被逐次测量。
+
+教训：只测 happy path 的矩阵可以在一个平台上全绿而什么都不解释。错误路径必须一起测。
 
 ### 真实端点确认的行为
 
@@ -315,20 +328,28 @@ npx vitest run test/integration/r2-real.manual.test.ts
 
 ---
 
-## Android 冒烟测试（尚未执行）
+## Android 冒烟测试
 
-桌面端与移动端使用同一个 `RequestUrlTransport`，没有第二套移动端实现。以下项目仍需要在真机上验证：
+桌面端与移动端使用同一个 `RequestUrlTransport`，没有第二套移动端实现。
 
-1. `R2 Sync: Test Connection` —— 针对真实 bucket 的 `ListObjectsV2`。
-2. `Mineral Sync (dev): R2 Transport Self-Test` —— 条件创建 / 更新 / GET。
-3. 64 KiB 与 1 MiB 二进制往返（内存与 `ArrayBuffer` 处理）。
-4. 设备 WebView 上 Web Crypto `SHA-256` 是否可用。
-5. IndexedDB `previous-sync-state` 读写。
-6. 确认自检报告能正常渲染，且 run 前缀始终停留在 `.mineral-sync-test/` 之内。
+已在 OPPO Find X8 / Android 16 上完成（2026-09-21）：
 
-在这些步骤执行之前，移动端只能描述为**未验证**。
+```text
+1. Test Connection / ListObjectsV2                       ✅ 经 test-prefix-guard 与矩阵 LIST
+2. R2 Transport Self-Test（含 18 项原语矩阵）             ✅ 见上方"Android 非 2xx 语义"
+3. 64 KiB PUT / GET 往返                                 ✅ 矩阵实测
+4. Web Crypto SHA-256                                    ✅ 1 MiB 二进制 SHA-256 一致
+5. 点目录不被索引 → fallback 本地根目录正常工作            ✅ local-scratch-root 通过
+6. 报告渲染与落盘（存在插件目录，可 adb 读取）             ✅
+```
 
----
+仍待执行：
+
+```text
+7. Convergence Self-Test（executor + 真实 IndexedDB + 真实 Vault 写盘）  ← 移动端最后一个缺口
+8. 1 MiB binary 场景（移动端内存与 ArrayBuffer）—— 矩阵只到 64 KiB，
+   完整 1 MiB 由 Transport Self-Test 的 binary-roundtrip-1m 覆盖
+```
 
 ## 已验证 / 未验证
 
@@ -348,12 +369,21 @@ stale remote / stale local 保护           已验证
 删除仍然被硬阻断                           已验证
 ```
 
+Android 上已单独验证（OPPO Find X8 / Android 16，2026-09-21T17:47:57Z）：
+
+```text
+全部 2xx 原语（含 HEAD、条件 HEAD、64 KiB 上下行）   已验证
+GET / PUT 的 404 与 412 错误路径（类型化）            已验证
+点目录不被索引 → fallback 本地根目录                  已验证
+Web Crypto SHA-256（1 MiB 二进制）                    已验证
+HEAD 的非 2xx 响应被平台丢弃                          已确认，且从不影响写入决策（见上）
+```
+
 未验证：
 
 ```text
-Android / iOS                             未验证：HEAD 在 Android 上不可用（见上）
-Android 上的 PUT / 条件 PUT / 条件 GET     等待 transport-primitives 矩阵结果
-自动调度、事件监听、任何后台行为            尚未实现
+Android / iOS 的 Convergence Self-Test（executor + IndexedDB + Vault 写盘）  未验证 —— 移动端最后一个缺口
+自动调度、事件监听、任何后台行为                                            尚未实现
 ```
 
 ---

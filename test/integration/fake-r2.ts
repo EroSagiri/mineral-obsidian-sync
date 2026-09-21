@@ -26,8 +26,8 @@ export interface FakeR2Options {
   ignoreConditionalHead?: boolean;
   /** Reproduces Obsidian on Android (2026-09-21): HEAD throws at the transport layer. */
   failHead?: boolean;
-  /** Reproduces the measured Android case: a HEAD whose 404 response has no body throws. */
-  failHeadMissing?: boolean;
+  /** Reproduces the measured Android case exactly: any non-2xx HEAD response is dropped. */
+  failHeadNon2xx?: boolean;
 }
 
 const EMPTY = new ArrayBuffer(0);
@@ -62,7 +62,7 @@ export class FakeR2 {
       ignoreIfMatch: options.ignoreIfMatch ?? false,
       ignoreConditionalHead: options.ignoreConditionalHead ?? false,
       failHead: options.failHead ?? false,
-      failHeadMissing: options.failHeadMissing ?? false,
+      failHeadNon2xx: options.failHeadNon2xx ?? false,
     };
     setRequestUrlHandler((request) => this.handle(request));
   }
@@ -78,6 +78,11 @@ export class FakeR2 {
       text: `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${code}</Message></Error>`,
       arrayBuffer: EMPTY,
     };
+  }
+
+  private headError(status: number, code: string): MockRequestUrlResponse {
+    if (this.settings.failHeadNon2xx) throw new Error("Request Failed. IOException Stream closed");
+    return this.error(status, code);
   }
 
   private metadata(entry: FakeObject): Record<string, string> {
@@ -149,13 +154,12 @@ export class FakeR2 {
       return { status: 200, headers: this.metadata(stored), text: "", arrayBuffer: EMPTY };
     }
 
-    if (!current) {
-      // A 404 HEAD carries no response body, and Obsidian on Android throws for exactly that.
-      if (method === "HEAD" && this.settings.failHeadMissing) throw new Error("Request Failed. IOException Stream closed");
-      return this.error(404, "NoSuchKey");
-    }
+    // Obsidian on Android cannot deliver a non-2xx HEAD response: no body, no status, just a throw.
+    if (!current) return method === "HEAD" ? this.headError(404, "NoSuchKey") : this.error(404, "NoSuchKey");
     const conditionalHead = method === "HEAD" && this.settings.ignoreConditionalHead;
-    if (ifMatch && !conditionalHead && !this.settings.ignoreIfMatch && ifMatch !== current.etag) return this.error(412, "PreconditionFailed");
+    if (ifMatch && !conditionalHead && !this.settings.ignoreIfMatch && ifMatch !== current.etag) {
+      return method === "HEAD" ? this.headError(412, "PreconditionFailed") : this.error(412, "PreconditionFailed");
+    }
     if (method === "HEAD") return { status: 200, headers: this.metadata(current), text: "", arrayBuffer: EMPTY };
     if (method === "GET") return { status: 200, headers: this.metadata(current), text: new TextDecoder().decode(current.bytes), arrayBuffer: current.bytes.slice(0).buffer };
     return this.error(400, "MethodNotAllowed");
