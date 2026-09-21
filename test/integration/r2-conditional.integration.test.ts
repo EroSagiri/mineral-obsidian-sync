@@ -77,6 +77,37 @@ describe("R2 conditional transport: real signer + real RequestUrlTransport over 
     expect(statuses(results)).toEqual(transportScenarioNames().map((name) => `${name}:pass`));
   });
 
+  it("separates a broken HEAD from a working write, the way Android behaves", async () => {
+    // Reproduces the real Android signature: every scenario that starts with HEAD dies, but the
+    // write itself lands. The matrix must attribute that correctly instead of blaming PUT.
+    const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, failHead: true });
+    const results = await runTransportScenarios({ namespace, client });
+    const matrix = find(results, "transport-primitives");
+    const probe = (name: string): string => String(matrix.observations.find((entry) => entry.name === name)?.value);
+
+    expect(matrix.status).toBe("fail");
+    expect(matrix.detail).toContain("primitive probes failed");
+    expect(probe("LIST")).toContain("ok");
+    expect(probe("HEAD")).toContain("FAILED");
+    expect(probe("HEAD If-Match (matching)")).toContain("FAILED");
+    // The product's putObject confirms with a HEAD, so even a successful write reports failure…
+    expect(probe("PUT If-None-Match:* small")).toContain("FAILED");
+    expect(probe("PUT If-Match (update)")).toContain("FAILED");
+    // …but LIST is a plain GET, and it proves both writes landed.
+    const v1Size = new TextEncoder().encode("primitive probe v1").byteLength;
+    const v2Size = new TextEncoder().encode("primitive probe v2 updated").byteLength;
+    expect(probe("LIST after small PUT")).toContain(`present size=${v1Size}`);
+    expect(probe("LIST after 64 KiB PUT")).toContain("present size=65536");
+    expect(probe("LIST after update")).toContain(`present size=${v2Size}`);
+    // Body-carrying and conditional reads are unaffected by the broken HEAD.
+    expect(probe("GET")).toContain("ok");
+    expect(probe("GET 64 KiB")).toContain("ok");
+    expect(probe("GET If-Match (matching)")).toContain("ok");
+    // The guard needs no HEAD, which is why it passed on the real Android device.
+    expect(find(results, "test-prefix-guard").status).toBe("pass");
+    expect(find(results, "conditional-create").detail).toContain("Stream closed");
+  });
+
   it("fails the create scenario when the endpoint ignores If-None-Match", async () => {
     const { namespace, client } = createHarness({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, ignoreIfNoneMatch: true });
     const results = await runTransportScenarios({ namespace, client });

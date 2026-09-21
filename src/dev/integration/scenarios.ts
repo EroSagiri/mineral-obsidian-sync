@@ -2,8 +2,9 @@ import { RemoteHttpError, RemoteObjectChangedError } from "../../remote/errors";
 import type { R2Client } from "../../remote/r2-client";
 import { sha256 } from "../../sync/fingerprint";
 import { randomBytes as secureRandomBytes, sameBytes, toArrayBuffer, utf8 } from "./bytes";
+import type { TransportScenarioContext } from "./context";
+import { primitivesScenario } from "./primitives";
 import { IntegrationTestEscapeError } from "./test-namespace";
-import type { IntegrationTestNamespace } from "./test-namespace";
 import { observation, require, runScenario } from "./result";
 import type { ScenarioObservation, ScenarioResult } from "./result";
 
@@ -21,16 +22,10 @@ const BOGUS_ETAG = "0000000000000000000000000000dead";
 
 export const BINARY_SIZES = { small: 64 * 1024, large: 1024 * 1024 } as const;
 
-export interface TransportScenarioContext {
-  namespace: IntegrationTestNamespace;
-  /** Already prefix-guarded: it refuses any key outside the run root. */
-  client: R2Client;
-  /** Defaults to cryptographically secure random bytes, chunked for large payloads. */
-  randomBytes?: (size: number) => Uint8Array;
-}
+export type { TransportScenarioContext } from "./context";
 
 export function transportScenarioNames(): string[] {
-  return ["test-prefix-guard", "conditional-create", "conditional-update", "conditional-get", "conditional-head", "list-scoped", "binary-roundtrip-64k", "binary-roundtrip-1m"];
+  return ["test-prefix-guard", "transport-primitives", "conditional-create", "conditional-update", "conditional-get", "conditional-head", "list-scoped", "binary-roundtrip-64k", "binary-roundtrip-1m"];
 }
 
 /** Maps a thrown error onto a stable category so a report never depends on message text. */
@@ -59,6 +54,7 @@ export async function runTransportScenarios(context: TransportScenarioContext): 
   const results: ScenarioResult[] = [];
   for (const [name, body] of [
     ["test-prefix-guard", () => guardScenario(context)],
+    ["transport-primitives", () => primitivesScenario(context)],
     ["conditional-create", () => createScenario(context)],
     ["conditional-update", () => updateScenario(context)],
     ["conditional-get", () => conditionalGetScenario(context)],

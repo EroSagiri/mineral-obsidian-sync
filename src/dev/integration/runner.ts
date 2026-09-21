@@ -1,4 +1,5 @@
 import type { App } from "obsidian";
+import { Platform } from "obsidian";
 import { remoteIdentity, SignedR2ListClient } from "../../remote/r2-client";
 import type { R2Configuration } from "../../remote/r2-client";
 import type { R2SyncSettings } from "../../settings";
@@ -39,6 +40,14 @@ function configuration(settings: R2SyncSettings): R2Configuration {
     secretAccessKey: settings.secretAccessKey,
     remotePrefix: settings.remotePrefix,
   };
+}
+
+/** The report must identify the platform it ran on: the transport primitives differ by platform. */
+function platformLabel(): string {
+  if (Platform.isAndroidApp) return "android";
+  if (Platform.isIosApp) return "ios";
+  if (Platform.isDesktopApp) return "desktop";
+  return Platform.isMobile ? "mobile" : "unknown";
 }
 
 export async function runR2SelfTest(app: App, settings: R2SyncSettings, selection: SelfTestSelection): Promise<ScenarioReport> {
@@ -89,7 +98,7 @@ export async function runR2SelfTest(app: App, settings: R2SyncSettings, selectio
   }
 
   return redactReport(
-    { runId: namespace.runId, root: namespace.root, environment: "obsidian-requesturl", startedAt, finishedAt: Date.now(), results },
+    { runId: namespace.runId, root: namespace.root, environment: `obsidian-requesturl/${platformLabel()}`, startedAt, finishedAt: Date.now(), results },
     [settings.accessKeyId, settings.secretAccessKey],
   );
 }

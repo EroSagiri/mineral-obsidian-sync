@@ -14,6 +14,16 @@ export interface MockRequestUrlResponse {
   json?: unknown;
 }
 
+/** Mirrors the fields the plugin reads; tests run in a desktop-like Node environment. */
+export const Platform = {
+  isDesktop: true,
+  isMobile: false,
+  isDesktopApp: true,
+  isMobileApp: false,
+  isIosApp: false,
+  isAndroidApp: false,
+};
+
 type Handler = (request: MockRequestUrlRequest) => Promise<MockRequestUrlResponse>;
 
 let handler: Handler = async () => {

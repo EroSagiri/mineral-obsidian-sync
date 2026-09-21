@@ -24,6 +24,8 @@ export interface FakeR2Options {
   ignoreIfNoneMatch?: boolean;
   ignoreIfMatch?: boolean;
   ignoreConditionalHead?: boolean;
+  /** Reproduces Obsidian on Android (2026-09-21): HEAD throws at the transport layer. */
+  failHead?: boolean;
 }
 
 const EMPTY = new ArrayBuffer(0);
@@ -57,6 +59,7 @@ export class FakeR2 {
       ignoreIfNoneMatch: options.ignoreIfNoneMatch ?? false,
       ignoreIfMatch: options.ignoreIfMatch ?? false,
       ignoreConditionalHead: options.ignoreConditionalHead ?? false,
+      failHead: options.failHead ?? false,
     };
     setRequestUrlHandler((request) => this.handle(request));
   }
@@ -97,6 +100,8 @@ export class FakeR2 {
   async handle(request: MockRequestUrlRequest): Promise<MockRequestUrlResponse> {
     this.requests.push(request);
     const method = (request.method ?? "GET").toUpperCase();
+    // Android's requestUrl fails HEAD requests at the transport layer, after the request is sent.
+    if (this.settings.failHead && method === "HEAD") throw new Error("Request Failed. IOException Stream closed");
     const url = new URL(request.url);
     const denial = this.authenticate(request);
     if (denial) return denial;
