@@ -8,6 +8,7 @@ import { buildSyncPlan } from "../../sync/planner";
 import type { LocalEntry, PreviousEntry, RemoteEntry, RemoteIdentity, SyncOperation, SyncPlan } from "../../sync/types";
 import { sameBytes, utf8 } from "./bytes";
 import { headOrAbsent } from "./guarded-client";
+import { ensureFolder, ensureFolderTree } from "./local-scratch";
 import type { LocalScratch } from "./local-scratch";
 import { observation, require, runScenario, ScenarioFailure, skipScenario } from "./result";
 import type { ScenarioObservation, ScenarioResult } from "./result";
@@ -158,13 +159,15 @@ class FailingStateStore implements StateStore {
 }
 
 export function convergenceScenarioNames(): string[] {
-  return ["safe-executor-convergence", "stale-remote-preserved", "stale-local-preserved", "state-commit-failure", "ambiguous-put"];
+  return ["safe-executor-convergence", "download-applied", "download-blocked-by-file-parent", "stale-remote-preserved", "stale-local-preserved", "state-commit-failure", "ambiguous-put"];
 }
 
 export async function runConvergenceScenarios(context: ConvergenceContext): Promise<ScenarioResult[]> {
   const ambiguous = context.ambiguousClient;
   return [
     await runScenario("safe-executor-convergence", () => convergenceScenario(context)),
+    await runScenario("download-applied", () => downloadAppliedScenario(context)),
+    await runScenario("download-blocked-by-file-parent", () => downloadParentFileScenario(context)),
     await runScenario("stale-remote-preserved", () => staleRemoteScenario(context)),
     await runScenario("stale-local-preserved", () => staleLocalScenario(context)),
     await runScenario("state-commit-failure", () => stateCommitFailureScenario(context)),
@@ -187,6 +190,8 @@ async function convergenceScenario(context: ConvergenceContext): Promise<Scenari
   const first = await observe(context, [key]);
   require(!first.previous.has(key), "the integration state store already held a baseline for this run root");
   requireOperation(first.plan, key, "upload");
+  // This scenario runs on a fresh run root, so it executes the complete observed plan.
+  require(first.plan.operations.every((operation) => operation.key === key), `the first plan mentioned unrelated keys: ${planSummary(first.plan)}`);
   require(typeCount(first.plan, "upload") === 1, `first plan was ${planSummary(first.plan)}`);
 
   const firstOutcomes = await executePlan(context, first.plan);
@@ -209,6 +214,82 @@ async function convergenceScenario(context: ConvergenceContext): Promise<Scenari
   ];
 }
 
+/**
+ * Phase 12b: a successful download must create the missing parent folders itself.
+ * `Vault.createBinary` does not mkdir parents (verified on a real Vault), so this scenario is the
+ * happy path that would otherwise never be exercised: remote-only file, no local folder.
+ */
+async function downloadAppliedScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
+  const cases: Array<{ leaf: string; preCreatedParent: string[] }> = [
+    { leaf: "downloaded/root-file.md", preCreatedParent: [] },
+    { leaf: "downloaded/nested/new/note.md", preCreatedParent: [] },
+    { leaf: "downloaded/a/b/c/deep.md", preCreatedParent: [] },
+    { leaf: "downloaded/existing/parent/kept.md", preCreatedParent: ["downloaded/existing/parent"] },
+  ];
+  let parentFoldersCreated = false;
+
+  for (const item of cases) {
+    const key = context.scratch.key(item.leaf);
+    requireLocalAbsent(context, key);
+    for (const folder of item.preCreatedParent) await ensureFolderTree(context.vault, context.scratch.key(folder));
+    const parentPath = key.slice(0, key.lastIndexOf("/"));
+    const parentExistedBefore = context.vault.getAbstractFileByPath(parentPath) !== null;
+
+    const body = utf8(`remote payload for ${item.leaf}`);
+    await context.client.putObject(key, body, { ifNoneMatch: "*" });
+    const planned = requireOperation((await observe(context, [key])).plan, key, "download");
+
+    const outcome = requireOutcome(await executePlan(context, { operations: [planned] }), key);
+    require(outcome.status === "applied", `downloading ${item.leaf} returned ${outcome.status}${outcome.reason ? `/${outcome.reason}` : ""}`);
+
+    const file = context.vault.getFileByPath(key);
+    if (!file) throw new ScenarioFailure(`the download created no local file for ${item.leaf}`);
+    require(sameBytes(await context.vault.readBinary(file), body), `the downloaded bytes differ for ${item.leaf}`);
+    require(scopedPrevious(await context.state.loadAll(), context.scratch.root).get(key)?.remote?.etag, `no committed baseline after downloading ${item.leaf}`);
+    if (!parentExistedBefore && context.vault.getAbstractFileByPath(parentPath) !== null) parentFoldersCreated = true;
+  }
+
+  const nestedKey = context.scratch.key("downloaded/nested/new/note.md");
+  requireOperation((await observe(context, [nestedKey])).plan, nestedKey, "noop");
+
+  return [
+    observation("remote-only nested file", "downloaded/nested/new/note.md"),
+    observation("missing parent folders created", parentFoldersCreated),
+    observation("local bytes exact", true),
+    observation("previous state committed", true),
+    observation("second reconciliation", "noop"),
+  ];
+}
+
+/** Phase 12c: a file occupying a parent path is a definite failure, never an overwrite. */
+async function downloadParentFileScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
+  const occupier = context.scratch.key("blocked/occupier");
+  await ensureFolder(context.vault, context.scratch.key("blocked"));
+  const occupierBody = utf8("local file occupying the parent path");
+  await context.vault.createBinary(occupier, occupierBody);
+
+  const target = context.scratch.key("blocked/occupier/child.md");
+  await context.client.putObject(target, utf8("remote payload under a file parent"), { ifNoneMatch: "*" });
+
+  const planned = requireOperation((await observe(context, [target])).plan, target, "download");
+  const outcome = requireOutcome(await executePlan(context, { operations: [planned] }), target);
+  require(outcome.status === "failed", `a download under a file parent returned ${outcome.status}`);
+  require(outcome.reason === "parent-path-is-file", `the blocked download was classified as ${outcome.reason}`);
+
+  const occupierFile = context.vault.getFileByPath(occupier);
+  if (!occupierFile) throw new ScenarioFailure("the local file occupying the parent path disappeared");
+  require(sameBytes(await context.vault.readBinary(occupierFile), occupierBody), "the blocked download modified the file occupying the parent path");
+  require(!context.vault.getFiles().some((file) => file.path === target), "the blocked download still created a file under a file parent");
+  require(!scopedPrevious(await context.state.loadAll(), context.scratch.root).has(target), "previous state was mutated by a blocked download");
+
+  return [
+    observation("parent path occupied by a file", "blocked/occupier"),
+    observation("execution", `${outcome.status}/${outcome.reason}`),
+    observation("occupying file preserved", true),
+    observation("previous state mutated", false),
+  ];
+}
+
 /** Phase 13: a remote change after planning is stale, and the newer remote body survives. */
 async function staleRemoteScenario(context: ConvergenceContext): Promise<ScenarioObservation[]> {
   const key = context.scratch.key("stale-remote.md");
@@ -216,8 +297,9 @@ async function staleRemoteScenario(context: ConvergenceContext): Promise<Scenari
   await context.vault.createBinary(key, utf8("stale remote v1"));
 
   const first = await observe(context, [key]);
-  requireOperation(first.plan, key, "upload");
-  require(requireOutcome(await executePlan(context, first.plan), key).status === "applied", "the establishing upload did not apply");
+  const establishing = requireOperation(first.plan, key, "upload");
+  // Only this scenario's own operation is executed, so leftovers from other scenarios cannot leak in.
+  require(requireOutcome(await executePlan(context, { operations: [establishing] }), key).status === "applied", "the establishing upload did not apply");
 
   const baseline = scopedPrevious(await context.state.loadAll(), context.scratch.root).get(key);
   const etagA = baseline?.remote?.etag;

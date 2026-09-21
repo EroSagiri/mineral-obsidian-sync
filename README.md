@@ -22,10 +22,13 @@ Existing complete baselines use the normal metadata cost model (`mtime` + size l
 `SafeExecutor` runs one operation at a time and commits one key of previous state per proven operation:
 
 - `upload` uses `If-None-Match: *` for a new object and `If-Match: <observed ETag>` otherwise.
-- `download` uses `GET If-Match: <observed ETag>` and re-checks the local file before and after the write.
-- A `412` is `stale`, never an overwrite. A received 4xx is a definitive failure.
+- `download` runs `GET If-Match: <observed ETag>` **before** any local side effect, re-checks the local precondition, creates the missing parent folders, re-checks the target once more, and only then writes.
+- `ensureParentFolders` creates one level at a time, never rolls back a folder it already created, and refuses to proceed when a *file* occupies a parent path (`failed` / `parent-path-is-file`) or when the target path is a folder (`failed` / `target-path-is-folder`). The occupying file is never modified.
+- A `412` is `stale`, never an overwrite. A received 4xx is a definitive `failed`.
 - Only a 5xx/429 response, a transport throw, or a failed state commit is `unresolved`; `unresolved` never claims success and never commits a baseline.
 - `delete-local` and `delete-remote` are hard-blocked.
+
+`Vault.createBinary` does not create missing parent folders, and `Vault.createFolder` is not recursive — both verified against a real Vault on 2026-09-21. Without that step, a download into a folder that does not exist locally would fail with `ENOENT` on every reconcile.
 
 ## Safety boundary
 

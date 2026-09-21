@@ -1,16 +1,20 @@
 import type { Vault } from "obsidian";
+import { ensureParentFolders } from "../local/ensure-folders";
 import { LocalFileChangedError, readStableLocalBytes } from "../local/read-local";
 import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, SyncOperation } from "./types";
 
+/** Precise reasons a Vault write cannot proceed; they are not transport or precondition failures. */
+export type VaultWriteFailure = "parent-path-is-file" | "folder-create-failed" | "target-path-is-folder";
+
 export type OperationResult =
   | { status: "applied"; key: string }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" }
   | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" }
-  /** A definitive negative answer: a received auth/permission failure, not a lost response. */
-  | { status: "failed"; key: string; error: string }
+  /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
+  | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure }
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
   | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed" };
 
@@ -68,10 +72,21 @@ export class SafeExecutor {
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
     let bytes: ArrayBuffer;
     try { bytes = await this.r2.getObject(operation.key, { ifMatch: operation.expectedRemote.etag }); } catch (error) { return error instanceof RemoteObjectChangedError ? { status: "stale", key: operation.key, reason: "remote-changed" } : { status: "failed", key: operation.key, error: message(error) }; }
+    // Local side effects stay as late as possible: a failed download must not create folders.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
     try {
       const file = this.vault.getFileByPath(operation.key);
-      if (file) await this.vault.modifyBinary(file, bytes); else await this.vault.createBinary(operation.key, bytes);
+      if (file) {
+        await this.vault.modifyBinary(file, bytes);
+      } else {
+        if (this.vault.getAbstractFileByPath(operation.key) !== null) return { status: "failed", key: operation.key, reason: "target-path-is-folder", error: `Vault path "${operation.key}" is a folder, not a file` };
+        // Vault.createBinary does not create missing parent folders, so the chain is made first.
+        const folders = await ensureParentFolders(this.vault, operation.key);
+        if (!folders.ok) return { status: "failed", key: operation.key, reason: folders.reason, error: folders.error };
+        // Creating folders widens the race window, so the target is confirmed once more.
+        if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
+        await this.vault.createBinary(operation.key, bytes);
+      }
       const local = await this.vault.adapter.stat(operation.key);
       if (!local) return { status: "failed", key: operation.key, error: "Vault write did not produce a file" };
       const commit = await this.commit({ key: operation.key, local: { size: local.size, mtime: local.mtime }, remote: operation.expectedRemote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });

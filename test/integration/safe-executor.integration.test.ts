@@ -52,17 +52,24 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(converge.observations.find((entry) => entry.name === "previous-state commit")?.value).toBe("1 entry");
     expect(converge.observations.find((entry) => entry.name === "second plan")?.value).toBe("noop:1");
 
-    // Only the two successfully reconciled keys hold a baseline.
-    expect([...state.entries.keys()].sort()).toEqual([`${scratch.root}stale-remote.md`, `${scratch.root}test-file.md`]);
+    // Baselines exist for the reconciled uploads and for every applied download.
+    expect([...state.entries.keys()].sort()).toEqual([
+      `${scratch.root}downloaded/a/b/c/deep.md`,
+      `${scratch.root}downloaded/existing/parent/kept.md`,
+      `${scratch.root}downloaded/nested/new/note.md`,
+      `${scratch.root}downloaded/root-file.md`,
+      `${scratch.root}stale-remote.md`,
+      `${scratch.root}test-file.md`,
+    ]);
 
     // Every remote object stays inside the run prefix, and every local file inside the run base
     // (the capability probe lives outside the scenario root so it can never enter a plan).
     const base = scratch.root.slice(0, -"convergence/".length);
-    expect(fake.objects.size).toBe(5);
+    expect(fake.objects.size).toBe(10);
     expect([...fake.objects.keys()].every((key) => key.startsWith(`sync/.mineral-sync-test/20260922T001500Z/`))).toBe(true);
     expect([...vault.files.keys()].every((key) => key.startsWith(base))).toBe(true);
     expect([...vault.files.keys()].some((key) => key === `${base}local-probe/probe.bin`)).toBe(true);
-    expect(scanLocalNamespace(vault as unknown as Vault, scratch.root).size).toBe(5);
+    expect(scanLocalNamespace(vault as unknown as Vault, scratch.root).size).toBe(10);
   });
 
   it("records the stale, unresolved and blocked outcomes it observed", async () => {
@@ -94,7 +101,7 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(vault.files.size).toBeGreaterThan(0);
     const base = scratch.root.slice(0, -"convergence/".length);
     expect([...vault.files.keys()].every((key) => key.startsWith(base))).toBe(true);
-    expect(fake.objects.size).toBe(5);
+    expect(fake.objects.size).toBe(10);
     expect([...fake.objects.keys()].every((key) => key.startsWith("sync/.mineral-sync-test/20260922T001500Z/"))).toBe(true);
   });
 
