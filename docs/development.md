@@ -11,7 +11,7 @@
 | Phase 1 | 本地元数据扫描、分页 `ListObjectsV2`、纯确定性三方 planner、IndexedDB previous-state、Inspect Sync State 诊断 | 完成 |
 | Phase 1.5 | 安全 bootstrap 基线、惰性二进制 SHA-256 比对、`GET If-Match`、只有验证为逐字节相同的配对才能建立基线 | 完成 |
 | Phase 2A | aws4fetch 仅签名、`CredentialProvider`、`RequestUrlTransport`、`R2Client` 的 GET / PUT / HEAD、`PUT If-Match`、`PUT If-None-Match: *`、`GET If-Match`、顺序 `SafeExecutor`、本地/远端执行前置条件、per-key previous-state 提交、PUT 结果不明与状态写失败 → `unresolved`、二进制 `createBinary` / `modifyBinary`、remote identity 含 endpoint/bucket/prefix、忽略策略变化 fail closed、删除硬阻断 | 完成 |
-| Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | 传输层已验证；下载写盘路径的真实运行**待执行**（见下方验证记录） |
+| Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | 完成：桌面 9/9 + 8/8，Android 9/9 + 8/8（见下方验证记录） |
 | Phase 3A | 自动调度器（Vault 事件 → dirty set → debounce → planner → SafeExecutor），删除仍为 BLOCKED | 尚未开始 |
 
 ---
@@ -225,6 +225,7 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T17:42:08Z | Transport Self-Test（**Android**，矩阵只有 happy path） | 2 / 9 PASS：矩阵 12 项 happy path **全部通过**；7 个场景仍全部失败 |
 | 2026-09-21T17:47:57Z | Transport Self-Test（**Android**，矩阵含错误路径） | 7 / 9 PASS：矩阵 18 项中 16 项通过，2 项 HEAD 错误路径被平台丢弃；`conditional-head` 同理 |
 | 2026-09-21T18:00:20Z | Transport Self-Test（**Android**，平台期望编码后） | **9 / 9 PASS**：2 项 HEAD 限制照旧逐字记录，其余 16 项严格通过；64 KiB 与 1 MiB 二进制在设备上逐字节 + SHA-256 一致 |
+| 2026-09-21T18:01:52Z | Convergence Self-Test（**Android**） | **8 / 8 PASS**：真实 executor 写盘、真实 IndexedDB 提交 + 重读、三级缺失目录链创建、stale / unresolved 保护全部成立 |
 
 ### Android 非 2xx 语义（真机实测，问题已彻底摸清）
 
@@ -368,26 +369,31 @@ npx vitest run test/integration/r2-real.manual.test.ts
 
 桌面端与移动端使用同一个 `RequestUrlTransport`，没有第二套移动端实现。
 
-已在 OPPO Find X8 / Android 16 上完成（2026-09-21，最后一轮 18:00:20Z 为 **9 / 9 PASS**）：
+已在 OPPO Find X8 / Android 16 上完成（2026-09-21）：
 
 ```text
 1. Test Connection / ListObjectsV2                       ✅ 经 test-prefix-guard 与矩阵 LIST
-2. R2 Transport Self-Test（含 18 项原语矩阵）             ✅ 9/9，见上方"Android 非 2xx 语义"
+2. R2 Transport Self-Test（含 18 项原语矩阵）             ✅ 9/9（18:00:20Z）
 3. 64 KiB PUT / GET 往返                                 ✅ 矩阵实测
 4. 1 MiB 二进制往返                                      ✅ 逐字节 + SHA-256 一致
 5. Web Crypto SHA-256                                    ✅
 6. 点目录不被索引 → fallback 本地根目录正常工作            ✅ local-scratch-root 通过
 7. 条件创建 / 更新 / GET 的 412 语义                      ✅ 全部类型化
 8. 报告渲染与落盘（存在插件目录，可 adb 读取）             ✅
+9. Convergence Self-Test（executor + IndexedDB + 写盘）  ✅ 8/8（18:01:52Z）
+   ├ safe-executor-convergence   upload → applied → 1 entry → noop（IndexedDB 写 + 重读都成立）
+   ├ download-applied            三级缺失目录链被创建，字节精确，baseline 提交，再次 noop
+   ├ download-blocked-by-file-parent  父路径被文件占用 → failed/parent-path-is-file，占用文件不动
+   ├ stale-remote / stale-local   两侧 stale 判定正确，新内容保留，state 未被改动
+   ├ state-commit-failure        R2 写成功 + state 提交失败 → unresolved，R2 未被回滚
+   └ ambiguous-put               PUT 已落盘但响应丢失 → unresolved，state 未提交
 ```
 
-仍待执行：
+落盘核对（adb 直接读文件系统，与报告逐条对齐）：`multi/level/deep/foo.md` 三级目录链、
+`one-level/foo.md`、`root-file.md`、`existing/parent/kept.md` 四种下载情况全部真实存在；
+`blocked/occupier` 仍是 36 B 文件且其下没有子文件。vault 顶层除测试前缀外无任何改动。
 
-```text
-9. Convergence Self-Test（executor + 真实 IndexedDB + 真实 Vault 写盘）  ← 移动端最后一个缺口
-   注：旧版（01:32 那次）已在 Android 上证明本地文件与目录创建可行，
-       失败点在当时仍使用 404 HEAD 的远端观测，现已改为 LIST。
-```
+仍待执行：iOS（从未运行）。
 
 ## 已验证 / 未验证
 
@@ -407,7 +413,7 @@ stale remote / stale local 保护           已验证
 删除仍然被硬阻断                           已验证
 ```
 
-Android 上已单独验证（OPPO Find X8 / Android 16，最后一轮 2026-09-21T18:00:20Z 为 9 / 9 PASS）：
+Android 上已单独验证（OPPO Find X8 / Android 16，2026-09-21）：
 
 ```text
 全部 2xx 原语（含 HEAD、条件 HEAD、64 KiB 与 1 MiB 上下行）  已验证
@@ -416,12 +422,15 @@ GET / PUT 的 404 与 412 错误路径（类型化）                      已�
 点目录不被索引 → fallback 本地根目录                            已验证
 Web Crypto SHA-256（1 MiB 二进制）                              已验证
 HEAD 的非 2xx 响应被平台丢弃                                    已确认，且从不影响写入决策（见上）
+executor 真实写盘 + 多级目录创建（18:01:52Z）                   已验证
+真实 IndexedDB 提交 + 重读 → 第二次 reconcile 为 noop           已验证
+stale remote / stale local / state 提交失败 / PUT 结果不明       已验证
 ```
 
 未验证：
 
 ```text
-Android / iOS 的 Convergence Self-Test（executor + IndexedDB + Vault 写盘）  未验证 —— 移动端最后一个缺口
+iOS                                                                       从未运行
 自动调度、事件监听、任何后台行为                                            尚未实现
 ```
 
@@ -443,9 +452,22 @@ Vault: private/mineral-sync-test-local/<run-id>/       （回退时的可见根�
 
 ## 下一步
 
-Phase 3A（自动调度器）开工前必须满足：
+Phase 3A（自动调度器）开工前的两项前置条件均已满足：
 
-1. ~~收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。~~ 已于 2026-09-21T17:30:31Z 满足。
-2. Android 冒烟测试通过，或在明确知晓风险的前提下决定暂不覆盖移动端。
+1. ~~收敛自检在真实 Vault 上跑通，包含 `download-applied`（成功下载写盘）。~~ 已于 2026-09-21T17:30:31Z（桌面）与 18:01:52Z（Android）满足。
+2. ~~移动端验证。~~ Android 传输 9/9 + 收敛 8/8 均已通过；iOS 从未运行，属于已知未覆盖面。
+
+Phase 3A 的已知前置技术项（不是阻塞项，但应在实现中一并处理）：
+
+```text
+a. putObject 的确认 HEAD：目前 PUT 成功后再发一次条件 HEAD 取 canonical 元数据。
+   Android 上若该 HEAD 返回非 2xx（仅在其他写者抢改的窄窗口内可能），会变成 opaque →
+   unresolved（安全但不收敛）。可选做法是让 baseline 直接取自 PUT 响应的 ETag + 已知
+   body 长度，从而两平台完全一致且每次上传少一次往返；代价是 lastModified 只能用本地时钟
+   （两侧都有 ETag 时 remoteChanged() 不看它，故实际无害）。
+b. 模糊结果的自愈：ambiguous PUT / state 提交失败后，下一轮可以通过"远端内容与本地一致"
+   的哈希比对重新收敛 baseline。该能力已在 buildBootstrapResult 中存在，目前只接在
+   Inspect 路径上，尚未接入执行后的重规划。
+```
 
 Phase 3A 本身仍受以下约束：删除保持 BLOCKED；不实现 Gateway、临时凭据端点、队列、Cloudflare Worker、Durable Object、WebSocket。
