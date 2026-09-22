@@ -12,6 +12,8 @@
 - 对"本地与远端都存在、且已证明逐字节相同"的文件建立本设备基线（惰性哈希，只在大小相同时才读内容）。
 - 自动同步：本地事件、启动、focus/resume、以及 `Mineral Sync: Sync Now` 都会触发一轮完整 reconciliation。
 - 可选的 **Sync Gateway**：让两台都在前台打开的 Obsidian 互相发现对方的远端变化，而不需要 focus/resume，也不做远端轮询。见 [`docs/gateway-integration.md`](docs/gateway-integration.md)。
+- **远端删除会传播到本地**：远端对象消失且本地文件相对基线未改动时，本地文件会被移到回收站（尊重你的"删除文件"偏好），随后退休它的基线。见 [`docs/deletion-safety.md`](docs/deletion-safety.md)。
+- **自动清理过期基线**：本地与远端都已不存在的 key，其设备本地 baseline 会被自动忘掉，不再永久占据差异报告。
 - 弹出只读的检查报告：`Mineral Sync: Inspect Sync State`。
 - 验证 R2 连通性：`R2 Sync: Test Connection`。
 - 查看 Gateway 诊断：`Mineral Sync: Gateway Status`。
@@ -19,8 +21,9 @@
 ## 现在还不能做什么
 
 - 没有 push / pull 按钮；`Sync Now` 只是"立刻唤醒一轮完整 reconciliation"，不是强制推送或拉取。
-- **不会删除任何东西** —— 本地不删、远端也不删。`delete-local` 与 `delete-remote` 在代码里被硬阻断。
-- 自动同步不轮询 R2，也不会按事件直接上传或下载；事件只表示状态可能已变化，真正的决策永远来自 `scan + previous + planner`。重命名会上传新路径，但旧远端对象会作为已阻断的删除候选保留。真实环境验证状态见 [`docs/development.md`](docs/development.md)。
+- **本地删除还不会传播到 R2**：`delete-remote` 仍然被阻断。原因是 R2 的 `DeleteObject` 没有条件形式，无法指名"我要删的是哪个版本"，无条件 DELETE 可能删掉另一台设备刚写的新版本。计划中的做法是带版本身份的 tombstone 协议（Phase 4C.5 Stage D3），目前只有设计没有实现。
+- 本地删除**不会删除任何远端对象**；被移入回收站的文件也不会被同步（`.trash` 是内置忽略项）。
+- 自动同步不轮询 R2，也不会按事件直接上传或下载；事件只表示状态可能已变化，真正的决策永远来自 `scan + previous + planner`。重命名会上传新路径，但旧远端对象会保留（本地删除还没有 D3 的传播能力）。真实环境验证状态见 [`docs/development.md`](docs/development.md)。
 
 ## 安装
 
@@ -122,3 +125,4 @@ token 权限不足，或只给了错误 bucket 的权限。
 - [`docs/development.md`](docs/development.md) —— 阶段状态、代码结构、开发命令、集成自检脚手架、真实验证记录、Android 待办清单。
 - [`docs/scheduler-semantics.md`](docs/scheduler-semantics.md) —— Phase 3A 自动调度器的语义规格（触发时机、single-flight、dirty 模型、rerun 规则、MUST / MUST NOT）。
 - [`docs/gateway-integration.md`](docs/gateway-integration.md) —— Phase 4C Sync Gateway 接入：channel 派生、generation 游标与握手、写者通知合并、WS 生命周期与鉴权。
+- [`docs/deletion-safety.md`](docs/deletion-safety.md) —— Phase 4C.5 删除安全与状态 GC：baseline GC、安全 delete-local、tombstone 设计（D3）。

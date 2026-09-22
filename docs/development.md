@@ -13,7 +13,8 @@
 | Phase 2A | aws4fetch 仅签名、`CredentialProvider`、`RequestUrlTransport`、`R2Client` 的 GET / PUT / HEAD、`PUT If-Match`、`PUT If-None-Match: *`、`GET If-Match`、顺序 `SafeExecutor`、本地/远端执行前置条件、per-key previous-state 提交、PUT 结果不明与状态写失败 → `unresolved`、二进制 `createBinary` / `modifyBinary`、remote identity 含 endpoint/bucket/prefix、忽略策略变化 fail closed、删除硬阻断 | 完成 |
 | Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | **CLOSED**：桌面 9/9 + 9/9，Android 9/9 + 9/9（见下方验证记录） |
 | Phase 3A | 自动调度器（Vault 事件 → dirty set → debounce → planner → SafeExecutor），删除仍为 BLOCKED | **已实现**（语义规格见 [`scheduler-semantics.md`](scheduler-semantics.md)）；真机跨设备自动同步见 Phase 4C |
-| Phase 4C | Sync Gateway 接入：channel 派生、Gateway HTTP/WS 客户端、generation 游标与握手、写者通知合并 | **已实现**（见 [`gateway-integration.md`](gateway-integration.md)）；删除仍为 BLOCKED |
+| Phase 4C | Sync Gateway 接入：channel 派生、Gateway HTTP/WS 客户端、generation 游标与握手、写者通知合并 | **已实现**（见 [`gateway-integration.md`](gateway-integration.md)） |
+| Phase 4C.5 | 删除安全与状态 GC：**D1** baseline GC、**D2** 安全 `delete-local`（版本复查 + 回收站优先）；**D3** tombstone 版本身份仅设计 | **D1 + D2 已实现**（见 [`deletion-safety.md`](deletion-safety.md)）；`delete-remote` 仍为 BLOCKED |
 
 ---
 
@@ -46,11 +47,29 @@ download
   → createBinary
   → adapter.stat → 提交 baseline
 
+delete-local（Phase 4C.5 D2）
+  前置条件：远端已消失，且本地相对基线未改动（否则 planner 给 conflict）
+  ① adapter.stat 与 expectedLocal 比较
+       不存在 → 视为已完成，直接退休 baseline
+       不匹配 → stale / local-changed，绝不删除
+       匹配   → 继续
+  ② VaultFileRemover.trash(file)
+       FileManager.trashFile（1.5+）或 Vault.trash，尊重"删除文件"偏好
+  ③ 复查文件确实消失；仍存在 → failed / trash-unavailable
+  ④ 两侧都已不存在 → 退休 baseline
+  没有 permanent unlink 路径：trash 不可用就是类型化 failed，文件留在原地
+
+prune-baseline（Phase 4C.5 D1）
+  条件：local 无 && remote 无 && previous 有（两侧扫描都必须完整成功）
+  动作：state.delete(key) —— 纯 device-local 簿记
+  绝不触碰 Vault 文件或 R2 对象；索引写失败 → unresolved / state-commit-failed
+
 blocked
-  delete-local / delete-remote   → 永远不会执行
+  delete-remote  → 永远不会执行（R2 DeleteObject 无条件下形式，无法指名版本）
 ```
 
 本地副作用刻意推到尽可能晚：下载失败时**不会**创建任何目录。
+`delete-local` 的破坏性动作同样被推到本地版本复查**之后**。
 
 `PreviousEntry` 只表示"本客户端最后一次成功同步过的 local/remote 版本对"，不表示"提交那一纳秒远端绝对仍是该版本"。提交之后远端若被其他设备推进，由下一轮三方 planner 表达为 remote-only change —— 这也是 `remote-advanced-after-write` 场景所验证的。
 
@@ -421,7 +440,7 @@ transport.test.ts  3 项断言：throw 恒为 false；400/401/403/404/409/412/42
 
 ```text
 npm run typecheck      通过
-npm test               167 passed | 1 skipped（共 168，18 个文件）
+npm test               180 passed | 1 skipped（共 181，18 个文件）
 npm run build          通过（生产产物 ~56 KB）
 ```
 
@@ -432,7 +451,7 @@ npm run build          通过（生产产物 ~56 KB）
 | `src/remote/transport.test.ts` | 5 | transport 原样转发、`throw: false`、错误分类 |
 | `src/remote/r2-client.test.ts` | 5 | 条件 GET 的签名头、412 → stale、403 → 类型化错误 |
 | `src/sync/planner.test.ts` | 27 | 三方 planner 全部分支 |
-| `src/sync/executor.test.ts` | 14 | 条件创建/更新、stale、状态提交失败、4xx vs 5xx 分类、嵌套下载、父路径被占用、删除硬阻断 |
+| `src/sync/executor.test.ts` | 21 | 条件创建/更新、stale、状态提交失败、4xx vs 5xx 分类、嵌套下载、父路径被占用；Phase 4C.5：delete-local 的 L1→L2 版本复查、trash 失败不回退 unlink、prune-baseline |
 | `src/sync/ignore.test.ts` | 2 | 忽略策略与指纹 |
 | `src/bootstrap/bootstrap.test.ts` | 9 | 基线建立的全部路径 |
 | `src/scheduler/scheduler.test.ts` | 12 | debounce 合并、single-flight、版本化 dirty 清理、backoff、auth 全局停止、删除阻断不阻塞其他 key |
@@ -511,7 +530,8 @@ npx vitest run test/integration/r2-real.manual.test.ts
 stale remote / stale local 保护           已验证
 状态提交失败与 PUT 结果不明 → unresolved   已验证
 测试前缀隔离（真实 bucket）                已验证
-删除仍然被硬阻断                           已验证
+远端删除传播到本地（trash 优先 + 版本复查）  已验证（自动化 + 真机）
+delete-remote 仍被阻断（缺版本身份）         已验证
 ```
 
 Android 上已单独验证（OPPO Find X8 / Android 16，2026-09-21）：
@@ -611,4 +631,4 @@ reconciliation 的职责。
    → 应用后本地收敛到 C → 再一轮 noop
 ```
 
-Phase 3A 本身仍受以下约束：删除保持 BLOCKED；不实现 Gateway、临时凭据端点、队列、Cloudflare Worker、Durable Object、WebSocket。
+Phase 3A 本身仍受以下约束：`delete-remote` 保持 BLOCKED（Phase 4C.5 D3 的 tombstone 版本身份尚未实现）；不实现临时凭据端点、队列、Cloudflare Worker、Durable Object。
