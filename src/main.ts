@@ -65,7 +65,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
 
   async saveSettings(): Promise<void> { await this.saveData(this.settings); this.scheduler?.configChanged(); }
   private client(): SignedR2ListClient { return new SignedR2ListClient(this.settings); }
-  private debug(message: string): void { if (this.settings.debugLogging) console.debug(`[Mineral Obsidian Sync] ${message}`); }
+  /** Debug-only operational telemetry: intentionally no paths, content, credentials, or signed headers. */
+  private debug(message: string): void { if (this.settings.debugLogging) console.log(`[Mineral Obsidian Sync] ${message}`); }
   private setStatus(text: string): void { this.statusBar?.setText(`Mineral Sync ${text}`); }
   private setSchedulerStatus(state: SchedulerState, counts: ResultCounts): void {
     if (state === "running") return this.setStatus("… syncing");

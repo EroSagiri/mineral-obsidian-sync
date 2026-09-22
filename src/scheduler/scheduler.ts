@@ -114,10 +114,15 @@ export class SyncScheduler {
       if (this.shouldStop(generation)) halted = true;
       if (!halted) {
         const local = cycle.scanLocal();
+        this.dependencies.debug?.(`cycle local-scan entries=${local.size}`);
         const [remote, stored] = await Promise.all([cycle.scanRemote(), cycle.loadPrevious()]);
+        this.dependencies.debug?.(`cycle remote-scan entries=${remote.size} previous-stored=${stored.size}`);
         if (this.shouldStop(generation)) halted = true;
         if (!halted) {
           const plan = cycle.buildPlan(local, remote, cycle.filterPrevious(stored));
+          const planCounts = new Map<string, number>();
+          for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);
+          this.dependencies.debug?.(`cycle plan operations=${plan.operations.length} counts=${JSON.stringify(Object.fromEntries(planCounts))}`);
           for (const operation of plan.operations) {
             if (this.shouldStop(generation)) { halted = true; break; }
             const result = await this.apply(operation, cycle);
