@@ -2,7 +2,7 @@ import { RemoteHttpError, RemoteTransportError } from "../remote/errors";
 import { canonicalKey } from "../sync/path";
 import type { OperationResult } from "../sync/executor";
 import type { SyncOperation } from "../sync/types";
-import type { ConfirmationOutcome, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
+import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
 
 const LOCAL_DEBOUNCE = 1200;
 const FOCUS_DEBOUNCE = 800;
@@ -10,7 +10,7 @@ const CONFIG_DEBOUNCE = 400;
 const RETRY_INITIAL = 5000;
 const RETRY_MAX = 60000;
 
-const emptyCounts = (): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, conflict: 0, noop: 0 });
+const emptyCounts = (): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0 });
 const defaultTimers: SchedulerTimers = { set: (delay, callback) => window.setTimeout(callback, delay), clear: (handle) => window.clearTimeout(handle as number) };
 
 /** Event-driven, full-reconciliation scheduler. Dirty keys are only coalescing hints. */
@@ -83,7 +83,7 @@ export class SyncScheduler {
   }
 
   private delayFor(reason: ReconcileReason): number {
-    if (reason === "manual") return 0;
+    if (reason === "manual" || reason === "conflict-manual-resolution") return 0;
     if (reason === "config-change") return CONFIG_DEBOUNCE;
     if (reason === "focus-resume") return FOCUS_DEBOUNCE;
     if (reason === "stale" || reason === "retry") return 0;
@@ -113,6 +113,7 @@ export class SyncScheduler {
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
     let remoteMutation: CycleRemoteMutation | undefined;
     const resultDetails = new Map<string, number>();
+    const conflicts: ConflictObservation[] = [];
     const handshake: RemoteGenerationHandshake = { startFailed: false, observationComplete: true };
     this.lastCycleStartedAt = Date.now(); this.lastCycleReason = reason; this.lastHandshakeStart = undefined; this.lastConfirmation = undefined; this.lastCycleRemoteMutation = false;
     this.dependencies.debug?.(`cycle start reason=${reason} generation=${generation}`);
@@ -131,6 +132,7 @@ export class SyncScheduler {
         if (this.shouldStop(generation)) halted = true;
         if (!halted) {
           const plan = cycle.buildPlan(local, remote, cycle.filterPrevious(stored));
+          if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict")));
           const planCounts = new Map<string, number>();
           for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);
           this.dependencies.debug?.(`cycle plan operations=${plan.operations.length} counts=${JSON.stringify(Object.fromEntries(planCounts))}`);
@@ -145,6 +147,13 @@ export class SyncScheduler {
             if (result.status === "stale") stale = true;
             const mutation = observeRemoteMutation(operation, result);
             if (mutation === "confirmed" || (mutation === "possible" && remoteMutation !== "confirmed")) remoteMutation = mutation;
+            // A resolution that actually applied is retired here, once, outside the planner: the
+            // conflict it described no longer exists, and keeping its intent would let a stale decision
+            // be replayed later.
+            if (result.status === "applied" && isResolution(operation) && this.dependencies.onResolutionApplied) {
+              try { await this.dependencies.onResolutionApplied(operation.conflictId, operation.key); }
+              catch { this.dependencies.debug?.("resolution cleanup failed"); }
+            }
             // Only a shortfall discovered *before* the operation loop means the loop never reached
             // its deterministic end. A shortfall discovered by an operation itself is recorded in
             // `failures` (when it is a cycle failure) or is a normal shortfall that does not by
@@ -177,6 +186,13 @@ export class SyncScheduler {
 
     this.lastCycleFinishedAt = Date.now(); this.lastResultCounts = counts; this.lastFailureClass = failure;
     this.lastCycleRemoteMutation = remoteMutation !== undefined;
+    // Conflicts are handed to the coordinator after the cycle has fully executed. Nothing here
+    // rewrites the plan that just ran; a resolution the coordinator records is applied by a later
+    // cycle, which keeps `planner` the only decision maker and `event != operation` intact.
+    if (conflicts.length && this.dependencies.onConflicts) {
+      try { await this.dependencies.onConflicts(conflicts); }
+      catch { this.dependencies.debug?.("conflict coordination failed"); }
+    }
     // No await occurs between comparison and pruning, so a later event cannot be swallowed.
     for (const [key, version] of this.dirty) if (version <= startVersion) this.dirty.delete(key);
     const localDirty = this.syncDirtyVersion > startVersion || this.rerunRequested || outcome.kind === "mismatch";
@@ -187,8 +203,7 @@ export class SyncScheduler {
     if (operation.type === "noop") return { status: "noop" };
     if (operation.type === "conflict") return { status: "conflict" };
     return cycle.execute(operation);
-  }
-  private shouldStop(generation: number): boolean { return this.stopped || !this.dependencies.visible() || this.configGeneration !== generation; }
+  }  private shouldStop(generation: number): boolean { return this.stopped || !this.dependencies.visible() || this.configGeneration !== generation; }
 
   /**
    * Opening boundary. A failure here is not a data-plane failure: the cycle still runs, R2 is still
@@ -318,6 +333,11 @@ export function observeRemoteMutation(operation: SyncOperation, result: Operatio
   // `stale` is decided before the conditional request, and a 4xx/blocked upload provably did not
   // change the remote, so none of them justifies waking other clients.
   return undefined;
+}
+
+/** Resolutions are the only operations carrying a conflict identity. */
+function isResolution(operation: SyncOperation): operation is Extract<SyncOperation, { type: "resolve-keep-local" | "resolve-keep-remote" | "resolve-merged" }> {
+  return operation.type === "resolve-keep-local" || operation.type === "resolve-keep-remote" || operation.type === "resolve-merged";
 }
 
 function classify(result: OperationResult | { status: "noop" | "conflict" }): FailureClass | undefined {

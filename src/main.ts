@@ -19,8 +19,13 @@ import { IndexedDbGatewayCursorStore } from "./gateway/cursor-store";
 import { resolveGatewayConfig } from "./gateway/config";
 import type { GatewayConfigState } from "./gateway/types";
 import { gatewayConnectionConfig } from "./gateway/types";
-import type { LocalEntry, RemoteIdentity } from "./sync/types";
-import type { ResultCounts, SchedulerState } from "./scheduler/types";
+import { deriveRemoteChangeChannel } from "@mineral/sync-core/channel";
+import { IndexedDbConflictStores } from "./conflict/stores";
+import { createMergeBaseRecorder } from "./conflict/merge-base";
+import { ConflictCoordinator } from "./conflict/coordinator";
+import { ConflictResolverModal } from "./ui/conflict-resolver-modal";
+import type { LocalEntry, PreviousEntry, RemoteEntry, RemoteIdentity, SyncOperation } from "./sync/types";
+import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
 
 const ANDROID_LOCAL_DRIFT_INTERVAL_MS = 15_000;
 
@@ -28,13 +33,20 @@ export default class R2PersonalSyncPlugin extends Plugin {
   settings: R2SyncSettings = { ...DEFAULT_SETTINGS };
   private readonly stateStore = new IndexedDbStateStore();
   private readonly gatewayCursors = new IndexedDbGatewayCursorStore();
+  private readonly conflictStores = new IndexedDbConflictStores();
   private activeAnalysis?: AbortController;
   private statusBar?: HTMLElement;
   private scheduler?: SyncScheduler;
   private gateway?: GatewayClient;
+  private coordinator?: ConflictCoordinator;
   private gatewayConfig: GatewayConfigState = { kind: "disabled" };
   private androidLocalSnapshot?: Map<string, LocalEntry>;
   private androidLocalDriftPollRunning = false;
+  /** Conflict ids already announced, so a Notice is shown once per conflict rather than per cycle. */
+  private readonly announcedConflicts = new Set<string>();
+  private lastConflictCount = 0;
+  /** The derived channel for the current settings, refreshed once per cycle. */
+  private resolvedChannel?: string;
 
   async onload(): Promise<void> {
     const persisted = (await this.loadData() ?? {}) as Partial<R2SyncSettings> & { ignoredFolders?: unknown; ignoredFiles?: unknown };
@@ -53,6 +65,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.addCommand({ id: "r2-sync-test-connection", name: "R2 Sync: Test Connection", callback: () => this.testConnection() });
     this.addCommand({ id: "r2-sync-now", name: "Mineral Sync: Sync Now", callback: () => this.scheduler?.requestReconcile("manual") });
     this.addCommand({ id: "r2-sync-gateway-status", name: "Mineral Sync: Gateway Status", callback: () => this.reportGatewayStatus() });
+    this.addCommand({ id: "r2-sync-resolve-conflicts", name: "Mineral Sync: Resolve Conflicts", callback: () => this.openConflictResolver() });
     // Development-only diagnostics: never registered, and not even bundled, in production.
     if (__DEV__) {
       registerDevelopmentSelfTests({
@@ -79,12 +92,26 @@ export default class R2PersonalSyncPlugin extends Plugin {
         onStatusChanged: () => this.scheduler?.refreshStatus(),
       },
       { openSocket: (url) => new WebSocket(url), now: () => Date.now(), timerSet: (delay, callback) => window.setTimeout(callback, delay), timerClear: (handle) => window.clearTimeout(handle as number), debug: (message) => this.debug(message) },
-    );    this.scheduler = new SyncScheduler({
+    );
+    this.coordinator = new ConflictCoordinator({
+      vault: this.app.vault,
+      client: new SignedR2ListClient(this.settings),
+      // A per-call channel: the coordinator must follow a namespace change, and every record it writes
+      // is keyed by channel so an intent can never cross namespaces.
+      channel: this.currentChannel() ?? "",
+      mergeBase: this.conflictStores,
+      conflicts: this.conflictStores,
+      intents: this.conflictStores,
+      requestReconcile: () => this.scheduler?.requestReconcile("conflict-auto-merge"),
+      debug: (message) => this.debug(message),
+    });
+    this.scheduler = new SyncScheduler({
       visible: () => typeof document === "undefined" || document.visibilityState !== "hidden",
       captureCycle: () => this.captureSchedulerCycle(),
       onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
       debug: (message) => this.debug(message),
-      remoteChange: {
+      onConflicts: (conflicts) => this.handleConflicts(conflicts),
+      onResolutionApplied: (conflictId, path) => this.clearResolution(conflictId, path),      remoteChange: {
         hasPending: () => this.gateway?.hasPending() ?? false,
         readGeneration: () => this.gateway?.readGeneration() ?? Promise.resolve({ ok: false as const, kind: "misconfigured" }),
         confirmReconciled: async (generation) => { await this.gateway?.confirmReconciled(generation); },
@@ -95,7 +122,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.registerVaultListeners();
       this.registerAndroidLocalDriftDetector();
       this.registerDomEvent(document, "visibilitychange", () => this.onVisibilityChanged(document.visibilityState !== "hidden"));
-      this.scheduler?.requestReconcile("startup");
+      // The channel is a digest, so it is resolved once before the first cycle, which is what lets the
+      // planner receive valid resolution intents synchronously instead of doing its own I/O.
+      void this.resolveChannel().then(() => this.scheduler?.requestReconcile("startup"));
       void this.applyGatewayConfig(true);
     });
   }
@@ -236,17 +265,88 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const ignorePolicy = ignorePolicyFingerprint(settings);
     const identity = remoteIdentity(settings);
     const client = new SignedR2ListClient(settings);
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover());
+    const channel = this.currentChannel();
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined);
+    // Scanned once per cycle and shared by planning and conflict observation, so both see exactly the
+    // same observations and no second scan can disagree with the planner's inputs.
+    let previousFiltered = new Map<string, PreviousEntry>();
     return {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
       scanRemote: () => scanRemote(client, filter),
       loadPrevious: () => this.stateStore.loadAll(),
-      filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
-      buildPlan: buildSyncPlan,
+      filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => {
+        previousFiltered = new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
+        return previousFiltered;
+      },
+      buildPlan: (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => buildSyncPlan(local, remote, previous, this.coordinator?.resolutions()),
       execute: (operation: Parameters<SafeExecutor["execute"]>[0]) => executor.execute(operation),
+      observeConflicts: (conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>) => this.conflictObservations(conflicts, previousFiltered),
     };
+  }
+
+  /** Gathers identity inputs for conflicted keys from the maps the planner already received. */
+  private conflictObservations(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, previous: Map<string, PreviousEntry>) {
+    return conflicts.map((conflict) => ({ key: conflict.key, previous: previous.get(conflict.key) }));
+  }
+
+  /**
+   * The channel this device's R2 namespace maps to. Derived on demand from the R2 identity rather
+   * than stored, so it follows a namespace change and cannot drift from the baseline's own identity.
+   */
+  private currentChannel(): string | undefined { return this.resolvedChannel; }
+
+  /** Channel derivation is a digest, so it is resolved once per cycle and cached for sync access. */
+  private async resolveChannel(): Promise<string | undefined> {
+    if (!this.settings.endpoint.trim() || !this.settings.bucket.trim()) { this.resolvedChannel = undefined; return undefined; }
+    try { this.resolvedChannel = await deriveRemoteChangeChannel({ endpoint: this.settings.endpoint, bucket: this.settings.bucket, remotePrefix: this.settings.remotePrefix }); }
+    catch { this.resolvedChannel = undefined; }
+    return this.resolvedChannel;
+  }
+
+  private openConflictResolver(): void {
+    const coordinator = this.coordinator;
+    if (!coordinator) return;
+    new ConflictResolverModal(this.app, {
+      list: () => coordinator.list(),
+      propose: (intent) => coordinator.propose(intent),
+      debug: (message) => this.debug(message),
+    }).open();
+  }
+
+  /**
+   * Conflict handling runs after the cycle, with the channel pinned for that cycle, so every record
+   * and intent it writes belongs to the namespace the plan was built for.
+   */
+  private async handleConflicts(conflicts: ConflictObservation[]): Promise<void> {
+    const coordinator = this.coordinator;
+    if (!coordinator) return;
+    const channel = await this.resolveChannel();
+    if (!channel) return;
+    coordinator.setChannel(channel);
+    await coordinator.handleConflicts(conflicts);
+    await this.refreshConflictStatus();
+  }
+
+  /** Retires a conflict record and its intent once a resolution has actually applied. */
+  private async clearResolution(conflictId: string, path: string): Promise<void> {
+    const channel = this.currentChannel();
+    if (!channel) return;
+    this.coordinator?.setChannel(channel);
+    this.debug(`resolution applied path-hash=${conflictId.slice(0, 8)}`);
+    await this.coordinator?.clear(conflictId, path);
+    await this.refreshConflictStatus();
+  }
+
+  /** Announces each newly seen conflict exactly once and republishes the status bar. */
+  private async refreshConflictStatus(): Promise<void> {
+    const records = (await this.coordinator?.list()) ?? [];
+    this.lastConflictCount = records.length;
+    const fresh = records.filter((record) => !this.announcedConflicts.has(record.conflictId));
+    for (const record of fresh) this.announcedConflicts.add(record.conflictId);
+    if (fresh.length) new Notice(`Mineral Sync: ${records.length} conflict${records.length === 1 ? "" : "s"} need attention. Run "Mineral Sync: Resolve Conflicts".`);
+    this.scheduler?.refreshStatus();
   }
   private safeConnectionDiagnostic(error: unknown): string {
     if (!(error instanceof Error) || !error.message) return "unknown error";

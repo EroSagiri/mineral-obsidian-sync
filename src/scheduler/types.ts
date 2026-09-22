@@ -1,9 +1,14 @@
 import type { OperationResult } from "../sync/executor";
 import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
 
-export type ReconcileReason = "startup" | "manual" | "local-event" | "focus-resume" | "config-change" | "stale" | "retry" | "remote-change";
+export type ReconcileReason = "startup" | "manual" | "local-event" | "focus-resume" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
 export type SchedulerState = "idle" | "debouncing" | "running" | "rerun-pending" | "blocked-by-auth";
 export type FailureClass = "retryable" | "stable" | "auth";
+/**
+ * `partial` is a resolution-specific outcome: the remote half of a resolution landed but the local
+ * half could not be completed. It is counted separately from `applied` because it deliberately leaves
+ * the baseline uncommitted and needs one more reconciliation.
+ */
 export type ResultKind = OperationResult["status"] | "conflict" | "noop";
 export type ResultCounts = Record<ResultKind, number>;
 
@@ -26,6 +31,12 @@ export interface CycleDependencies {
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
   buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
   execute(operation: SyncOperation): Promise<OperationResult>;
+  /**
+   * The identity inputs behind a conflicted key, gathered from the maps the planner already received.
+   * This carries no content and performs no I/O: the coordinator reads content itself, after the
+   * cycle, so a running plan is never mutated by conflict handling.
+   */
+  observeConflicts?(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>): ConflictObservation[];
 }
 
 /**
@@ -47,9 +58,29 @@ export interface SchedulerDependencies {
   captureCycle(): CycleDependencies;
   visible(): boolean;
   remoteChange?: SchedulerRemoteChange;
+  /**
+   * Observes the conflicts a plan produced, after the cycle has executed. It is deliberately a
+   * post-cycle hook rather than something the planner calls: a cycle's plan is never rewritten while
+   * it is running, so any resolution this produces is applied by a *later* cycle.
+   */
+  onConflicts?(conflicts: ConflictObservation[]): Promise<void>;
+  /**
+   * Reports that a resolution actually applied, so its conflict record and intent can be retired.
+   * Only `applied` is reported: a `stale` or `partial` resolution must keep its conflict visible,
+   * because the disagreement still exists in a form the user has to see.
+   */
+  onResolutionApplied?(conflictId: string, path: string): Promise<void>;
   timers?: SchedulerTimers;
   onStatus?(state: SchedulerState, counts: ResultCounts): void;
   debug?(message: string): void;
+}
+
+/** The minimum a conflict observation needs to carry: identity inputs, never content. */
+export interface ConflictObservation {
+  key: string;
+  previous?: PreviousEntry;
+  observedLocal?: LocalEntry;
+  observedRemote?: RemoteEntry;
 }
 
 export type RemoteGenerationHandshake = {

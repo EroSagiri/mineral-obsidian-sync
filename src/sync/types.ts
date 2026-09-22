@@ -62,6 +62,17 @@ export type SyncOperation =
    * occupying the plan forever. Never touches a Vault file or an R2 object.
    */
   | { type: "prune-baseline"; key: string; reason: string }
+  /**
+   * Applying a user's (or a clean auto-merge's) explicit resolution to a conflicted key.
+   *
+   * These are deliberately *not* spelled as upload/download: the diagnostics, the preconditions and
+   * the partial-success semantics all differ, and collapsing them into a transfer would hide that.
+   * Every variant is bound to the exact conflict identity it was decided from, so a resolution can
+   * never be applied to a version the user did not see.
+   */
+  | { type: "resolve-keep-local"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string }
+  | { type: "resolve-keep-remote"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string }
+  | { type: "resolve-merged"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string; merged: { content: string; sha256: string; encoding: { bom: boolean; eol: "lf" | "crlf" | "mixed"; trailingNewline: boolean } } }
   | { type: "conflict"; key: string; conflict: ConflictKind; reason: string };
 
 export interface SyncPlan { operations: SyncOperation[]; }
