@@ -160,6 +160,23 @@ describe("resolve-keep-remote", () => {
     const result = await new SafeExecutor(vault({ "a.md": [1, 2, 3] }) as never, remote({ getObject: async () => { throw new RemoteHttpError("GetObject", 403); } }), state(), identity, "[]").execute(keepRemote());
     expect(result).toMatchObject({ status: "failed", httpStatus: 403 });
   });
+
+  it("reports landing-unknown, not failure, when the local write cannot be verified", async () => {
+    const local = vault({ "a.md": [1, 2, 3] });
+    // The write is attempted and then leaves no readable metadata: whether bytes landed is unknown, so
+    // the scheduler must not be told this path is settled.
+    const modify = local.modifyBinary;
+    const stat = local.adapter.stat;
+    let wrote = false;
+    local.modifyBinary = async (file, value) => { await modify(file, value); wrote = true; };
+    local.adapter.stat = async (path) => (wrote ? null : stat(path));
+    const saved = state();
+
+    const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(keepRemote());
+
+    expect(result).toMatchObject({ status: "partial", reason: "remote-write-landing-unknown" });
+    expect(saved.entries).toHaveLength(0);
+  });
 });
 
 describe("resolve-merged", () => {

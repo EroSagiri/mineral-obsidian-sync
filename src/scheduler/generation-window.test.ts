@@ -5,10 +5,11 @@ import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "../s
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
 
 /**
- * Investigation reproductions for the incremental remote-apply window.
+ * Generation retirement and remote-delta scheduling.
  *
- * These pin down what a cycle may report as `confirmed` — and therefore retire as a Gateway
- * generation — when the remote change it was meant to apply did not reach the Vault.
+ * Two rules are pinned down here: a window that cannot cover a generation must not retire it, and a
+ * queued remote delta must always end up in a cycle that can consume it — even when the reason that
+ * would have done so was overwritten by a concurrent local edit.
  */
 
 class FakeTimers implements SchedulerTimers {
@@ -26,92 +27,158 @@ class FakeTimers implements SchedulerTimers {
 
 const flush = async () => { for (let i = 0; i < 16; i++) await Promise.resolve(); };
 
-function fakeRemote(canApplyIncrementally: (generation: string) => boolean) {
+/** Mirrors the real Gateway client: a delta is only applicable when it is the exact next generation. */
+function fakeRemote(reconciled = "80", announced = "81") {
   const confirmed: string[] = [];
-  let pending = true;
-  let generation = "81";
+  const state = { reconciled, announced };
   const remote: SchedulerRemoteChange = {
-    hasPending: () => pending,
-    readGeneration: async () => ({ ok: true, generation }),
-    confirmReconciled: async (value) => { confirmed.push(value); pending = false; generation = value; },
-    notifyRemoteDirty: async () => ({ ok: true, generation }),
-    canApplyIncrementally,
+    hasPending: () => BigInt(state.announced) > BigInt(state.reconciled),
+    readGeneration: async () => ({ ok: true, generation: state.announced }),
+    confirmReconciled: async (value) => { confirmed.push(value); state.reconciled = value; },
+    notifyRemoteDirty: async () => ({ ok: true, generation: state.reconciled }),
+    canApplyIncrementally: (generation) => BigInt(generation) === BigInt(state.reconciled) + 1n,
   };
-  return { remote, confirmed };
+  return { remote, confirmed, announce: (generation: string) => { state.announced = generation; } };
 }
 
-describe("incremental remote-apply window", () => {
-  it("does not confirm a pending generation from a local-only incremental window", async () => {
-    const timers = new FakeTimers();
-    const { remote, confirmed } = fakeRemote(() => true);
-    const observedLocally: string[][] = [];
-    let fullRemoteScans = 0;
+const NOTE_LOCAL: LocalEntry = { key: "note.md", size: 5, mtime: 10 };
+const NOTE_REMOTE: RemoteEntry = { key: "note.md", size: 5, etag: "ETAG-2", lastModified: 20 };
+const NOTE_PREVIOUS: PreviousEntry = { key: "note.md", local: { size: 5, mtime: 10 }, remote: { size: 5, etag: "ETAG-1" }, syncedAt: 1 };
+const DOWNLOAD: SyncOperation = { type: "download", key: "note.md", reason: "remote changed", expectedLocal: NOTE_LOCAL, expectedRemote: NOTE_REMOTE };
 
-    const cycle = (): CycleDependencies => ({
-      scanLocal: () => new Map<string, LocalEntry>(),
-      scanRemote: async () => { fullRemoteScans++; return new Map<string, RemoteEntry>(); },
-      loadPrevious: async () => new Map<string, PreviousEntry>(),
-      filterPrevious: (entries) => entries,
-      localIncrementalObservations: async (keys: string[]) => {
-        observedLocally.push(keys);
-        return { local: new Map([["local-note.md", { key: "local-note.md", size: 1, mtime: 1 }]]), remote: new Map(), previous: new Map() };
-      },
-      buildPlan: () => ({ operations: [] as SyncOperation[] }),
-      execute: async (operation: SyncOperation) => ({ status: "applied", key: operation.key }),
-    });
+function harness(execute: CycleDependencies["execute"]) {
+  const timers = new FakeTimers();
+  const { remote, confirmed, announce } = fakeRemote();
+  const observedLocally: string[][] = [];
+  const observedIncrementally: RemoteChange[][] = [];
+  // Starts empty so that establishing a trusted window via `startup` executes nothing; a test then
+  // publishes the plan it wants the delta cycle to run.
+  const plan: { operations: SyncOperation[] } = { operations: [] };
+  let fullRemoteScans = 0;
+  const cycle = (): CycleDependencies => ({
+    scanLocal: () => new Map([[NOTE_LOCAL.key, NOTE_LOCAL]]),
+    scanRemote: async () => { fullRemoteScans++; return new Map([[NOTE_REMOTE.key, NOTE_REMOTE]]); },
+    loadPrevious: async () => new Map([[NOTE_PREVIOUS.key, NOTE_PREVIOUS]]),
+    filterPrevious: (entries) => entries,
+    incrementalObservations: async (changes: RemoteChange[]) => {
+      observedIncrementally.push(changes);
+      return { local: new Map([[NOTE_LOCAL.key, NOTE_LOCAL]]), remote: new Map([[NOTE_REMOTE.key, NOTE_REMOTE]]), previous: new Map([[NOTE_PREVIOUS.key, NOTE_PREVIOUS]]) };
+    },
+    localIncrementalObservations: async (keys: string[]) => {
+      observedLocally.push(keys);
+      return { local: new Map([[NOTE_LOCAL.key, NOTE_LOCAL]]), remote: new Map(), previous: new Map() };
+    },
+    buildPlan: () => ({ operations: plan.operations }),
+    execute,
+  });
+  const scheduler = new SyncScheduler({ captureCycle: cycle, visible: () => true, timers, remoteChange: remote });
+  return { scheduler, timers, confirmed, announce, observedLocally, observedIncrementally, plan, fullRemoteScans: () => fullRemoteScans };
+}
 
-    const scheduler = new SyncScheduler({ captureCycle: cycle, visible: () => true, timers, remoteChange: remote });
+/** One confirmed full window is what makes an exact-next-generation delta applicable. */
+async function establishTrustedWindow(env: ReturnType<typeof harness>) {
+  env.scheduler.requestReconcile("startup");
+  env.timers.fire(1200);
+  await flush();
+  expect(env.confirmed).toEqual(["81"]);
+  expect(env.scheduler.diagnostics().lastConfirmation).toBe("confirmed");
+}
 
-    // A Gateway announcement carrying a remote delta, then a local edit that takes over the debounce.
-    scheduler.requestRemoteChange("81", [{ op: "put", path: "remote-note.md" }]);
-    scheduler.markLocalPaths(["local-note.md"], () => false);
-    timers.fire(1200);
+describe("remote delta scheduling", () => {
+  it("consumes a delta whose remote-change reason was overwritten by a local edit", async () => {
+    const env = harness(async (operation) => ({ status: "applied", key: operation.key }));
+    await establishTrustedWindow(env);
+
+    // A delta arrives, and a local edit owns the debounce before it can run.
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [{ op: "put", path: "note.md" }]);
+    env.scheduler.markLocalPaths(["note.md"], () => false);
+    expect(env.timers.delays()).toEqual([1200]);
+
+    env.timers.fire(1200);
     await flush();
 
-    // A one-path local window cannot cover generation 81, so it must not retire it.
-    expect(observedLocally).toEqual([["local-note.md"]]);
-    expect(confirmed).toEqual([]);
-    expect(scheduler.diagnostics().lastConfirmation).toBe("not-requested");
-    // The delta is still queued, but nothing is scheduled to drain it: the only cycle that can consume
-    // it is one whose reason is exactly `remote-change`, and no timer was left for that.
-    expect(timers.delays()).toEqual([]);
-    expect(fullRemoteScans).toBe(0);
+    // The local window observed one path, so it can neither retire generation 82 nor drop its delta.
+    expect(env.observedLocally).toEqual([["note.md"]]);
+    expect(env.observedIncrementally).toEqual([]);
+    expect(env.confirmed).toEqual(["81"]);
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(1);
+    // The delta carries its own scheduled cycle instead of waiting for another announcement.
+    expect(env.timers.delays()).toEqual([0]);
 
-    // A fresh announcement is what finally drains it.
-    scheduler.requestRemoteChange("81", [{ op: "put", path: "remote-note.md" }]);
-    expect(timers.delays()).toEqual([0]);
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.observedIncrementally).toEqual([[{ op: "put", path: "note.md" }]]);
+    expect(env.confirmed).toEqual(["81", "82"]);
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(0);
+    expect(env.timers.delays()).toEqual([]);
   });
 
-  it("confirms an incrementally applied generation even when the only operation failed locally", async () => {
-    const timers = new FakeTimers();
-    const { remote, confirmed } = fakeRemote(() => true);
-
-    const localEntry: LocalEntry = { key: "note.md", size: 5, mtime: 10 };
-    const remoteEntry: RemoteEntry = { key: "note.md", size: 9, etag: "etag-2", lastModified: 20 };
-    const previous: PreviousEntry = { key: "note.md", local: { size: 5, mtime: 10 }, remote: { size: 5, etag: "etag-1" }, syncedAt: 1 };
-
-    const cycle = (): CycleDependencies => ({
-      scanLocal: () => new Map([[localEntry.key, localEntry]]),
-      scanRemote: async () => new Map([[remoteEntry.key, remoteEntry]]),
-      loadPrevious: async () => new Map([[previous.key, previous]]),
-      filterPrevious: (entries) => entries,
-      incrementalObservations: async () => ({ local: new Map([[localEntry.key, localEntry]]), remote: new Map([[remoteEntry.key, remoteEntry]]), previous: new Map([[previous.key, previous]]) }),
-      buildPlan: () => ({ operations: [{ type: "download", key: "note.md", reason: "remote changed", expectedLocal: localEntry, expectedRemote: remoteEntry }] as SyncOperation[] }),
-      // `SafeExecutor.download` returns exactly this when the Vault write landed but the post-write
-      // `adapter.stat` did not produce a file: no baseline is committed for the new remote version.
-      execute: async (operation: SyncOperation) => ({ status: "failed", key: operation.key, error: "Vault write did not produce a file" }),
+  it("keeps retrying a delta whose local half is landing-unknown, and retires it only when it applies", async () => {
+    let attempt = 0;
+    const env = harness(async (operation) => {
+      attempt++;
+      // The first pass leaves a local side effect nobody can account for.
+      return attempt === 1
+        ? { status: "partial", key: operation.key, reason: "remote-write-landing-unknown" }
+        : { status: "applied", key: operation.key };
     });
+    await establishTrustedWindow(env);
+    env.plan.operations = [DOWNLOAD];
 
-    const scheduler = new SyncScheduler({ captureCycle: cycle, visible: () => true, timers, remoteChange: remote });
-    scheduler.requestRemoteChange("81", [{ op: "put", path: "note.md" }]);
-    timers.fire(0);
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [{ op: "put", path: "note.md" }]);
+    env.timers.fire(0);
     await flush();
 
-    // The failure is local, the remote observation was complete, so the generation is retired and the
-    // delta is dropped — while the path's baseline still names the OLD remote version.
-    expect(scheduler.diagnostics().lastResultCounts.failed).toBe(1);
-    expect(confirmed).toEqual(["81"]);
-    expect(scheduler.diagnostics().lastConfirmation).toBe("confirmed");
-    expect(timers.delays()).toEqual([]);
+    // Landing-unknown must not retire the generation, and the delta stays queued for the retry.
+    expect(env.scheduler.diagnostics().lastResultCounts.partial).toBe(1);
+    expect(env.confirmed).toEqual(["81"]);
+    expect(env.scheduler.diagnostics().lastConfirmation).toBe("observation-incomplete");
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(1);
+    expect(env.timers.delays()).toEqual([0]);
+
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.confirmed).toEqual(["81", "82"]);
+    expect(env.scheduler.diagnostics().lastConfirmation).toBe("confirmed");
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(0);
+  });
+
+  it("still retires a generation for a failure that provably left no side effect", async () => {
+    const env = harness(async (operation) => ({ status: "failed", key: operation.key, error: "path", reason: "parent-path-is-file" }));
+    await establishTrustedWindow(env);
+    env.plan.operations = [DOWNLOAD];
+
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [{ op: "put", path: "note.md" }]);
+    env.timers.fire(0);
+    await flush();
+
+    // A definitive local rejection is a deterministic conclusion about this device, not an unknown: the
+    // remote window was fully observed, so the generation is retired and nothing is left queued.
+    expect(env.scheduler.diagnostics().lastResultCounts.failed).toBe(1);
+    expect(env.confirmed).toEqual(["81", "82"]);
+    expect(env.scheduler.diagnostics().lastConfirmation).toBe("confirmed");
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(0);
+    expect(env.timers.delays()).toEqual([]);
+  });
+
+  it("does not let a queued delta bypass a retryable backoff", async () => {
+    const env = harness(async (operation) => ({ status: "unresolved", key: operation.key, reason: "ambiguous-put" }));
+    await establishTrustedWindow(env);
+    env.plan.operations = [DOWNLOAD];
+
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [{ op: "put", path: "note.md" }]);
+    env.timers.fire(0);
+    await flush();
+
+    // An outage keeps its exponential backoff rather than turning the delta into an immediate spin.
+    expect(env.confirmed).toEqual(["81"]);
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(1);
+    expect(env.timers.delays()).toEqual([5000]);
   });
 });

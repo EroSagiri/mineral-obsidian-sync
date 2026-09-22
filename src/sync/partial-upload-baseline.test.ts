@@ -6,14 +6,18 @@ import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "./types";
 
 /**
- * Investigation reproduction for the self-inflicted `both-modified` conflict.
+ * Baseline fidelity on the two transfer paths.
  *
- * A conditional PUT that lands on R2 but whose local file moved on during the write returns
- * `partial` and commits **no** baseline at all. The device consequently keeps the ANCESTOR as its
- * baseline, so its own just-uploaded version reads as an external remote change on the next cycle.
+ * A landed conditional PUT must leave a baseline describing the version it carried, and a download must
+ * prove the bytes on disk before it claims `local == remote`. Both were reproduced as defects before
+ * the fix; both now assert the fixed behaviour.
  */
 
 const identity = { endpoint: "https://r2.example", bucket: "test", remotePrefix: "" };
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const bytes = (values: number[]) => new Uint8Array(values).buffer;
+const sizeOf = (text: string) => encoder.encode(text).byteLength;
 
 function state(): StateStore & { entries: PreviousEntry[] } {
   const entries: PreviousEntry[] = [];
@@ -27,94 +31,243 @@ function state(): StateStore & { entries: PreviousEntry[] } {
   };
 }
 
-describe("a landed upload that abandons its baseline", () => {
-  it("leaves the ancestor as the baseline and turns the device's own upload into a conflict", async () => {
-    // The file as the scan saw it, and the bytes that the conditional PUT actually sends.
-    const uploaded: LocalEntry = { key: "daily/note.md", size: 124, mtime: 1790094547566 };
-    const base: PreviousEntry = { key: "daily/note.md", local: uploaded, remote: { size: 124, etag: "095fa8ae" }, syncedAt: 1790094548736 };
-    let moved = false;
-    let reads = 0;
+function mergeBases() {
+  const recorded: Array<{ path: string; remoteETag?: string; size: number; mtime: number }> = [];
+  return {
+    recorded,
+    recorder: {
+      record: async ({ path, baseline }: { path: string; baseline: { localVersion: LocalEntry; remoteETag?: string } }) => {
+        recorded.push({ path, remoteETag: baseline.remoteETag, size: baseline.localVersion.size, mtime: baseline.localVersion.mtime });
+      },
+    },
+  };
+}
 
-    const file = { path: "daily/note.md" };
-    const vault = {
+/**
+ * A one-file Vault whose metadata and bytes a test can move at exact points, so each scenario can say
+ * precisely what the editor did and when.
+ */
+function vaultFile(initial: { text: string; mtime: number }) {
+  const file = { path: "note.md" };
+  const stored = { text: initial.text, mtime: initial.mtime };
+  const behaviour = {
+    /** Every `stat` reports a newer mtime, as a file being typed into continuously would. */
+    driftingStats: false,
+    /** Reports no metadata at all from the first `stat` after a write. */
+    statsUnavailableAfterWrite: false,
+    statsUnavailable: false,
+    /** What the local write actually leaves behind, instead of the bytes it was handed. */
+    onWrite: undefined as undefined | ((value: ArrayBuffer) => void),
+    writeThrows: undefined as undefined | Error,
+  };
+  let drift = 0;
+  let wrote = false;
+  const write = (value: ArrayBuffer): void => {
+    if (behaviour.writeThrows) throw behaviour.writeThrows;
+    if (behaviour.onWrite) behaviour.onWrite(value);
+    else stored.text = decoder.decode(new Uint8Array(value));
+    stored.mtime += 1;
+    wrote = true;
+  };
+  return {
+    stored,
+    behaviour,
+    /** An editor save: newer bytes and a newer timestamp, without going through the Vault. */
+    edit(text: string, mtime: number) { stored.text = text; stored.mtime = mtime; },
+    asVault: {
       getFileByPath: () => file,
       getAbstractFileByPath: () => file,
-      readBinary: async () => new Uint8Array(142).buffer,
-      modifyBinary: async () => {},
-      createBinary: async () => {},
+      readBinary: async () => bytes([...encoder.encode(stored.text)]),
+      modifyBinary: async (_file: unknown, value: ArrayBuffer) => write(value),
+      createBinary: async (_key: string, value: ArrayBuffer) => write(value),
       createFolder: async () => ({ path: "" }),
-      // Once the PUT is in flight the editor keeps saving, so every later stat reports a newer mtime.
-      adapter: { stat: async () => (moved ? { size: 211, mtime: 1790094560058 - reads++ } : { size: 124, mtime: uploaded.mtime }) },
-    };
+      adapter: {
+        stat: async () => {
+          if (behaviour.statsUnavailable) return null;
+          if (behaviour.statsUnavailableAfterWrite && wrote) return null;
+          if (behaviour.driftingStats) return { size: sizeOf(stored.text), mtime: stored.mtime + drift++ };
+          return { size: sizeOf(stored.text), mtime: stored.mtime };
+        },
+      },
+    },
+  };
+}
 
+describe("upload: a landed PUT always leaves a floor baseline", () => {
+  /** "base\n" is five bytes, so both transfer paths can share one fixture shape. */
+  const UPLOADED: LocalEntry = { key: "note.md", size: 5, mtime: 100 };
+  const upload = (): Extract<SyncOperation, { type: "upload" }> => ({ type: "upload", key: "note.md", reason: "local changed", expectedLocal: UPLOADED, expectedRemote: { kind: "etag", value: "ETAG-OLD" } });
+
+  it("keeps the floor baseline when the catch-up cannot complete, so the next plan uploads", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
     const saved = state();
-    const client = { putObject: async (_key: string, _body: ArrayBuffer) => { moved = true; return { size: 142, etag: "7c3652b5" }; } } as unknown as R2Client;
-    const operation: Extract<SyncOperation, { type: "upload" }> = { type: "upload", key: "daily/note.md", reason: "local changed", expectedLocal: uploaded, expectedRemote: { kind: "etag", value: "095fa8ae" } };
+    const base = mergeBases();
+    let puts = 0;
+    const client = {
+      putObject: async () => {
+        puts += 1;
+        // The PUT carries the scanned version; the user keeps typing, so no later read is stable.
+        editor.edit("base\nB\n", 200);
+        editor.behaviour.driftingStats = true;
+        return { size: 5, etag: "ETAG-A" };
+      },
+    } as unknown as R2Client;
 
-    const result = await new SafeExecutor(vault as never, client, saved, identity, "[]").execute(operation);
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(upload());
 
-    // R2 now holds this device's bytes — and the announced generation told every other device so.
-    expect(result).toEqual({ status: "partial", key: "daily/note.md", reason: "remote-applied-local-changed" });
-    // ...but nothing was committed, so the baseline still names the ancestor 095fa8ae.
-    expect(saved.entries).toEqual([]);
+    // The catch-up could not establish a stable local version, so the transfer is not converged ...
+    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-applied-local-changed" });
+    expect(puts).toBe(1);
+    // ... but the PUT that did land is recorded as exactly the pair it proved.
+    expect(saved.entries).toHaveLength(1);
+    expect(saved.entries[0]).toMatchObject({ key: "note.md", local: { size: 5, mtime: 100 }, remote: { size: 5, etag: "ETAG-A" } });
+    // The merge base describes the bytes that were actually uploaded, not whatever is on disk now.
+    expect(base.recorded).toEqual([{ path: "note.md", remoteETag: "ETAG-A", size: 5, mtime: 100 }]);
 
-    // The next cycle compares: local moved on, and the remote is no longer the baseline either.
-    const here: LocalEntry = { key: "daily/note.md", size: 211, mtime: 1790094560058 };
-    const there: RemoteEntry = { key: "daily/note.md", size: 142, etag: "7c3652b5", lastModified: 1790094554470 };
-    const planned = buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[base.key, base]]));
-    expect(planned.operations).toEqual([{ type: "conflict", key: "daily/note.md", reason: "both sides changed since previous successful sync", conflict: "both-modified" }]);
+    // The device's own upload must never read back as a remote concurrent edit.
+    const here: LocalEntry = { key: "note.md", size: 7, mtime: 200 };
+    const there: RemoteEntry = { key: "note.md", size: 5, etag: "ETAG-A", lastModified: 1 };
+    const plan = buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[saved.entries[0]!.key, saved.entries[0]!]]));
+    expect(plan.operations).toEqual([{ type: "upload", key: "note.md", reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: "ETAG-A" } }]);
+  });
 
-    // Had the baseline been advanced to the version the PUT actually carried — the local version that
-    // was uploaded, paired with the ETag it produced — the same observations plan a plain upload.
-    const truthful: PreviousEntry = { key: "daily/note.md", local: uploaded, remote: { size: 142, etag: "7c3652b5" }, syncedAt: 1790094554470 };
-    const plannedWithBase = buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[truthful.key, truthful]]));
-    expect(plannedWithBase.operations).toEqual([{ type: "upload", key: "daily/note.md", reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: "7c3652b5" } }]);
+  it("would have raised a self-conflict without the floor baseline", async () => {
+    // The counterfactual this fix removes: the ancestor as the baseline, the remote already advanced to
+    // this device's own bytes, and a local version newer than both.
+    const ancestor: PreviousEntry = { key: "note.md", local: { size: 5, mtime: 100 }, remote: { size: 5, etag: "ETAG-OLD" }, syncedAt: 1 };
+    const here: LocalEntry = { key: "note.md", size: 7, mtime: 200 };
+    const there: RemoteEntry = { key: "note.md", size: 5, etag: "ETAG-A", lastModified: 1 };
+    const plan = buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[ancestor.key, ancestor]]));
+    expect(plan.operations).toEqual([{ type: "conflict", key: "note.md", reason: "both sides changed since previous successful sync", conflict: "both-modified" }]);
+  });
+
+  it("upgrades the floor baseline when the catch-up lands", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    const base = mergeBases();
+    const bodies: string[] = [];
+    const client = {
+      putObject: async (_key: string, body: ArrayBuffer, options: unknown) => {
+        bodies.push(decoder.decode(new Uint8Array(body)));
+        if (bodies.length === 1) { editor.edit("base\nB\n", 200); return { size: 5, etag: "ETAG-A" }; }
+        expect(options).toEqual({ ifMatch: "ETAG-A" });
+        return { size: 7, etag: "ETAG-B" };
+      },
+    } as unknown as R2Client;
+
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(upload());
+
+    expect(result).toEqual({ status: "applied", key: "note.md" });
+    expect(bodies).toEqual(["base\n", "base\nB\n"]);
+    // The baseline must end on the newer pair, not stay behind on the floor.
+    expect(saved.entries).toHaveLength(2);
+    expect(saved.entries[1]).toMatchObject({ local: { size: 7, mtime: 200 }, remote: { size: 7, etag: "ETAG-B" } });
+    expect(base.recorded.at(-1)).toMatchObject({ remoteETag: "ETAG-B", size: 7, mtime: 200 });
+
+    const here: LocalEntry = { key: "note.md", size: 7, mtime: 200 };
+    const there: RemoteEntry = { key: "note.md", size: 7, etag: "ETAG-B", lastModified: 1 };
+    const plan = buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[saved.entries[1]!.key, saved.entries[1]!]]));
+    expect(plan.operations).toEqual([{ type: "noop", key: "note.md", reason: "unchanged since previous successful sync" }]);
+  });
+
+  it("leaves no baseline at all when the PUT itself never landed", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    const client = { putObject: async () => { throw new Error("no response"); } } as unknown as R2Client;
+
+    await expect(new SafeExecutor(editor.asVault as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "unresolved", key: "note.md", reason: "ambiguous-put" });
+    expect(saved.entries).toHaveLength(0);
   });
 });
 
-describe("a download that commits whatever the post-write stat happens to say", () => {
-  it("records the user's racing save as if it matched the remote version, hiding the edit forever", async () => {
-    const file = { path: "a.md" };
-    let stored = { bytes: new Uint8Array([1, 2, 3]).buffer, mtime: 10 };
-    const vault = {
-      getFileByPath: () => file,
-      getAbstractFileByPath: () => file,
-      readBinary: async () => stored.bytes,
-      modifyBinary: async (_file: unknown, value: ArrayBuffer) => {
-        // The remote bytes land ...
-        stored = { bytes: value, mtime: 20 };
-        // ... and the editor's pending save overwrites them before the executor stats the file.
-        stored = { bytes: new Uint8Array([9, 9, 9]).buffer, mtime: 30 };
-      },
-      createBinary: async () => {},
-      createFolder: async () => ({ path: "" }),
-      adapter: { stat: async () => ({ size: stored.bytes.byteLength, mtime: stored.mtime }) },
-    };
-    const client = { getObject: async () => new Uint8Array([7, 8]).buffer } as unknown as R2Client;
+describe("download: the baseline is only committed for verified bytes", () => {
+  const EXPECTED_LOCAL: LocalEntry = { key: "note.md", size: 5, mtime: 100 };
+  const REMOTE: RemoteEntry = { key: "note.md", size: 5, etag: "ETAG-R", lastModified: 1 };
+  const download = (): Extract<SyncOperation, { type: "download" }> => ({ type: "download", key: "note.md", reason: "remote changed", expectedLocal: EXPECTED_LOCAL, expectedRemote: REMOTE });
+  const remoteBody = () => bytes([...encoder.encode("remot")]);
+  const client = { getObject: async () => remoteBody() } as unknown as R2Client;
+
+  it("reports partial and commits nothing when an editor save wins the write", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
     const saved = state();
-    const operation: Extract<SyncOperation, { type: "download" }> = {
-      type: "download",
-      key: "a.md",
-      reason: "remote changed",
-      expectedLocal: { key: "a.md", size: 3, mtime: 10 },
-      expectedRemote: { key: "a.md", size: 2, etag: "R", lastModified: 1 },
-    };
+    const base = mergeBases();
+    // The remote bytes land, then the editor's pending save overwrites them before the re-read.
+    editor.behaviour.onWrite = () => { editor.edit("base\nUSER\n", 300); };
 
-    const result = await new SafeExecutor(vault as never, client, saved, identity, "[]").execute(operation);
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(download());
 
-    expect(result).toMatchObject({ status: "applied" });
-    // The baseline claims the local version (size 3, mtime 30) is the remote object with ETag "R" —
-    // but those bytes are the user's, not the downloaded ones.
-    expect(saved.entries).toMatchObject([{ key: "a.md", local: { size: 3, mtime: 30 }, remote: { size: 2, etag: "R" } }]);
+    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-write-raced-with-local-edit" });
+    // In particular, the user's content is never recorded as equal to the remote version.
+    expect(saved.entries).toHaveLength(0);
+    expect(base.recorded).toHaveLength(0);
 
-    // Nothing is left to notice: the planner now calls this path converged ...
-    const plan = buildSyncPlan(
-      new Map([["a.md", { key: "a.md", size: 3, mtime: 30 }]]),
-      new Map([["a.md", { key: "a.md", size: 2, etag: "R", lastModified: 1 }]]),
-      new Map([["a.md", saved.entries[0]]]),
-    );
-    expect(plan.operations).toEqual([{ type: "noop", key: "a.md", reason: "unchanged since previous successful sync" }]);
-    // ... while R2 still holds the downloaded bytes and never receives the user's.
-    expect(stored.bytes.byteLength).toBe(3);
+    // The defect this replaces: binding the racing save to the remote ETag made the planner report the
+    // path converged forever, so the user's text could never be uploaded.
+    const racy: PreviousEntry = { key: "note.md", local: { size: 10, mtime: 300 }, remote: { size: 5, etag: "ETAG-R" }, syncedAt: 1 };
+    const here: LocalEntry = { key: "note.md", size: 10, mtime: 300 };
+    const racyPlan = buildSyncPlan(new Map([[here.key, here]]), new Map([[REMOTE.key, REMOTE]]), new Map([[racy.key, racy]]));
+    expect(racyPlan.operations).toEqual([{ type: "noop", key: "note.md", reason: "unchanged since previous successful sync" }]);
+  });
+
+  it("detects the race by content, not by size or mtime", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    // Same length as the downloaded bytes and a timestamp that never moves: only a content comparison
+    // can tell that the file does not hold what was downloaded.
+    editor.behaviour.onWrite = () => { editor.stored.text = "XXXXX"; };
+    editor.behaviour.driftingStats = false;
+    const asVault = { ...editor.asVault, adapter: { stat: async () => ({ size: 5, mtime: 100 }) } };
+
+    const result = await new SafeExecutor(asVault as never, client, saved, identity, "[]").execute(download());
+
+    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-write-raced-with-local-edit" });
+    expect(saved.entries).toHaveLength(0);
+  });
+
+  it("commits the verified version and records its merge base when the write landed", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    const base = mergeBases();
+
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(download());
+
+    expect(result).toMatchObject({ status: "applied", key: "note.md", localWrite: { key: "note.md", size: 5, mtime: 101 } });
+    expect(saved.entries).toHaveLength(1);
+    expect(saved.entries[0]).toMatchObject({ local: { size: 5, mtime: 101 }, remote: { size: 5, etag: "ETAG-R" } });
+    expect(base.recorded).toEqual([{ path: "note.md", remoteETag: "ETAG-R", size: 5, mtime: 101 }]);
+  });
+
+  it("treats an unreadable post-write stat as landing-unknown, never as a definitive failure", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    editor.behaviour.statsUnavailableAfterWrite = true;
+
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]").execute(download());
+
+    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-write-landing-unknown" });
+    expect(saved.entries).toHaveLength(0);
+  });
+
+  it("treats a throwing local write as landing-unknown, never as a definitive failure", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    editor.behaviour.writeThrows = new Error("write interrupted");
+
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]").execute(download());
+
+    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-write-landing-unknown", error: "write interrupted" });
+    expect(saved.entries).toHaveLength(0);
+  });
+
+  it("still fails definitively when nothing was written at all", async () => {
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    // A folder occupying the target is decided before any write, so it stays a definitive failure.
+    const asVault = { ...editor.asVault, getFileByPath: () => null, getAbstractFileByPath: () => ({ path: "note.md" }) };
+
+    const result = await new SafeExecutor(asVault as never, client, saved, identity, "[]").execute(download());
+
+    expect(result).toMatchObject({ status: "failed", reason: "target-path-is-folder" });
+    expect(saved.entries).toHaveLength(0);
   });
 });

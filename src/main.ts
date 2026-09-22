@@ -330,7 +330,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const identity = remoteIdentity(settings);
     const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
     const channel = this.currentChannel();
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined);
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message));
     // Scanned once per cycle and shared by planning and conflict observation, so both see exactly the
     // same observations and no second scan can disagree with the planner's inputs.
     return {

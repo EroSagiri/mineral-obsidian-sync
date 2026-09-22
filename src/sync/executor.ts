@@ -6,6 +6,7 @@ import type { R2Client } from "../remote/r2-client";
 import { TOMBSTONE_PROTOCOL, type RemoteTombstone } from "../remote/tombstones";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, RemoteVersion, SyncOperation } from "./types";
+import { sha256 } from "./fingerprint";
 
 /**
  * The single destructive capability the executor is allowed to request.
@@ -36,6 +37,21 @@ export type VaultTrashFailure = "trash-unavailable" | "target-is-folder" | "file
 /** Precise reasons a resolution could not be applied to the local file. */
 export type ResolutionWriteFailure = "target-missing" | "target-path-is-folder" | "parent-path-is-file" | "folder-create-failed";
 
+/**
+ * Why a transfer left the two sides in a state this device must not claim is converged.
+ *
+ * The distinction that matters to the scheduler is not *what* went wrong but whether a side effect may
+ * exist that nobody has accounted for. Every `partial` is such a case, which is why a `partial` makes
+ * a cycle's remote observation incomplete and no Gateway generation may be retired from it.
+ */
+export type PartialReason =
+  /** A conditional PUT landed and the local half (the catch-up, or the resolved write) did not. */
+  | "remote-applied-local-changed"
+  /** A completed local write was superseded by an editor save before its content could be verified. */
+  | "remote-write-raced-with-local-edit"
+  /** A local write was attempted and whether it landed cannot be established. */
+  | "remote-write-landing-unknown";
+
 export type OperationResult =
   | { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" | "conflict-superseded" }
@@ -45,12 +61,15 @@ export type OperationResult =
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
   | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed" }
   /**
-   * A resolution whose remote half landed but whose local half could not be completed, because the
-   * user edited the file while the PUT was in flight. The remote already holds the resolved content,
-   * so this is not a failure and not a success: it needs one more reconciliation, and the baseline
-   * was deliberately left uncommitted.
+   * A transfer that may have left a side effect this device cannot describe with a baseline.
+   *
+   * A `failed` is a promise that nothing needs recovering; a `partial` is the absence of that promise.
+   * The remote half may have landed (a conditional PUT that this device authored, or the resolved
+   * content another device can already see), or a local write's landing may be unknown, or a local
+   * write was proven superseded by the user. In every case exactly one more reconciliation is needed,
+   * and the caller must not treat the remote window as fully observed.
    */
-  | { status: "partial"; key: string; reason: "remote-applied-local-changed" };
+  | { status: "partial"; key: string; reason: PartialReason; error?: string };
 
 /**
  * A conditional mismatch is a stale plan, not a plugin error. A received 4xx means the write
@@ -76,6 +95,25 @@ async function localStillMatches(vault: Vault, key: string, expected: LocalEntry
 }
 function message(error: unknown): string { return error instanceof Error ? error.message.slice(0, 180) : "unknown error"; }
 
+/**
+ * A short, non-reversible digest of a path.
+ *
+ * Debug telemetry in this plugin deliberately never carries a key, and this is how the two constraints
+ * — "say which path this was about" and "never log a path" — are reconciled: the digest is stable for
+ * correlation within a session and reveals nothing on its own. FNV-1a keeps this synchronous, so a
+ * diagnostic can never add an await to a transfer.
+ */
+export function pathDigest(key: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < key.length; index++) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+const shortEtag = (etag: string | undefined): string => etag ? `${etag.slice(0, 8)}…` : "none";
+
 /** Sequentially executed, deliberately unexposed executor: callers must supply an already-observed plan. */
 export class SafeExecutor {
   constructor(
@@ -86,7 +124,11 @@ export class SafeExecutor {
     private readonly ignorePolicy: string,
     private readonly files?: VaultFileRemover,
     private readonly mergeBase?: MergeBaseRecorder,
+    private readonly debug?: (message: string) => void,
   ) {}
+
+  /** Diagnostic categories only: never a key, never content, never request metadata. */
+  private log(message: string): void { this.debug?.(message); }
 
   async execute(operation: SyncOperation): Promise<OperationResult> {
     if (operation.type === "delete-remote") return this.deleteRemote(operation);
@@ -278,14 +320,25 @@ export class SafeExecutor {
       if (!folders.ok) return { status: "failed", key, error: folders.error, reason: folders.reason };
       if (this.vault.getFileByPath(key)) return { status: "stale", key, reason: "local-changed" };
       try { await this.vault.createBinary(key, bytes); }
-      catch (error) { return { status: "failed", key, error: message(error) }; }
+      catch (error) { return this.landingUnknown(key, error); }
     } else {
       try { await this.vault.modifyBinary(file, bytes); }
-      catch (error) { return { status: "failed", key, error: message(error) }; }
+      catch (error) { return this.landingUnknown(key, error); }
     }
     const local = await this.vault.adapter.stat(key);
-    if (!local) return { status: "failed", key, error: "Vault write did not produce a file" };
+    // The write was attempted; whether it landed is exactly what an unreadable stat leaves unknown.
+    if (!local) return this.landingUnknown(key, new Error("Vault write did not produce a file"));
     return { version: { size: local.size, mtime: local.mtime } };
+  }
+
+  /**
+   * A local write whose landing cannot be established is never a definitive failure: the scheduler must
+   * not retire a remote generation on a result that proves nothing about the local side. It is reported
+   * as `partial`, which keeps the window incomplete and lets the next reconciliation observe the truth.
+   */
+  private landingUnknown(key: string, error: unknown): OperationResult {
+    this.log(`local write landing unknown path-digest=${pathDigest(key)} result=partial`);
+    return { status: "partial", key, reason: "remote-write-landing-unknown", error: message(error) };
   }
 
   private async recordMergeBase(key: string, baseline: { localVersion: LocalEntry; remoteETag?: string }): Promise<void> {
@@ -301,18 +354,51 @@ export class SafeExecutor {
 
   // ---- transfers --------------------------------------------------------------------------------
 
+  /**
+   * Commits the baseline a landed conditional PUT proves: this exact local version, now equal to the
+   * remote version that PUT produced.
+   *
+   * It is called *before* the executor looks at the file again, because the fact it records is a
+   * property of the completed transfer rather than of the file's current state. A `state-commit-failed`
+   * is returned as `unresolved` for the caller to surface: a transfer whose baseline could not be
+   * remembered is not a converged transfer.
+   */
+  private async commitFloorBaseline(key: string, local: LocalEntry, remote: RemoteVersion): Promise<OperationResult | undefined> {
+    const result = await this.commit({ key, local: { size: local.size, mtime: local.mtime }, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
+    if (!result) this.log(`floor-baseline committed path-digest=${pathDigest(key)} etag=${shortEtag(remote.etag)}`);
+    return result;
+  }
+
+  /**
+   * Uploads the exact local version the planner observed, with the conditional PUT as its only
+   * precondition.
+   *
+   * The ordering after a successful PUT is the whole safety argument:
+   *
+   * 1. commit a **floor baseline** for the version that was actually sent, immediately, before anything
+   *    else can fail. The PUT landed, so at that instant the local file provably held those bytes and
+   *    R2 provably holds them — exactly the fact a baseline asserts, and one that stays true whatever
+   *    the editor does next. Without it, a catch-up failure leaves the *ancestor* as the baseline while
+   *    the remote has already advanced to this device's own bytes, and the next cycle reads that as a
+   *    remote concurrent edit and reports `both-modified` against itself;
+   * 2. only then look at the file again, and offer a newer local version to the catch-up path, which
+   *    upgrades the baseline to that newer pair if — and only if — its own conditional PUT lands.
+   *
+   * A failed catch-up therefore keeps the floor and reports `partial`; it never retracts the fact that
+   * the first PUT succeeded.
+   */
   private async upload(operation: Extract<SyncOperation, { type: "upload" }>): Promise<OperationResult> {
     if (operation.expectedRemote.kind === "etag" && !operation.expectedRemote.value) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     let bytes: ArrayBuffer;
     try { bytes = await readStableLocalBytes(this.vault, operation.expectedLocal); } catch (error) { return error instanceof LocalFileChangedError ? { status: "stale", key: operation.key, reason: "local-changed" } : { status: "failed", key: operation.key, error: message(error) }; }
     try {
       const remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemote.kind === "absent" ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemote.value! });
+      this.log(`upload landed path-digest=${pathDigest(operation.key)} etag=${shortEtag(remote.etag)}`);
+      const floor = await this.commitFloorBaseline(operation.key, operation.expectedLocal, remote);
+      if (floor) return floor;
+      await this.recordMergeBase(operation.key, { localVersion: operation.expectedLocal, remoteETag: remote.etag });
       const localStat = await this.vault.adapter.stat(operation.key);
       if (!same(localStat, operation.expectedLocal)) return this.catchUpLatestLocalUpload(operation.key, remote);
-      const version = { size: localStat!.size, mtime: localStat!.mtime };
-      const commit = await this.commit({ key: operation.key, local: version, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
-      if (commit) return commit;
-      await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...version }, remoteETag: remote.etag });
       return { status: "applied", key: operation.key };
     } catch (error) {
       return uploadFailure("PutObject", operation.key, error);
@@ -320,27 +406,77 @@ export class SafeExecutor {
   }
 
   /**
-   * The first conditional PUT already landed, but the editor saved a newer local version before its
-   * baseline could be committed. One conditional catch-up PUT preserves that latest local version
-   * without ever overwriting an intervening writer: only the ETag we just received is accepted.
+   * The first conditional PUT already landed, but the editor saved a newer local version before it
+   * could be accounted for. One conditional catch-up PUT preserves that latest local version without
+   * ever overwriting an intervening writer: only the ETag we just received is accepted. On success the
+   * baseline is upgraded to the newer pair; on any failure the floor baseline from the first PUT is
+   * deliberately left in place.
    */
   private async catchUpLatestLocalUpload(key: string, landedRemote: RemoteVersion): Promise<OperationResult> {
+    this.log(`upload catch-up required path-digest=${pathDigest(key)} etag=${shortEtag(landedRemote.etag)}`);
+    const partial = (): OperationResult => {
+      this.log(`upload catch-up partial path-digest=${pathDigest(key)} floorBaselineRetained=true`);
+      return { status: "partial", key, reason: "remote-applied-local-changed" };
+    };
     let latest: Awaited<ReturnType<typeof readCurrentStableLocalBytes>>;
     try { latest = await readCurrentStableLocalBytes(this.vault, key); }
-    catch { return { status: "partial", key, reason: "remote-applied-local-changed" }; }
+    catch { return partial(); }
     try {
       const remote = await this.r2.putObject(key, latest.bytes, { ifMatch: landedRemote.etag });
-      if (!same(await this.vault.adapter.stat(key), latest.version)) return { status: "partial", key, reason: "remote-applied-local-changed" };
+      if (!same(await this.vault.adapter.stat(key), latest.version)) return partial();
       const commit = await this.commit({ key, local: { size: latest.version.size, mtime: latest.version.mtime }, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
       if (commit) return commit;
       await this.recordMergeBase(key, { localVersion: latest.version, remoteETag: remote.etag });
       return { status: "applied", key };
     } catch {
-      // The first PUT is known to have landed. A failed catch-up must therefore be surfaced as a
-      // partial result so the scheduler wakes peers and re-observes rather than forgetting it.
-      return { status: "partial", key, reason: "remote-applied-local-changed" };
+      // The first PUT is known to have landed, so this must be surfaced as a partial result rather
+      // than a failure: the floor baseline it committed is the only record of that transfer.
+      return partial();
     }
   }
+
+  /**
+   * Confirms that a completed local write left behind exactly the bytes the transfer intended, and
+   * returns the Vault version those bytes belong to.
+   *
+   * A `stat` cannot answer this question: it reports a size and a timestamp, and an editor save that
+   * lands between the write and the stat would otherwise be recorded as a converged baseline while its
+   * content was never compared. That would make the planner see `local == baseline.local` forever and
+   * drop the user's edit silently. The check is therefore content-level, over bytes re-read around a
+   * stable `stat`, and the returned version is the one the verified bytes actually belong to.
+   *
+   * `unavailable` means the file or its metadata could not be read at all — the write's landing is
+   * unknown. `mismatch` means a different version is on disk — a racing editor save won the window.
+   */
+  private async verifyWrittenContent(key: string, expected: ArrayBuffer): Promise<
+    { matched: true; version: { size: number; mtime: number }; hash: string } | { matched: false; cause: "unavailable" | "mismatch" }
+  > {
+    const file = this.vault.getFileByPath(key);
+    if (!file) return { matched: false, cause: "unavailable" };
+    const before = await this.vault.adapter.stat(key);
+    if (!before) return { matched: false, cause: "unavailable" };
+    let actual: ArrayBuffer;
+    try { actual = await this.vault.readBinary(file); } catch { return { matched: false, cause: "unavailable" }; }
+    const after = await this.vault.adapter.stat(key);
+    // A version that moved while it was being read cannot be attributed to these bytes either.
+    if (!after || after.size !== before.size || after.mtime !== before.mtime) return { matched: false, cause: "mismatch" };
+    const [expectedHash, actualHash] = await Promise.all([sha256(expected), sha256(actual)]);
+    if (expectedHash.value !== actualHash.value) return { matched: false, cause: "mismatch" };
+    return { matched: true, version: { size: after.size, mtime: after.mtime }, hash: actualHash.value };
+  }
+
+  /**
+   * Applies a remote version to the local file, then proves the result before claiming convergence.
+   *
+   * The baseline may only be committed for bytes the executor has read back and compared with the ones
+   * it downloaded. Anything else — a racing editor save, or metadata that cannot be read — is a
+   * `partial` with no baseline, so no `local == remote` fact is invented and no merge base is recorded
+   * for a version that was never on disk.
+   *
+   * A write that may have landed is likewise never reported as a definitive `failed`: whether it left
+   * a side effect is exactly what is unknown, and the scheduler must not retire a remote generation on
+   * the strength of a failure that proves nothing about the local side.
+   */
   private async download(operation: Extract<SyncOperation, { type: "download" }>): Promise<OperationResult> {
     if (!operation.expectedRemote.etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
@@ -353,10 +489,13 @@ export class SafeExecutor {
     }
     // Local side effects stay as late as possible: a failed download must not create folders.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
+    let wrote = false;
     try {
       const file = this.vault.getFileByPath(operation.key);
       if (file) {
-        await this.vault.modifyBinary(file, bytes);
+        // A throwing write cannot prove that no bytes landed, so it is landing-unknown, not a failure.
+        try { await this.vault.modifyBinary(file, bytes); }
+        catch (error) { return this.landingUnknown(operation.key, error); }
       } else {
         if (this.vault.getAbstractFileByPath(operation.key) !== null) return { status: "failed", key: operation.key, reason: "target-path-is-folder", error: `Vault path "${operation.key}" is a folder, not a file` };
         // Vault.createBinary does not create missing parent folders, so the chain is made first.
@@ -364,16 +503,31 @@ export class SafeExecutor {
         if (!folders.ok) return { status: "failed", key: operation.key, reason: folders.reason, error: folders.error };
         // Creating folders widens the race window, so the target is confirmed once more.
         if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
-        await this.vault.createBinary(operation.key, bytes);
+        try { await this.vault.createBinary(operation.key, bytes); }
+        catch (error) { return this.landingUnknown(operation.key, error); }
       }
-      const local = await this.vault.adapter.stat(operation.key);
-      if (!local) return { status: "failed", key: operation.key, error: "Vault write did not produce a file" };
-      const version = { size: local.size, mtime: local.mtime };
+      wrote = true;
+      const verified = await this.verifyWrittenContent(operation.key, bytes);
+      if (!verified.matched) {
+        this.log(`download post-write verification mismatch path-digest=${pathDigest(operation.key)} cause=${verified.cause} result=partial`);
+        return {
+          status: "partial",
+          key: operation.key,
+          reason: verified.cause === "unavailable" ? "remote-write-landing-unknown" : "remote-write-raced-with-local-edit",
+        };
+      }
+      const version = { size: verified.version.size, mtime: verified.version.mtime, hash: verified.hash };
       const commit = await this.commit({ key: operation.key, local: version, remote: operation.expectedRemote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
       if (commit) return commit;
-      await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...version }, remoteETag: operation.expectedRemote.etag });
-      return { status: "applied", key: operation.key, localWrite: { key: operation.key, ...version } };
-    } catch (error) { return { status: "failed", key: operation.key, error: message(error) }; }
+      await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...verified.version }, remoteETag: operation.expectedRemote.etag });
+      this.log(`download applied path-digest=${pathDigest(operation.key)} etag=${shortEtag(operation.expectedRemote.etag)}`);
+      return { status: "applied", key: operation.key, localWrite: { key: operation.key, ...verified.version } };
+    } catch (error) {
+      // Past the write, a throw says nothing about whether bytes landed: that is landing-unknown, not
+      // a definitive failure. Before it, every local side effect is still accounted for.
+      if (wrote) return this.landingUnknown(operation.key, error);
+      return { status: "failed", key: operation.key, error: message(error) };
+    }
   }
 }
 

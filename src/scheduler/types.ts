@@ -131,6 +131,8 @@ export interface SchedulerDiagnostics {
   lastResultCounts: ResultCounts;
   lastFailureClass?: FailureClass;
   pendingDirtyCount: number;
+  /** Remote deltas that have been announced but not yet covered by a completed observation window. */
+  pendingRemoteDeltaCount: number;
   syncDirtyVersion: number;
   currentState: SchedulerState;
   configGeneration: number;

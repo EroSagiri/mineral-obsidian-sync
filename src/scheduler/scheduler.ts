@@ -55,6 +55,7 @@ export class SyncScheduler {
     const existing = this.pendingRemoteChanges.find((entry) => entry.generation === generation);
     if (existing) existing.changes = changes;
     else this.pendingRemoteChanges.push({ generation, changes });
+    this.dependencies.debug?.(`remote delta queued generation=${generation} pendingRemoteChanges=${this.pendingRemoteChanges.length}`);
     this.requestReconcile("remote-change");
   }
 
@@ -93,7 +94,7 @@ export class SyncScheduler {
 
   refreshStatus(): void { this.publish(); }
   diagnostics(): SchedulerDiagnostics {
-    return { lastCycleStartedAt: this.lastCycleStartedAt, lastCycleFinishedAt: this.lastCycleFinishedAt, lastCycleReason: this.lastCycleReason, lastResultCounts: { ...this.lastResultCounts }, lastFailureClass: this.lastFailureClass, pendingDirtyCount: this.dirty.size, syncDirtyVersion: this.syncDirtyVersion, currentState: this.state, configGeneration: this.configGeneration, stopped: this.stopped, lastHandshakeStart: this.lastHandshakeStart, lastConfirmation: this.lastConfirmation, lastCycleRemoteMutation: this.lastCycleRemoteMutation };
+    return { lastCycleStartedAt: this.lastCycleStartedAt, lastCycleFinishedAt: this.lastCycleFinishedAt, lastCycleReason: this.lastCycleReason, lastResultCounts: { ...this.lastResultCounts }, lastFailureClass: this.lastFailureClass, pendingDirtyCount: this.dirty.size, syncDirtyVersion: this.syncDirtyVersion, currentState: this.state, configGeneration: this.configGeneration, stopped: this.stopped, lastHandshakeStart: this.lastHandshakeStart, lastConfirmation: this.lastConfirmation, lastCycleRemoteMutation: this.lastCycleRemoteMutation, pendingRemoteDeltaCount: this.pendingRemoteChanges.length };
   }
 
   private delayFor(reason: ReconcileReason): number {
@@ -241,7 +242,12 @@ export class SyncScheduler {
         if (complete) {
           await this.dependencies.remoteChange?.confirmReconciled(incremental.generation);
           outcome = { kind: "confirmed", generation: incremental.generation };
-        } else outcome = { kind: "observation-incomplete" };
+        } else {
+          // The delta goes back on the queue below and is retried; naming the cause is what makes it
+          // possible to tell a stalled transport from a local side effect nobody has accounted for.
+          this.dependencies.debug?.(`remote observation incomplete generation=${incremental.generation} reason=${incompleteWindowReason({ counts, stale, halted })}`);
+          outcome = { kind: "observation-incomplete" };
+        }
       } else outcome = await this.finishGenerationHandshake(handshake, { halted, counts, stale, remoteMutation, remoteChanges });
       failure = applyConfirmationFailure(outcome, failure);
     } catch {
@@ -365,6 +371,20 @@ export class SyncScheduler {
     // A foreground recovery is a correctness boundary after a background suspension. It must not
     // wait behind editor debounce, even when an executor-owned or user edit event also arrived.
     if (rerunReason === "foreground-resume") { this.pendingReason = rerunReason; this.scheduleDebounce(0); return; }
+    // A queued remote delta is work in its own right, not a property of whichever reason happened to
+    // win the debounce. It can only be consumed by a cycle whose reason is exactly `remote-change`, so
+    // if a concurrent local edit overwrote that reason the delta would otherwise sit here until an
+    // unrelated event arrived. It therefore gets its own slot, ahead of the local rerun: local
+    // dirtiness survives in the dirty map and is picked up by the cycle that follows this one.
+    //
+    // A retryable failure keeps precedence, so an outage backs off instead of spinning here, and the
+    // retry cycle it schedules reaches this same slot once the transport recovers.
+    if (this.pendingRemoteChanges.length > 0 && failure !== "retryable") {
+      this.dependencies.debug?.(`remote delta rescheduled after active cycle generation=${this.pendingRemoteChanges[0].generation} pendingRemoteChanges=${this.pendingRemoteChanges.length}`);
+      this.pendingReason = "remote-change";
+      this.scheduleDebounce(0);
+      return;
+    }
     if (localDirty) { this.retryDelay = RETRY_INITIAL; this.pendingReason = "local-event"; this.scheduleRerun(); return; }
     // A Gateway announcement (including our own just-confirmed R2 write) must be observed again,
     // but it has no unstable editor buffer to protect. Run its confirmation window immediately.
@@ -392,25 +412,41 @@ function remoteChangeForOperation(operation: SyncOperation): RemoteChange | unde
 }
 
 /**
+ * The category that stops a window from being able to cover a generation.
+ *
+ * It exists so an incomplete window names its cause instead of a bare count. `partial` deserves the
+ * explicit label: it means a local side effect may exist that nothing has accounted for — a write whose
+ * landing is unknown, or a transfer whose local half did not complete — which is precisely the case
+ * where a remote generation must not be retired.
+ */
+export function incompleteWindowReason(state: { counts: ResultCounts; stale: boolean; halted: boolean }): string {
+  if (state.halted) return "halted";
+  if (state.stale) return "stale";
+  if (state.counts.unresolved > 0) return "unresolved";
+  if ((state.counts.partial ?? 0) > 0) return "partial-landing-unknown";
+  return "complete";
+}
+
+/**
  * Maps a cycle's aggregate result onto "could this window have covered a generation?".
  *
  * This is deliberately **not** `applied === total`, and not "everything succeeded". A conflict, a
  * blocked delete, and a definitive per-key failure are all deterministic conclusions that a full
  * remote LIST already reached; treating them as incomplete would re-list forever without any
- * external change, which is exactly the busy loop this contract exists to prevent.
+ * external change, which is exactly the busy loop this contract exists to prevent. A `failed` is only
+ * ever reported when nothing needs recovering — a write whose landing is unknown is a `partial`
+ * instead — so the two classifications agree.
  *
  * The cases where the window genuinely may not have seen the truth are:
  *
  * - `stale` — an observation was proven wrong during execution, so a write was not attempted.
  * - `unresolved` — a PUT's outcome is unknown, so remote state may differ from the LIST.
- * - `partial` — a confirmed R2 write exists, but its local counterpart changed before commit.
+ * - `partial` — a local side effect may exist that no baseline accounts for.
  * - `halted` — config/visibility/unload stopped the cycle before the loop reached its end, so the
  *   remote was never fully observed.
  */
 export function isRemoteObservationComplete(counts: { counts: ResultCounts; stale: boolean; halted: boolean }): boolean {
-  if (counts.halted) return false;
-  if (counts.stale) return false;
-  return counts.counts.unresolved === 0 && (counts.counts.partial ?? 0) === 0;
+  return incompleteWindowReason(counts) === "complete";
 }
 
 function applyConfirmationFailure(outcome: ConfirmationOutcome, failure: FailureClass | undefined): FailureClass | undefined {

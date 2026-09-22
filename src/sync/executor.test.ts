@@ -76,7 +76,11 @@ describe("SafeExecutor", () => {
 
     await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "applied", key: "a.bin" });
     expect(writes).toEqual([{ body: [1, 2, 3], options: { ifNoneMatch: "*" } }, { body: [4, 5, 6, 7], options: { ifMatch: "first" } }]);
-    expect(saved.entries).toMatchObject([{ local: { size: 4, mtime: 20 }, remote: { etag: "latest" } }]);
+    // Two true facts, in order: the first PUT's own pair, then the catch-up's upgrade of it.
+    expect(saved.entries).toMatchObject([
+      { local: { size: 3, mtime: 10 }, remote: { etag: "first" } },
+      { local: { size: 4, mtime: 20 }, remote: { etag: "latest" } },
+    ]);
   });
   it("does not overwrite an intervening remote writer while catching up a local save", async () => {
     const local = vault({ "a.bin": [1, 2, 3] }), saved = state(); let calls = 0;
@@ -86,7 +90,9 @@ describe("SafeExecutor", () => {
       throw new RemoteObjectChangedError();
     } });
     await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "partial", key: "a.bin", reason: "remote-applied-local-changed" });
-    expect(saved.entries).toHaveLength(0);
+    // The refused catch-up changes nothing about the transfer that did land: its floor baseline is kept,
+    // which is what stops the next plan from reading this device's own PUT as a remote concurrent edit.
+    expect(saved.entries).toMatchObject([{ local: { size: 3, mtime: 10 }, remote: { etag: "first" } }]);
   });
   it("will not overwrite a locally-created download target", async () => {
     const local = vault({ "a.bin": [9] }), saved = state();
