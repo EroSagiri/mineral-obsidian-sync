@@ -107,6 +107,7 @@ export class SyncScheduler {
     const startVersion = this.syncDirtyVersion;
     const generation = this.configGeneration;
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
+    const resultDetails = new Map<string, number>();
     this.lastCycleStartedAt = Date.now(); this.lastCycleReason = reason;
     this.dependencies.debug?.(`cycle start reason=${reason} generation=${generation}`);
     try {
@@ -127,6 +128,8 @@ export class SyncScheduler {
             if (this.shouldStop(generation)) { halted = true; break; }
             const result = await this.apply(operation, cycle);
             counts[result.status]++;
+            const detail = resultDetail(result);
+            if (detail) resultDetails.set(detail, (resultDetails.get(detail) ?? 0) + 1);
             if (result.status === "stale") stale = true;
             const classified = classify(result);
             if (classified === "auth") { failure = "auth"; halted = true; break; }
@@ -145,7 +148,7 @@ export class SyncScheduler {
       for (const [key, version] of this.dirty) if (version <= startVersion) this.dirty.delete(key);
       const localDirty = this.syncDirtyVersion > startVersion || this.rerunRequested;
       this.finishCycle(generation, failure, stale, localDirty, halted);
-      this.dependencies.debug?.(`cycle end counts=${JSON.stringify(counts)} dirty=${this.dirty.size}`);
+      this.dependencies.debug?.(`cycle end counts=${JSON.stringify(counts)} details=${JSON.stringify(Object.fromEntries(resultDetails))} dirty=${this.dirty.size}`);
     }
   }
   private async apply(operation: SyncOperation, cycle: CycleDependencies): Promise<OperationResult | { status: "noop" | "conflict" }> {
@@ -185,4 +188,11 @@ function classifyError(error: unknown): FailureClass {
     return "stable";
   }
   return error instanceof RemoteTransportError ? "retryable" : "stable";
+}
+
+/** Diagnostic categories only: never log a key, an exception message, or remote request metadata. */
+function resultDetail(result: OperationResult | { status: "noop" | "conflict" }): string | undefined {
+  if (result.status === "failed") return result.reason ?? (result.httpStatus ? `http-${result.httpStatus}` : "failed-unclassified");
+  if (result.status === "unresolved" || result.status === "blocked" || result.status === "stale") return result.reason;
+  return undefined;
 }
