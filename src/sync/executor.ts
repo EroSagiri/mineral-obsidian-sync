@@ -229,14 +229,14 @@ export class SafeExecutor {
     let remote: RemoteVersion;
     try { remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemoteAbsent ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemoteETag! }); }
     catch (error) { return uploadFailure("PutObject", operation.key, error); }
-    // The remote now holds L. If the local file moved on during the PUT, the baseline cannot describe
-    // both sides, so it is left uncommitted and the next reconciliation picks the divergence up.
-    const localStat = await this.vault.adapter.stat(operation.key);
-    if (!same(localStat, operation.expectedLocal)) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed" };
-    const version = { size: localStat!.size, mtime: localStat!.mtime };
-    const commit = await this.commit({ key: operation.key, local: version, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
-    if (commit) return commit;
-    await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...version }, remoteETag: remote.etag });
+    // The remote now holds L, which `bytes` were read from `expectedLocal`: recording that pair is the
+    // same invariant every other landed PUT has. Leaving it uncommitted is what makes the device's own
+    // resolution read as a remote concurrent edit on the next cycle.
+    const floor = await this.commitFloorBaseline(operation.key, operation.expectedLocal, remote);
+    if (floor) return floor;
+    await this.recordMergeBase(operation.key, { localVersion: operation.expectedLocal, remoteETag: remote.etag });
+    // The confirmation only decides whether the *newest* local version is accounted for as well.
+    if (!same(await this.vault.adapter.stat(operation.key), operation.expectedLocal)) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed" };
     return { status: "applied", key: operation.key };
   }
 
@@ -423,10 +423,16 @@ export class SafeExecutor {
     catch { return partial(); }
     try {
       const remote = await this.r2.putObject(key, latest.bytes, { ifMatch: landedRemote.etag });
-      if (!same(await this.vault.adapter.stat(key), latest.version)) return partial();
-      const commit = await this.commit({ key, local: { size: latest.version.size, mtime: latest.version.mtime }, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
-      if (commit) return commit;
+      this.log(`upload catch-up landed path-digest=${pathDigest(key)} etag=${shortEtag(remote.etag)}`);
+      // This PUT landed as well, so the pair it carried is recorded before anything else can fail —
+      // the same invariant the first PUT has. It is the newer of the two floors, and without it the
+      // device's own catch-up reads as a remote concurrent edit on the next cycle, which is a
+      // `both-modified` conflict against itself.
+      const floor = await this.commitFloorBaseline(key, latest.version, remote);
+      if (floor) return floor;
       await this.recordMergeBase(key, { localVersion: latest.version, remoteETag: remote.etag });
+      // The confirmation only decides whether the *newest* local version is accounted for as well.
+      if (!same(await this.vault.adapter.stat(key), latest.version)) return partial();
       return { status: "applied", key };
     } catch {
       // The first PUT is known to have landed, so this must be surfaced as a partial result rather

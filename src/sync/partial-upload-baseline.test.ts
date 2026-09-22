@@ -131,6 +131,43 @@ describe("upload: a landed PUT always leaves a floor baseline", () => {
     expect(plan.operations).toEqual([{ type: "upload", key: "note.md", reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: "ETAG-A" } }]);
   });
 
+  it("records the catch-up's own pair when the local moves on again, so the device cannot conflict with itself", async () => {
+    // The reported incident: the first PUT landed, the catch-up PUT landed too, and only then did the
+    // editor save again. The catch-up's pair is what R2 holds, so keeping the earlier floor as the
+    // baseline made the next cycle read this device's own upload as a remote concurrent edit.
+    const editor = vaultFile({ text: "base\n", mtime: 100 });
+    const saved = state();
+    const base = mergeBases();
+    const bodies: string[] = [];
+    const client = {
+      putObject: async (_key: string, body: ArrayBuffer, options: unknown) => {
+        bodies.push(decoder.decode(new Uint8Array(body)));
+        if (bodies.length === 1) { editor.edit("base\nB\n", 200); return { size: 5, etag: "ETAG-A" }; }
+        expect(options).toEqual({ ifMatch: "ETAG-A" });
+        // The catch-up's own PUT lands, and the editor saves once more while it is in flight.
+        editor.edit("base\nB\nC\n", 300);
+        return { size: 7, etag: "ETAG-B" };
+      },
+    } as unknown as R2Client;
+
+    const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(upload());
+
+    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-applied-local-changed" });
+    expect(bodies).toEqual(["base\n", "base\nB\n"]);
+    // Both landed transfers are recorded, newest last: the catch-up's pair must not be lost.
+    expect(saved.entries).toHaveLength(2);
+    expect(saved.entries[1]).toMatchObject({ local: { size: 7, mtime: 200 }, remote: { size: 7, etag: "ETAG-B" } });
+
+    const here: LocalEntry = { key: "note.md", size: 9, mtime: 300 };
+    const there: RemoteEntry = { key: "note.md", size: 7, etag: "ETAG-B", lastModified: 1 };
+    // With the catch-up's pair recorded, the same observations plan a plain upload ...
+    expect(buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[saved.entries[1]!.key, saved.entries[1]!]])).operations)
+      .toEqual([{ type: "upload", key: "note.md", reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: "ETAG-B" } }]);
+    // ... whereas the earlier floor, which is what a missing catch-up baseline leaves behind, conflicts.
+    expect(buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[saved.entries[0]!.key, saved.entries[0]!]])).operations)
+      .toEqual([{ type: "conflict", key: "note.md", reason: "both sides changed since previous successful sync", conflict: "both-modified" }]);
+  });
+
   it("would have raised a self-conflict without the floor baseline", async () => {
     // The counterfactual this fix removes: the ancestor as the baseline, the remote already advanced to
     // this device's own bytes, and a local version newer than both.

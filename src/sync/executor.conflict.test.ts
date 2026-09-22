@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SafeExecutor } from "./executor";
+import { buildSyncPlan } from "./planner";
 import type { MergeBaseRecorder, VaultFileRemover } from "./executor";
 import type { StateStore } from "../state/sync-state";
 import type { R2Client } from "../remote/r2-client";
@@ -102,10 +103,18 @@ describe("resolve-keep-local", () => {
     const saved = state();
     const executor = new SafeExecutor(local as never, remote({ putObject: async () => { local.files.set("a.md", { bytes: bytes([9, 9, 9, 9]), mtime: 77 }); return { size: 3, etag: "NEW" }; } }), saved, identity, "[]");
     const result = await executor.execute(keepLocal());
-    // The remote holds the resolved content, the local edit survives, and nothing is claimed converged.
+    // The remote holds the resolved content, the local edit survives, and the newest local version is
+    // not claimed converged — but the PUT that did land is, because that pair is true.
     expect(result).toEqual({ status: "partial", key: "a.md", reason: "remote-applied-local-changed" });
-    expect(saved.entries).toHaveLength(0);
+    expect(saved.entries).toMatchObject([{ local: { size: 3, mtime: 10 }, remote: { size: 3, etag: "NEW" } }]);
     expect([...new Uint8Array(local.files.get("a.md")!.bytes)]).toEqual([9, 9, 9, 9]);
+
+    // That floor is what keeps the device's own resolution from being read as a remote concurrent edit:
+    // the next plan pushes the newer local text over the version this resolution just wrote.
+    const here = { key: "a.md", size: 4, mtime: 77 };
+    const there = { key: "a.md", size: 3, etag: "NEW", lastModified: 1 };
+    expect(buildSyncPlan(new Map([[here.key, here]]), new Map([[there.key, there]]), new Map([[saved.entries[0]!.key, saved.entries[0]!]])).operations)
+      .toEqual([{ type: "upload", key: "a.md", reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: "NEW" } }]);
   });
 
   it("blocks without an ETag rather than overwriting blindly", async () => {
