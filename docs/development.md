@@ -14,7 +14,8 @@
 | Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | **CLOSED**：桌面 9/9 + 9/9，Android 9/9 + 9/9（见下方验证记录） |
 | Phase 3A | 自动调度器（Vault 事件 → dirty set → debounce → planner → SafeExecutor），删除仍为 BLOCKED | **已实现**（语义规格见 [`scheduler-semantics.md`](scheduler-semantics.md)）；真机跨设备自动同步见 Phase 4C |
 | Phase 4C | Sync Gateway 接入：channel 派生、Gateway HTTP/WS 客户端、generation 游标与握手、写者通知合并 | **已实现**（见 [`gateway-integration.md`](gateway-integration.md)） |
-| Phase 4C.5 | 删除安全与状态 GC：**D1** baseline GC、**D2** 安全 `delete-local`（版本复查 + 回收站优先）；**D3** tombstone 版本身份仅设计 | **D1 + D2 已实现**（见 [`deletion-safety.md`](deletion-safety.md)）；`delete-remote` 仍为 BLOCKED |
+| Phase 4C.5 | 删除安全与状态 GC：**D1** baseline GC、**D2** 安全 `delete-local`（版本复查 + 回收站优先）；**D3** tombstone 版本身份仅设计 | **D1 + D2 已实现**（见 [deletion-safety.md](deletion-safety.md)）；`delete-remote` 仍为 BLOCKED |
+| Phase 4C.6 | 冲突解决：merge base 快照、3-way 文本合并、冲突身份、resolution intent、手动解决 UI | **已实现**（见 [conflict-resolution.md](conflict-resolution.md)）；delete 仍为 BLOCKED |
 
 ---
 
@@ -440,8 +441,8 @@ transport.test.ts  3 项断言：throw 恒为 false；400/401/403/404/409/412/42
 
 ```text
 npm run typecheck      通过
-npm test               180 passed | 1 skipped（共 181，18 个文件）
-npm run build          通过（生产产物 ~56 KB）
+npm test               262 passed | 1 skipped（共 263，23 个文件）
+npm run build          通过（生产产物 ~84 KB，新增 node-diff3 约 12 KB）
 ```
 
 | 测试文件 | 数量 | 覆盖 |

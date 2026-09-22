@@ -14,6 +14,7 @@
 - 可选的 **Sync Gateway**：让两台都在前台打开的 Obsidian 互相发现对方的远端变化，而不需要 focus/resume，也不做远端轮询。见 [`docs/gateway-integration.md`](docs/gateway-integration.md)。
 - **远端删除会传播到本地**：远端对象消失且本地文件相对基线未改动时，本地文件会被移到回收站（尊重你的"删除文件"偏好），随后退休它的基线。见 [`docs/deletion-safety.md`](docs/deletion-safety.md)。
 - **自动清理过期基线**：本地与远端都已不存在的 key，其设备本地 baseline 会被自动忘掉，不再永久占据差异报告。
+- **文本冲突自动三方合并**：有 merge base 快照时，双方改到不同区域的 markdown / 纯文本会被自动合并。无法干净合并时保留冲突，可用 `Mineral Sync: Resolve Conflicts` 手动解决。见 [docs/conflict-resolution.md](docs/conflict-resolution.md)。
 - 弹出只读的检查报告：`Mineral Sync: Inspect Sync State`。
 - 验证 R2 连通性：`R2 Sync: Test Connection`。
 - 查看 Gateway 诊断：`Mineral Sync: Gateway Status`。
@@ -74,6 +75,7 @@ Gateway 的 **channel 不需要填写**：它由 R2 的 endpoint / bucket / pref
 | `R2 Sync: Test Connection` | 只做一次 `ListObjectsV2`，确认 endpoint、bucket、凭据可用。 |
 | `Mineral Sync: Sync Now` | 立即唤醒一轮完整 reconciliation（不是强制推送或拉取，也不绕过 planner）。 |
 | `Mineral Sync: Gateway Status` | 只读诊断：channel 指纹、连接状态、两个 generation 游标、pending 与否、最近错误分类。它不会触发同步或重连。 |
+| `Mineral Sync: Resolve Conflicts` | 查看并手动解决文本冲突（Keep Local / Keep Remote / Edit Merged）。它只记录一个 resolution intent，实际写入仍由 planner + SafeExecutor 完成。 |
 
 ## 安全边界
 
@@ -125,4 +127,5 @@ token 权限不足，或只给了错误 bucket 的权限。
 - [`docs/development.md`](docs/development.md) —— 阶段状态、代码结构、开发命令、集成自检脚手架、真实验证记录、Android 待办清单。
 - [`docs/scheduler-semantics.md`](docs/scheduler-semantics.md) —— Phase 3A 自动调度器的语义规格（触发时机、single-flight、dirty 模型、rerun 规则、MUST / MUST NOT）。
 - [`docs/gateway-integration.md`](docs/gateway-integration.md) —— Phase 4C Sync Gateway 接入：channel 派生、generation 游标与握手、写者通知合并、WS 生命周期与鉴权。
-- [`docs/deletion-safety.md`](docs/deletion-safety.md) —— Phase 4C.5 删除安全与状态 GC：baseline GC、安全 delete-local、tombstone 设计（D3）。
+- [docs/deletion-safety.md](docs/deletion-safety.md) —— Phase 4C.5 删除安全与状态 GC：baseline GC、安全 delete-local、tombstone 设计（D3）。
+- [docs/conflict-resolution.md](docs/conflict-resolution.md) —— Phase 4C.6 冲突解决：merge base、三方合并语义、冲突身份、resolution intent 与手动解决 UI。

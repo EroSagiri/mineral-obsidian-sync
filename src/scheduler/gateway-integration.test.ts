@@ -76,8 +76,29 @@ describe("writer notification coalescing", () => {
     }
   });
 
-  it("still notifies when a cycle is stopped early after a confirmed R2 mutation", async () => {
-    // a.md succeeds, then a config change stops the cycle before b.md runs. a.md already changed R2,
+  it("notifies for resolutions that change R2, and not for keep-remote", async () => {
+    const resolution = (type: "resolve-keep-local" | "resolve-keep-remote" | "resolve-merged"): SyncOperation =>
+      type === "resolve-merged"
+        ? { type, key: "a.md", reason: "test", conflictId: "c", expectedLocal: { key: "a.md", size: 1, mtime: 1 }, expectedRemoteETag: "R", merged: { content: "m\n", sha256: "s", encoding: { bom: false, eol: "lf", trailingNewline: true } } }
+        : { type, key: "a.md", reason: "test", conflictId: "c", expectedLocal: { key: "a.md", size: 1, mtime: 1 }, expectedRemoteETag: "R" };
+    const cases: Array<{ operation: SyncOperation; result: OperationResult; notify: number; name: string }> = [
+      { name: "keep-local applied", operation: resolution("resolve-keep-local"), result: { status: "applied", key: "a.md" }, notify: 1 },
+      { name: "merged applied", operation: resolution("resolve-merged"), result: { status: "applied", key: "a.md" }, notify: 1 },
+      { name: "merged ambiguous PUT", operation: resolution("resolve-merged"), result: { status: "unresolved", key: "a.md", reason: "ambiguous-put" }, notify: 1 },
+      // A partial resolution really did change R2, so other devices must still be woken.
+      { name: "merged partial", operation: resolution("resolve-merged"), result: { status: "partial", key: "a.md", reason: "remote-applied-local-changed" }, notify: 1 },
+      { name: "keep-local stale", operation: resolution("resolve-keep-local"), result: { status: "stale", key: "a.md", reason: "conflict-superseded" }, notify: 0 },
+      // Keep-remote writes only the local file.
+      { name: "keep-remote applied", operation: resolution("resolve-keep-remote"), result: { status: "applied", key: "a.md" }, notify: 0 },
+    ];
+    for (const testCase of cases) {
+      const harness = setup(() => base([testCase.operation], async () => testCase.result), true);
+      await runOnce(harness);
+      expect(harness.remote!.notifyCalls, testCase.name).toBe(testCase.notify);
+    }
+  });
+
+  it("still notifies when a cycle is stopped early after a confirmed R2 mutation", async () => {    // a.md succeeds, then a config change stops the cycle before b.md runs. a.md already changed R2,
     // so the exit notification must still happen.
     let scheduler!: SyncScheduler;
     const started: string[] = [];

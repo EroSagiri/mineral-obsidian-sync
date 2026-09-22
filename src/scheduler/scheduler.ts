@@ -322,14 +322,23 @@ function applyConfirmationFailure(outcome: ConfirmationOutcome, failure: Failure
   return failure;
 }
 
-/** Only a confirmed upload changed R2 for certain; an unknown PUT might have. */
+/**
+ * Which operations can have changed R2, and how certain that is.
+ *
+ * `resolve-keep-local` and `resolve-merged` write to R2 exactly like an upload, so another device
+ * needs the same wake-up. `resolve-keep-remote` writes only locally and must not notify.
+ */
 export function observeRemoteMutation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): CycleRemoteMutation | undefined {
-  if (operation.type !== "upload") return undefined;
+  const writesRemote = operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged";
+  if (!writesRemote) return undefined;
   if (result.status === "applied") return "confirmed";
   // An ambiguous PUT may or may not have landed. The executor's verdict stays `unresolved` and no
   // baseline is committed; an extra best-effort wake-up is what keeps a landed write from being
   // invisible to other devices.
   if (result.status === "unresolved" && result.reason === "ambiguous-put") return "possible";
+  // A `partial` resolution DID reach R2 — that is precisely what partial means — so other devices must
+  // still be woken even though this device could not finish its own half.
+  if (result.status === "partial" && result.reason === "remote-applied-local-changed") return "confirmed";
   // `stale` is decided before the conditional request, and a 4xx/blocked upload provably did not
   // change the remote, so none of them justifies waking other clients.
   return undefined;
