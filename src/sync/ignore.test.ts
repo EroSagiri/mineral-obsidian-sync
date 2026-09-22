@@ -24,11 +24,9 @@ describe("vault path filter", () => {
     expect([...remote.keys()]).toEqual(["daily/visible.md"]);
   });
 
-  it("always excludes plugin, development diagnostics, and common temporary paths", () => {
+  it("always excludes plugin and common temporary paths, and safely ignores invalid entries", () => {
     const filter = createVaultPathFilter({ ignoredPaths: ["../invalid", "/../invalid"] });
     expect(filter.ignores(".obsidian/plugins/mineral-obsidian-sync/main.js")).toBe(true);
-    expect(filter.ignores(".mineral-sync-test/20260922T001500Z/result.bin")).toBe(true);
-    expect(filter.ignores("private/mineral-sync-test-local/20260922T001500Z/result.bin")).toBe(true);
     expect(filter.ignores("folder/Thumbs.db")).toBe(true);
     expect(filter.ignores("folder/note.tmp")).toBe(true);
     expect(filter.ignores("normal.md")).toBe(false);

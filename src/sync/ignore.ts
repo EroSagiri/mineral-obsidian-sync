@@ -14,8 +14,6 @@ export function ignorePolicyFingerprint(rules: IgnoreRules): string {
 }
 
 const PLUGIN_PREFIX = ".obsidian/plugins/mineral-obsidian-sync/";
-/** Dev-only diagnostics live outside the product namespace and may be invisible to Obsidian indexing. */
-const INTEGRATION_TEST_PREFIXES = [".mineral-sync-test/", "private/mineral-sync-test-local/"];
 const TEMPORARY_BASENAMES = new Set([".ds_store", "thumbs.db"]);
 
 function configuredPath(value: string): string | undefined {
@@ -31,7 +29,7 @@ export function createVaultPathFilter(rules: IgnoreRules): VaultPathFilter {
     ignores(key: string): boolean {
       const normalized = canonicalKey(key);
       const lower = normalized.toLowerCase();
-      if (lower.startsWith(PLUGIN_PREFIX) || INTEGRATION_TEST_PREFIXES.some((path) => lower.startsWith(path)) || TEMPORARY_BASENAMES.has(lower.split("/").at(-1) ?? "") || lower.endsWith("~") || lower.endsWith(".tmp")) return true;
+      if (lower.startsWith(PLUGIN_PREFIX) || TEMPORARY_BASENAMES.has(lower.split("/").at(-1) ?? "") || lower.endsWith("~") || lower.endsWith(".tmp")) return true;
       return [...paths].some((path) => normalized === path || normalized.startsWith(`${path}/`));
     },
   };

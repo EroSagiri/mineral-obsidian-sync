@@ -173,7 +173,7 @@ remote 侧字段来源      PUT 响应本身（etag + 写出的字节数）—�
 ## 1.6 ignore policy
 
 ```text
-内置排除：.obsidian/plugins/mineral-obsidian-sync/、.mineral-sync-test/、private/mineral-sync-test-local/、.ds_store、thumbs.db、*~、*.tmp
+内置排除：.obsidian/plugins/mineral-obsidian-sync/、.ds_store、thumbs.db、*~、*.tmp
 用户排除：路径本身 + 全部子孙
 大小写：ignores() 用 toLowerCase()，但用户规则匹配用的是**原大小写**的 normalized 路径
          ⇒ 忽略规则是"大小写不敏感的内置项 + 大小写敏感的路径前缀"

@@ -50,7 +50,7 @@ npm run build          # 产出 main.js
 | **Remote prefix** | 可选的对象 key 前缀，不要以 `/` 开头。留空表示直接用 bucket 根目录。 |
 | **Ignored paths** | 每行一个 Vault 相对路径。该路径**及其全部子内容**都会从本地与 R2 的规划中排除。 |
 
-内置排除项（无需手写）：`.obsidian/plugins/mineral-obsidian-sync/`、开发自检路径 `.mineral-sync-test/` 与 `private/mineral-sync-test-local/`、名为 `.ds_store` / `thumbs.db` 的文件、以 `~` 结尾的文件、以 `.tmp` 结尾的文件。
+内置排除项（无需手写）：`.obsidian/plugins/mineral-obsidian-sync/`、名为 `.ds_store` / `thumbs.db` 的文件、以 `~` 结尾的文件、以 `.tmp` 结尾的文件。
 
 关于 R2 token 权限：自动同步需要该 bucket 的 Object 读写权限（List + Get + 条件 Put）；插件仍不会请求或执行删除权限。建议使用权限范围尽量窄的 token。
 
