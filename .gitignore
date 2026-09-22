@@ -48,3 +48,6 @@ tmp/
 
 # Integration self-test namespace: any local artifact of an R2 transport run
 .mineral-sync-test/
+# Diagnostic bundle output
+build-diag/
+
