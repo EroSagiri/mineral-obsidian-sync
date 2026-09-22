@@ -92,12 +92,14 @@ export class ConflictCoordinator {
   async handleConflicts(conflicts: ConflictDetectionInput[]): Promise<void> {
     if (!this.dependencies.channel) return;
     const active = new Map<string, string>();
-    let proposed = false;
+    // Both outcomes need a follow-up cycle: a recorded conflict (so the user sees it, and so the
+    // intent list is refreshed) and a clean auto-merge (so the planner can actually apply it).
+    let followUp = false;
     for (const conflict of conflicts) {
       const record = await this.inspect(conflict);
       if (!record) continue;
       active.set(record.path, record.conflictId);
-      if (record.autoMergeStatus === "clean") continue;
+      if (record.autoMergeStatus === "clean") { followUp = true; continue; }
       // A conflict we have already examined in this session is not re-attempted on every cycle.
       if (this.attempted.has(record.conflictId)) {
         // Still refresh the visible record so the UI can show it, but do not re-run the merge.
@@ -107,14 +109,14 @@ export class ConflictCoordinator {
       this.attempted.add(record.conflictId);
       await this.safePutConflict(record);
       this.dependencies.debug?.(`conflict detected path-hash=${shortConflictId(record.conflictId)} base=${record.snapshot.baseAvailable ? "available" : "unavailable"} autoMerge=${record.autoMergeStatus}`);
-      proposed = true;
+      followUp = true;
     }
     // Only conflicts that are still active survive; a superseded identity is dropped so a stale user
     // decision can never be applied to it later.
     try { await this.dependencies.conflicts.reconcile(this.dependencies.channel, active); } catch { this.dependencies.debug?.("conflict store reconcile failed"); }
     // Refresh the proposals the *next* plan may apply, from this cycle's real observations.
     await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])));
-    if (proposed) this.dependencies.requestReconcile();
+    if (followUp) this.dependencies.requestReconcile();
   }
 
   /** Reads the intents that match the current observations and caches them for the planner. */

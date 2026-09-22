@@ -50,15 +50,15 @@ export function countLineEndings(text: string): { crlf: number; lf: number } {
  * because any "replacement character" we introduced would be written back as real content.
  */
 export function decodeText(bytes: Uint8Array): DecodedText | undefined {
-  let bom = false;
-  let body = bytes;
-  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-    bom = true;
-    body = bytes.subarray(3);
-  }
+  // `ignoreBOM: true` keeps a leading U+FEFF in the decoded string instead of consuming it. The BOM
+  // is detected explicitly below, so letting the decoder silently swallow it would make this
+  // function's own `bom` flag unable to ever be true.
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   let raw: string;
-  try { raw = new TextDecoder("utf-8", { fatal: true }).decode(body); }
+  try { raw = decoder.decode(bytes); }
   catch { return undefined; }
+  let bom = false;
+  if (raw.startsWith(BOM)) { bom = true; raw = raw.slice(1); }
   if (raw.includes("\u0000")) return undefined; // NUL means this is not a text document.
   const { crlf, lf } = countLineEndings(raw);
   const eol: LineEnding = crlf > 0 && lf > 0 ? "mixed" : crlf > 0 ? "crlf" : "lf";
