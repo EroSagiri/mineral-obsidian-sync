@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, TFolder } from "obsidian";
+import { Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
 import { scanLocal, scanLocalAdapterMetadata } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
@@ -9,7 +9,7 @@ import { buildBootstrapResult } from "./bootstrap/bootstrap";
 import { DryRunModal } from "./ui/dry-run-modal";
 import { createVaultPathFilter, ignorePolicyFingerprint } from "./sync/ignore";
 import { registerDevelopmentSelfTests } from "./dev/self-test-command";
-import { SafeExecutor } from "./sync/executor";
+import { SafeExecutor, type VaultFileRemover } from "./sync/executor";
 import { buildSyncPlan } from "./sync/planner";
 import { SyncScheduler } from "./scheduler/scheduler";
 import { changedLocalKeys } from "./scheduler/mobile-local-drift";
@@ -214,13 +214,29 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.debug("android local-drift metadata-scan-failed");
     } finally { this.androidLocalDriftPollRunning = false; }
   }
+  /**
+   * The only destructive capability handed to the executor: move a file to trash, honouring the
+   * user's "Deleted files" setting. It never permanently unlinks.
+   *
+   * `FileManager.trashFile` is the modern entry point (Obsidian 1.5+, which matches our
+   * `minAppVersion`); `Vault.trash` is the older equivalent. Both fall back to the same user
+   * preference, and one of them exists on every supported version.
+   */
+  private vaultFileRemover(): VaultFileRemover {
+    const fileManager = this.app.fileManager as { trashFile?: (file: TFile) => Promise<void> };
+    if (typeof fileManager?.trashFile === "function") return { trash: (file) => fileManager.trashFile!(file) };
+    const vault = this.app.vault as { trash?: (file: TFile, system: boolean) => Promise<void> };
+    if (typeof vault?.trash === "function") return { trash: (file) => vault.trash!(file, false) };
+    // No recovery-capable API exists, so no destructive action is permitted at all.
+    return { trash: async () => { throw new Error("this Obsidian version exposes no trash API"); } };
+  }
   private captureSchedulerCycle() {
     const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
     const filter = createVaultPathFilter(settings);
     const ignorePolicy = ignorePolicyFingerprint(settings);
     const identity = remoteIdentity(settings);
     const client = new SignedR2ListClient(settings);
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy);
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover());
     return {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.

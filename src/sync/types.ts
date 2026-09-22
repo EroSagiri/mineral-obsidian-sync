@@ -48,8 +48,20 @@ export type SyncOperation =
   | { type: "noop"; key: string; reason: string }
   | { type: "upload"; key: string; reason: string; expectedLocal: LocalEntry; expectedRemote: { kind: "absent" } | { kind: "etag"; value?: string } }
   | { type: "download"; key: string; reason: string; expectedLocal: LocalEntry | { kind: "absent" }; expectedRemote: RemoteEntry }
-  | { type: "delete-local"; key: string; reason: string }
+  /**
+   * Local deletion, planned only when the remote is provably gone and the local version is provably
+   * unchanged since the recorded baseline. `expectedLocal` is the observation the deletion decision
+   * was made from; the executor revalidates it immediately before touching anything, so a file that
+   * changed after the scan is never the file that gets removed.
+   */
+  | { type: "delete-local"; key: string; reason: string; expectedLocal: LocalEntry }
   | { type: "delete-remote"; key: string; reason: string }
+  /**
+   * Device-local bookkeeping removal. It is **not** a deletion of user data: it only forgets a
+   * baseline entry for a key that is provably absent both locally and remotely, so it can stop
+   * occupying the plan forever. Never touches a Vault file or an R2 object.
+   */
+  | { type: "prune-baseline"; key: string; reason: string }
   | { type: "conflict"; key: string; conflict: ConflictKind; reason: string };
 
 export interface SyncPlan { operations: SyncOperation[]; }

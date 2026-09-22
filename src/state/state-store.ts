@@ -67,4 +67,21 @@ export class IndexedDbStateStore implements StateStore {
       });
     } finally { db.close(); }
   }
+
+  /**
+   * Removes one baseline entry. Device-local bookkeeping only: no Vault file and no R2 object is
+   * touched. A missing key is not an error, because the caller's intent ("this baseline should no
+   * longer exist") is already satisfied.
+   */
+  async delete(key: string): Promise<void> {
+    const db = await this.database();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = db.transaction(STORE, "readwrite");
+        transaction.objectStore(STORE).delete(key);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error ?? new Error("Unable to remove the sync state entry"));
+      });
+    } finally { db.close(); }
+  }
 }

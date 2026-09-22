@@ -163,6 +163,9 @@ class FailingStateStore implements StateStore {
   async put(): Promise<void> {
     throw new Error("Simulated IndexedDB commit failure (integration fault injection)");
   }
+  async delete(): Promise<void> {
+    throw new Error("Simulated IndexedDB commit failure (integration fault injection)");
+  }
 }
 
 export function convergenceScenarioNames(): string[] {

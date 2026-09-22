@@ -1,4 +1,4 @@
-import type { Vault } from "obsidian";
+import type { TFile, Vault } from "obsidian";
 import { ensureParentFolders } from "../local/ensure-folders";
 import { LocalFileChangedError, readStableLocalBytes } from "../local/read-local";
 import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
@@ -6,15 +6,26 @@ import type { R2Client } from "../remote/r2-client";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, SyncOperation } from "./types";
 
+/**
+ * The single destructive capability the executor is allowed to request.
+ *
+ * It is deliberately narrow and plugin-driven rather than the raw `Vault` API: the executor must not
+ * be able to perform an irreversible unlink. The implementation is expected to honour the user's
+ * "Deleted files" preference (system trash or the vault's `.trash` folder).
+ */
+export interface VaultFileRemover { trash(file: TFile): Promise<void>; }
+
 /** Precise reasons a Vault write cannot proceed; they are not transport or precondition failures. */
 export type VaultWriteFailure = "parent-path-is-file" | "folder-create-failed" | "target-path-is-folder";
+/** Precise reasons a local removal could not be performed; none of them fall back to a hard unlink. */
+export type VaultTrashFailure = "trash-unavailable" | "target-is-folder" | "file-manager-unavailable";
 
 export type OperationResult =
   | { status: "applied"; key: string }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" }
-  | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" }
+  | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" | "remote-deletion-requires-version-identity" }
   /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
-  | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure; httpStatus?: number }
+  | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure | VaultTrashFailure; httpStatus?: number }
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
   | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed" };
 
@@ -44,12 +55,65 @@ function message(error: unknown): string { return error instanceof Error ? error
 
 /** Sequential, deliberately unexposed executor: callers must supply an already-observed plan. */
 export class SafeExecutor {
-  constructor(private readonly vault: Vault, private readonly r2: R2Client, private readonly state: StateStore, private readonly identity: RemoteIdentity, private readonly ignorePolicy: string) {}
+  constructor(private readonly vault: Vault, private readonly r2: R2Client, private readonly state: StateStore, private readonly identity: RemoteIdentity, private readonly ignorePolicy: string, private readonly files?: VaultFileRemover) {}
 
   async execute(operation: SyncOperation): Promise<OperationResult> {
-    if (operation.type === "delete-local" || operation.type === "delete-remote") return { status: "blocked", key: operation.key, reason: "deletion-not-supported-in-phase-2a" };
+    // Remote deletion stays blocked. R2's DeleteObject has no conditional form, so it cannot name the
+    // exact version it intends to remove; an unconditional DELETE could destroy a version another
+    // writer created after our scan. It needs a version-identity protocol, not a shortcut.
+    if (operation.type === "delete-remote") return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
+    if (operation.type === "prune-baseline") return this.prune(operation.key);
+    if (operation.type === "delete-local") return this.deleteLocal(operation);
     if (operation.type !== "upload" && operation.type !== "download") return { status: "failed", key: operation.key, error: `operation ${operation.type} is not executable` };
     return operation.type === "upload" ? this.upload(operation) : this.download(operation);
+  }
+
+  /**
+   * Forgets a baseline entry for a key that is provably absent both locally and remotely.
+   *
+   * This is bookkeeping, not deletion: no Vault file and no R2 object is touched. It exists so that a
+   * converged absence stops occupying the plan forever, which is what previously required wiping the
+   * entire device store by hand.
+   */
+  private async prune(key: string): Promise<OperationResult> {
+    try { await this.state.delete(key); return { status: "applied", key }; }
+    catch { return { status: "unresolved", key, reason: "state-commit-failed" }; }
+  }
+
+  /**
+   * Propagates a remote deletion to the local file, recovery-first.
+   *
+   * The ordering is the whole safety argument:
+   *
+   * 1. revalidate the local version recorded by the scan, immediately before acting;
+   * 2. only then ask the FileManager to trash it, honouring the user's "Deleted files" preference;
+   * 3. never fall back to a permanent unlink.
+   *
+   * A file that became L2 after the scan planned L1 is reported `stale`, never removed — the
+   * destructive action is always gated on the version it was decided from.
+   */
+  private async deleteLocal(operation: Extract<SyncOperation, { type: "delete-local" }>): Promise<OperationResult> {
+    const expected = operation.expectedLocal;
+    // Step 1: the file must still be exactly what the scan saw.
+    if (!(await localStillMatches(this.vault, operation.key, expected))) {
+      // Absent already means the deletion is effectively done; changed means the user moved on.
+      if (this.vault.getFileByPath(operation.key) === null) return this.pruneResult(operation.key);
+      return { status: "stale", key: operation.key, reason: "local-changed" };
+    }
+    const file = this.vault.getFileByPath(operation.key);
+    if (!file) return this.pruneResult(operation.key);
+    if (!this.files) return { status: "failed", key: operation.key, error: "no Vault file remover is configured", reason: "file-manager-unavailable" };
+    // Step 2: recovery-first removal. No permanent unlink path exists here on purpose.
+    try { await this.files.trash(file); }
+    catch (error) { return { status: "failed", key: operation.key, error: message(error), reason: "trash-unavailable" }; }
+    if (this.vault.getFileByPath(operation.key) !== null) return { status: "failed", key: operation.key, error: "the file is still present after the trash operation", reason: "trash-unavailable" };
+    // Step 3: both sides are now absent, so the baseline describes nothing and is retired.
+    return this.pruneResult(operation.key);
+  }
+
+  private async pruneResult(key: string): Promise<OperationResult> {
+    try { await this.state.delete(key); return { status: "applied", key }; }
+    catch { return { status: "unresolved", key, reason: "state-commit-failed" }; }
   }
 
   private async commit(entry: PreviousEntry): Promise<OperationResult | undefined> {

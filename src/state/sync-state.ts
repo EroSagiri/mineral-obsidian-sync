@@ -7,6 +7,14 @@ export interface StateStore {
   saveVerified(entries: Map<string, PreviousEntry>): Promise<void>;
   /** Atomically commits one proven post-operation baseline, without replacing unrelated keys. */
   put(entry: PreviousEntry): Promise<void>;
+  /**
+   * Removes one baseline entry.
+   *
+   * This is **device-local bookkeeping only**: it never touches a Vault file or an R2 object. It is
+   * used when a key is provably absent on both sides, so keeping its baseline would leave a
+   * permanent, unresolvable footprint in the plan. Distinct from any product "delete" semantics.
+   */
+  delete(key: string): Promise<void>;
   /** Reserved for a future successful real-sync commit. */
   saveAll(entries: Map<string, PreviousEntry>): Promise<void>;
 }

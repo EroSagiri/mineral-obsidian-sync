@@ -1,8 +1,8 @@
 import { Modal } from "obsidian";
 import type { SyncOperation, SyncPlan } from "../sync/types";
 
-const TYPES: SyncOperation["type"][] = ["upload", "download", "delete-local", "delete-remote", "conflict", "noop"];
-const LABELS: Record<SyncOperation["type"], string> = { upload: "Upload", download: "Download", "delete-local": "Delete Local", "delete-remote": "Delete Remote", conflict: "Conflict", noop: "Unchanged" };
+const TYPES: SyncOperation["type"][] = ["upload", "download", "delete-local", "delete-remote", "prune-baseline", "conflict", "noop"];
+const LABELS: Record<SyncOperation["type"], string> = { upload: "Upload", download: "Download", "delete-local": "Move Local To Trash", "delete-remote": "Delete Remote (blocked)", "prune-baseline": "Forget Stale Baseline", conflict: "Conflict", noop: "Unchanged" };
 
 export class DryRunModal extends Modal {
   constructor(app: import("obsidian").App, private readonly plan: SyncPlan, private readonly counts: { local: number; remote: number; previous: number; bootstrapCandidates: number; verifiedIdentical: number; hashedFiles: number; hashedBytes: number; differentContent: number; unresolved: number }) { super(app); }
