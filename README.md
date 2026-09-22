@@ -10,15 +10,17 @@
 - 分页扫描 R2 对象元数据（`ListObjectsV2`）。
 - 用纯函数 planner 算出差异，这一步不联网、不写盘。
 - 对"本地与远端都存在、且已证明逐字节相同"的文件建立本设备基线（惰性哈希，只在大小相同时才读内容）。
+- 自动同步：本地事件、启动、focus/resume、以及 `Mineral Sync: Sync Now` 都会触发一轮完整 reconciliation。
+- 可选的 **Sync Gateway**：让两台都在前台打开的 Obsidian 互相发现对方的远端变化，而不需要 focus/resume，也不做远端轮询。见 [`docs/gateway-integration.md`](docs/gateway-integration.md)。
 - 弹出只读的检查报告：`Mineral Sync: Inspect Sync State`。
 - 验证 R2 连通性：`R2 Sync: Test Connection`。
+- 查看 Gateway 诊断：`Mineral Sync: Gateway Status`。
 
 ## 现在还不能做什么
 
-- 没有手动同步、没有 push / pull 按钮。
-- 自动同步：相关 Vault 文件事件会经过全局 trailing debounce，随后完整扫描本地、远端与基线；planner 决策后由条件执行器顺序上传或下载。
+- 没有 push / pull 按钮；`Sync Now` 只是"立刻唤醒一轮完整 reconciliation"，不是强制推送或拉取。
 - **不会删除任何东西** —— 本地不删、远端也不删。`delete-local` 与 `delete-remote` 在代码里被硬阻断。
-- 自动同步不轮询，也不会按事件直接上传或下载；事件只表示状态可能已变化。重命名会上传新路径，但旧远端对象会作为已阻断的删除候选保留。真实环境验证状态见 [`docs/development.md`](docs/development.md)。
+- 自动同步不轮询 R2，也不会按事件直接上传或下载；事件只表示状态可能已变化，真正的决策永远来自 `scan + previous + planner`。重命名会上传新路径，但旧远端对象会作为已阻断的删除候选保留。真实环境验证状态见 [`docs/development.md`](docs/development.md)。
 
 ## 安装
 
@@ -49,6 +51,11 @@ npm run build          # 产出 main.js
 | **Secret access key** | 对应的 Secret。以 Obsidian 常规设置机制保存在本地，**本插件不做加密**。 |
 | **Remote prefix** | 可选的对象 key 前缀，不要以 `/` 开头。留空表示直接用 bucket 根目录。 |
 | **Ignored paths** | 每行一个 Vault 相对路径。该路径**及其全部子内容**都会从本地与 R2 的规划中排除。 |
+| **Gateway enabled** | 是否启用可选的同步控制平面。关闭时行为与没有 Gateway 时完全一致。 |
+| **Gateway endpoint** | `mineral-sync-gateway` 的地址，例如 `https://mineral-sync-gateway.<subdomain>.workers.dev`。 |
+| **Gateway token** | Gateway 的 bearer secret（密码框）。与 R2 凭据完全分离，日志中永不输出。 |
+
+Gateway 的 **channel 不需要填写**：它由 R2 的 endpoint / bucket / prefix 确定性派生。两端只要这三个值相同，就会自动落在同一个 channel 上。
 
 内置排除项（无需手写）：`.obsidian/plugins/mineral-obsidian-sync/`、名为 `.ds_store` / `thumbs.db` 的文件、以 `~` 结尾的文件、以 `.tmp` 结尾的文件。
 
@@ -62,6 +69,8 @@ npm run build          # 产出 main.js
 | --- | --- |
 | `Mineral Sync: Inspect Sync State` | 扫描本地与远端元数据，必要时读取并哈希内容，弹出只读的差异报告。它不会修改任何 Vault 文件或 R2 对象。 |
 | `R2 Sync: Test Connection` | 只做一次 `ListObjectsV2`，确认 endpoint、bucket、凭据可用。 |
+| `Mineral Sync: Sync Now` | 立即唤醒一轮完整 reconciliation（不是强制推送或拉取，也不绕过 planner）。 |
+| `Mineral Sync: Gateway Status` | 只读诊断：channel 指纹、连接状态、两个 generation 游标、pending 与否、最近错误分类。它不会触发同步或重连。 |
 
 ## 安全边界
 
@@ -71,6 +80,8 @@ npm run build          # 产出 main.js
 - IndexedDB 只写入"已证明一致"或"已证明完成传输"的 key，不会写入推测性的状态。
 - 状态栏只做被动显示，永远不会触发同步。
 - 自动调度在后台时不会发起新周期；恢复可见后会执行一次完整 reconciliation。认证失败（401/403）会暂停自动网络请求，直到配置变更或插件重新加载。
+- Gateway 是附加的低延迟通道：它只传递"远端可能已变化"，不传文件内容。Gateway 关闭、配置错误或不可达时，R2 同步照常工作，一次成功的 R2 写入绝不会因为通知失败而被改判为失败。
+- Gateway 的 WebSocket 使用短期、channel 绑定的 ticket；长期 token 只出现在 HTTP header 里，绝不进入 URL。
 
 ## 数据落在哪里
 
@@ -78,6 +89,7 @@ npm run build          # 产出 main.js
 | --- | --- |
 | 凭据与设置 | Obsidian 插件设置（`.obsidian/plugins/mineral-obsidian-sync/data.json`），明文 |
 | 本设备基线 | IndexedDB 数据库 `r2-personal-sync-state-v1`，对象存储 `previous-sync-state` |
+| Gateway 游标 | IndexedDB 数据库 `r2-personal-sync-gateway-v1`，对象存储 `channel-cursors`（按 channel 隔离） |
 | 远端内容 | 你的 R2 bucket，key 为 `<remote prefix>/<Vault 相对路径>` |
 
 基线只对本设备生效，并且与 endpoint / bucket / prefix 绑定；换了 namespace 或改了忽略策略，旧基线不会被复用。
@@ -99,10 +111,14 @@ token 权限不足，或只给了错误 bucket 的权限。
 **bucket 里存在以 `/` 结尾的"目录占位对象"，或含 `//` 的 key**
 列取会整体失败。这是刻意的 fail-closed 行为：无法映射成合法 Vault 路径的 key 会被拒绝，而不是被静默跳过。需要先在 bucket 里清理掉这类对象。
 
+**Gateway 显示 misconfigured / backoff / 收不到对方变化**
+先用两端的 `Mineral Sync: Gateway Status` 比较 **channel 指纹**：不一致说明 R2 的 endpoint / bucket / prefix 不是同一套。指纹一致但状态是 `backoff`，检查 endpoint 与 token，以及 Worker secret 是否已设置。
+
 **移动端**
 传输层与桌面端是同一份实现，Android 的传输与执行器路径已在真机验证；自动调度仍需真机验证。具体验证范围见 [`docs/development.md`](docs/development.md)。
 
 ## 更多文档
 
 - [`docs/development.md`](docs/development.md) —— 阶段状态、代码结构、开发命令、集成自检脚手架、真实验证记录、Android 待办清单。
-- [`docs/scheduler-semantics.md`](docs/scheduler-semantics.md) —— Phase 3A 自动调度器的语义规格（触发时机、single-flight、dirty 模型、rerun 规则、MUST / MUST NOT）。设计文档，尚未实现。
+- [`docs/scheduler-semantics.md`](docs/scheduler-semantics.md) —— Phase 3A 自动调度器的语义规格（触发时机、single-flight、dirty 模型、rerun 规则、MUST / MUST NOT）。
+- [`docs/gateway-integration.md`](docs/gateway-integration.md) —— Phase 4C Sync Gateway 接入：channel 派生、generation 游标与握手、写者通知合并、WS 生命周期与鉴权。

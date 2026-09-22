@@ -12,7 +12,8 @@
 | Phase 1.5 | 安全 bootstrap 基线、惰性二进制 SHA-256 比对、`GET If-Match`、只有验证为逐字节相同的配对才能建立基线 | 完成 |
 | Phase 2A | aws4fetch 仅签名、`CredentialProvider`、`RequestUrlTransport`、`R2Client` 的 GET / PUT / HEAD、`PUT If-Match`、`PUT If-None-Match: *`、`GET If-Match`、顺序 `SafeExecutor`、本地/远端执行前置条件、per-key previous-state 提交、PUT 结果不明与状态写失败 → `unresolved`、二进制 `createBinary` / `modifyBinary`、remote identity 含 endpoint/bucket/prefix、忽略策略变化 fail closed、删除硬阻断 | 完成 |
 | Phase 2A.5 | 真实 R2 + 真实 `requestUrl` 传输验证、测试前缀硬保护、仅开发用的自检脚手架、`__DEV__` + 生产 stub、下载父目录修复 | **CLOSED**：桌面 9/9 + 9/9，Android 9/9 + 9/9（见下方验证记录） |
-| Phase 3A | 自动调度器（Vault 事件 → dirty set → debounce → planner → SafeExecutor），删除仍为 BLOCKED | **语义规格已完成 edge-case reconciliation，尚未实现**：[`scheduler-semantics.md`](scheduler-semantics.md) |
+| Phase 3A | 自动调度器（Vault 事件 → dirty set → debounce → planner → SafeExecutor），删除仍为 BLOCKED | **已实现**（语义规格见 [`scheduler-semantics.md`](scheduler-semantics.md)）；真机跨设备自动同步见 Phase 4C |
+| Phase 4C | Sync Gateway 接入：channel 派生、Gateway HTTP/WS 客户端、generation 游标与握手、写者通知合并 | **已实现**（见 [`gateway-integration.md`](gateway-integration.md)）；删除仍为 BLOCKED |
 
 ---
 
@@ -379,27 +380,35 @@ transport.test.ts  3 项断言：throw 恒为 false；400/401/403/404/409/412/42
 
 ```text
 npm run typecheck      通过
-npm test               93 passed | 1 skipped（共 94，13 个文件）
-npm run build          通过（生产产物 ~24 KB）
+npm test               167 passed | 1 skipped（共 168，18 个文件）
+npm run build          通过（生产产物 ~56 KB）
 ```
 
 | 测试文件 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `src/local/ensure-folders.test.ts` | 8 | 逐级创建、复用已存在目录、父路径是文件、创建失败、并发写者、不回滚 |
-| `src/remote/transport.test.ts` | 2 | transport 原样转发与凭据接口 |
-| `src/remote/r2-client.test.ts` | 3 | 条件 GET 的签名头、412 → stale、403 → 类型化错误 |
-| `src/sync/planner.test.ts` | 24 | 三方 planner 全部分支 |
-| `src/sync/executor.test.ts` | 12 | 条件创建/更新、stale、状态提交失败、4xx vs 5xx 分类、嵌套下载、父路径被占用、删除硬阻断 |
+| `src/local/ensure-folders.test.ts` | 9 | 逐级创建、复用已存在目录、父路径是文件、创建失败、并发写者、不回滚 |
+| `src/local/scan-local.test.ts` | 1 | 本地扫描与 adapter 元数据扫描一致 |
+| `src/remote/transport.test.ts` | 5 | transport 原样转发、`throw: false`、错误分类 |
+| `src/remote/r2-client.test.ts` | 5 | 条件 GET 的签名头、412 → stale、403 → 类型化错误 |
+| `src/sync/planner.test.ts` | 27 | 三方 planner 全部分支 |
+| `src/sync/executor.test.ts` | 14 | 条件创建/更新、stale、状态提交失败、4xx vs 5xx 分类、嵌套下载、父路径被占用、删除硬阻断 |
 | `src/sync/ignore.test.ts` | 2 | 忽略策略与指纹 |
 | `src/bootstrap/bootstrap.test.ts` | 9 | 基线建立的全部路径 |
+| `src/scheduler/scheduler.test.ts` | 12 | debounce 合并、single-flight、版本化 dirty 清理、backoff、auth 全局停止、删除阻断不阻塞其他 key |
+| `src/scheduler/mobile-local-drift.test.ts` | 2 | Android 本地漂移检测 |
+| `src/scheduler/gateway-integration.test.ts` | 22 | 写者通知合并与抑制、提前结束仍通知、ambiguous PUT、通知失败、G10/G11 握手竞态、start/end 读取失败、conflict/blocked 的 observation complete、hidden/unload 中止不推进游标 |
+| `src/gateway/client.test.ts` | 19 | channel 派生与向量、配置解析、ticket-only 连接、游标隔离与持久化、malformed 帧、hidden/reconnect、退避、unload、channel 切换栅栏、错误分类 |
+| `src/gateway/no-polling.test.ts` | 4 | 唯一的周期性计时器是 Android 本地探测；gateway 层不出现任何 R2 LIST/GET/PUT |
 | `test/integration/signed-request.test.ts` | 5 | 签名不可变性、sessionToken 回归 |
 | `test/integration/test-prefix-guard.test.ts` | 9 | 硬保护的越界与列表过滤 |
 | `test/integration/local-scratch.test.ts` | 5 | scratch 根目录解析、回退、探测失败轨迹 |
 | `test/integration/safe-executor.integration.test.ts` | 7 | 收敛、stale、unresolved、blocked，隐藏与回退两种根目录 |
-| `test/integration/r2-conditional.integration.test.ts` | 7 | 传输场景 + "场景有牙齿"的注入失败测试 |
+| `test/integration/r2-conditional.integration.test.ts` | 10 | 传输场景 + "场景有牙齿"的注入失败测试 |
 | `test/integration/r2-real.manual.test.ts` | 1（默认 skipped） | 可选的真实 R2 诊断，见下 |
 
 进程内集成测试使用一个进程内 R2 模拟器，但跑在其上的是**真实 signer 与真实 `RequestUrlTransport`**。它们是回归保护，不是真实端点验证。
+
+调度器与 Gateway 的所有测试都使用注入的依赖（fake transport、fake socket、fake clock、fake cursor store），不连接真实 Gateway、不依赖真实时间。
 
 ### 可选：从 Node 发起的真实 R2 诊断
 
@@ -481,8 +490,9 @@ stale remote / stale local / state 提交失败 / PUT 结果不明       已验�
 未验证：
 
 ```text
-iOS                                                                       从未运行
-Phase 3A 自动调度的真实 Obsidian 验证                                             尚未执行
+iOS                                                            从未运行
+Phase 3A 自动调度的真实 Obsidian 验证                            见 Phase 4C 记录
+Phase 4C Gateway 跨设备自动同步（Windows ↔ Android）             见下方记录
 ```
 
 ---
