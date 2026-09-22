@@ -24,6 +24,66 @@ export const Platform = {
   isAndroidApp: false,
 };
 
+/**
+ * Vault file classes, minimal but real classes so `instanceof` checks behave as they do in Obsidian.
+ *
+ * `TFile.stat` is present because the plugin reads it directly on the desktop scan path.
+ */
+export class TFile {
+  path = "";
+  stat = { size: 0, mtime: 0, ctime: 0 };
+}
+
+export class TFolder {
+  path = "";
+}
+
+/**
+ * `MarkdownView` stand-in.
+ *
+ * A plugin-level test needs three things from it: an `instanceof` target for the workspace listeners,
+ * the editor buffer, and a `save()` whose effect on the file a test can script. Everything else in the
+ * real class is irrelevant to the code under test.
+ */
+export class MarkdownView {
+  file: TFile | null = null;
+  editor: { getValue(): string } = { getValue: () => "" };
+  saved = 0;
+  async save(): Promise<void> { this.saved += 1; }
+}
+
+/** Records the controls a settings tab adds, so a tab can be constructed without a DOM. */
+export class PluginSettingTab {
+  constructor(public app: unknown, public plugin: unknown) {}
+  display(): void {}
+}
+
+/**
+ * `Plugin` stand-in.
+ *
+ * Only the base-class surface `main.ts` touches is implemented, and every registration is a no-op: a
+ * test constructs the plugin and drives the method it is interested in, rather than an `onload()` that
+ * would need sockets, timers and a whole Vault.
+ */
+export class Plugin {
+  app: unknown;
+  manifest: { id: string; dir?: string } = { id: "mineral-obsidian-sync" };
+  constructor(app?: unknown, manifest?: { id: string; dir?: string }) {
+    this.app = app;
+    if (manifest) this.manifest = manifest;
+  }
+  addSettingTab(): void {}
+  addCommand(): void {}
+  addStatusBarItem(): { setText(text: string): void } { return { setText: () => {} }; }
+  registerEvent(): void {}
+  registerInterval(handle: unknown): unknown { return handle; }
+  registerDomEvent(): void {}
+  async loadData(): Promise<unknown> { return null; }
+  async saveData(): Promise<void> {}
+  async onload(): Promise<void> {}
+  onunload(): void {}
+}
+
 type Handler = (request: MockRequestUrlRequest) => Promise<MockRequestUrlResponse>;
 
 let handler: Handler = async () => {
