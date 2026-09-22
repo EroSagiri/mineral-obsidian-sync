@@ -343,3 +343,53 @@ describe("remote-change triggering", () => {
     expect(harness.scheduler.diagnostics().lastResultCounts.applied).toBe(1);
   });
 });
+
+describe("conflict observation hook", () => {
+  it("reports an empty conflict list, so a resolved conflict can be dropped", async () => {
+    // The empty call is load-bearing: without it the coordinator would keep a stale conflict visible
+    // forever, because a key that stops conflicting produces no conflict operation at all.
+    const observed: Array<Array<{ key: string }>> = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => base([]),
+      visible: () => true,
+      timers,
+      onConflicts: async (conflicts) => { observed.push(conflicts as Array<{ key: string }>); },
+    });
+    scheduler.requestReconcile("startup");
+    timers.fire();
+    await flush();
+    expect(observed).toEqual([[]]);
+  });
+
+  it("passes the conflicted keys once per cycle", async () => {
+    const observed: Array<Array<{ key: string }>> = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => ({ ...base([{ type: "conflict", key: "a.md", conflict: "both-modified", reason: "test" }]), observeConflicts: (conflicts) => conflicts.map((conflict) => ({ key: conflict.key })) }),
+      visible: () => true,
+      timers,
+      onConflicts: async (conflicts) => { observed.push(conflicts as Array<{ key: string }>); },
+    });
+    scheduler.requestReconcile("startup");
+    timers.fire();
+    await flush();
+    expect(observed).toEqual([[{ key: "a.md" }]]);
+  });
+
+  it("keeps the cycle result intact when conflict handling throws", async () => {
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => base([upload("a.md")]),
+      visible: () => true,
+      timers,
+      onConflicts: async () => { throw new Error("coordinator unavailable"); },
+    });
+    scheduler.requestReconcile("startup");
+    timers.fire();
+    await flush();
+    // A broken conflict coordinator must never degrade an otherwise successful cycle.
+    expect(scheduler.diagnostics().lastResultCounts.applied).toBe(1);
+    expect(scheduler.diagnostics().lastFailureClass).toBeUndefined();
+  });
+});

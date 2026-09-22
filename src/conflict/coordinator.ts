@@ -30,8 +30,13 @@ export interface ConflictCoordinatorDependencies {
   mergeBase: MergeBaseStore;
   conflicts: ConflictStore;
   intents: ResolutionIntentStore;
-  /** Requests one follow-up reconciliation after a new proposal or conflict is recorded. */
-  requestReconcile(): void;
+  /**
+   * Asks for a reconciliation after a proposal or conflict was recorded.
+   *
+   * The reason is passed through so an explicit user action can be scheduled differently from an
+   * automatic merge: a click deserves an immediate cycle, while an auto-merge can wait out a debounce.
+   */
+  requestReconcile(reason: "conflict-auto-merge" | "conflict-manual-resolution"): void;
   debug?(message: string): void;
   now?(): number;
 }
@@ -116,7 +121,7 @@ export class ConflictCoordinator {
     try { await this.dependencies.conflicts.reconcile(this.dependencies.channel, active); } catch { this.dependencies.debug?.("conflict store reconcile failed"); }
     // Refresh the proposals the *next* plan may apply, from this cycle's real observations.
     await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])));
-    if (followUp) this.dependencies.requestReconcile();
+    if (followUp) this.dependencies.requestReconcile("conflict-auto-merge");
   }
 
   /** Reads the intents that match the current observations and caches them for the planner. */
@@ -143,10 +148,10 @@ export class ConflictCoordinator {
    * Records a resolution the user or the auto-merge produced. This is the **only** write path the UI
    * uses; it stores an intent and asks for a reconciliation, and never touches file content.
    */
-  async propose(intent: ResolutionIntent): Promise<void> {
+  async propose(intent: ResolutionIntent, reason: "conflict-auto-merge" | "conflict-manual-resolution" = "conflict-manual-resolution"): Promise<void> {
     await this.dependencies.intents.putIntent(intent);
     this.dependencies.debug?.(`resolution intent type=${intent.type} path-hash=${shortConflictId(intent.conflictId)}`);
-    this.dependencies.requestReconcile();
+    this.dependencies.requestReconcile(reason);
   }
 
   /**

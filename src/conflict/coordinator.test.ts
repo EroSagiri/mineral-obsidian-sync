@@ -96,6 +96,7 @@ describe("conflict coordinator", () => {
   let env: ReturnType<typeof setup>;
   let remoteBodies: Map<string, string>;
   let remoteError: Error | undefined;
+  let reconcileReasons: string[];
 
   const client = (): R2Client => ({
     listObjects: async () => [],
@@ -117,12 +118,12 @@ describe("conflict coordinator", () => {
       mergeBase: env.stores,
       conflicts: env.stores,
       intents: env.stores,
-      requestReconcile: () => env.reconcilations.push(1),
+      requestReconcile: (reason) => { reconcileReasons.push(reason); env.reconcilations.push(1); },
       now: () => 1000,
     });
   }
 
-  beforeEach(() => { env = setup(); remoteBodies = new Map(); remoteError = undefined; });
+  beforeEach(() => { env = setup(); remoteBodies = new Map(); remoteError = undefined; reconcileReasons = []; });
 
   it("marks a conflict manual-required when no merge base exists", async () => {
     env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
@@ -265,5 +266,46 @@ describe("conflict coordinator", () => {
     // scheduler's data flow, which is what keeps logs and diagnostics safe.
     const observation: ConflictRecord["observedLocal"] = localEntry("note.md", 6, 50);
     expect(Object.keys(observation).sort()).toEqual(["key", "mtime", "size"]);
+  });
+
+  it("asks for an automatic cycle after an auto-merge, and an immediate one after a user action", async () => {
+    const cleanLocal = "A\nB-local\nC\n";
+    const cleanRemote = "A\nB\nC\nD-remote\n";
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode(cleanLocal), mtime: 10 });
+    remoteBodies.set("note.md", cleanRemote);
+    env.stores.mergeBase.set(`${CHANNEL}\u0000note.md`, { protocolVersion: CONFLICT_PROTOCOL_VERSION, channel: CHANNEL, path: "note.md", baseline: { localVersion: localEntry("note.md", cleanLocal.length, 10), remoteETag: "A" }, sha256: "x", byteLength: 6, encoding: { bom: false, eol: "lf", trailingNewline: true }, content: "A\nB\nC\n", updatedAt: 1 });
+    const instance = coordinator();
+    await instance.handleConflicts([{ key: "note.md", previous: previous("note.md", cleanLocal.length, 10, "A"), observedLocal: localEntry("note.md", cleanLocal.length, 10), observedRemote: { key: "note.md", size: cleanRemote.length, etag: "B", lastModified: 1 } }]);
+    // An auto-merge may wait out a debounce.
+    expect(reconcileReasons).toEqual(["conflict-auto-merge"]);
+
+    // A user's explicit choice should be applied on the next cycle, not after a delay.
+    reconcileReasons = [];
+    await instance.propose({ protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "c", channel: CHANNEL, path: "note.md", type: "keep-remote", expectedLocalVersion: localEntry("note.md", 1, 1), createdAt: 1 });
+    expect(reconcileReasons).toEqual(["conflict-manual-resolution"]);
+  });
+
+  it("reconciles stored records even when a cycle reports no conflicts at all", async () => {
+    // A key that stops conflicting produces no conflict operation, so the empty call is the only signal
+    // that a previously recorded conflict is gone. Without it the record would persist indefinitely.
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
+    remoteBodies.set("note.md", "remote\n");
+    const instance = coordinator();
+    await instance.handleConflicts([{ key: "note.md", previous: previous("note.md", 6, 10, "A"), observedLocal: localEntry("note.md", 6, 50), observedRemote: { key: "note.md", size: 7, etag: "B", lastModified: 1 } }]);
+    expect(await instance.list()).toHaveLength(1);
+    await instance.handleConflicts([]);
+    expect(await instance.list()).toHaveLength(0);
+    expect(instance.resolutions().size).toBe(0);
+  });
+
+  it("never mixes two channels' conflict state", async () => {
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
+    remoteBodies.set("note.md", "remote\n");
+    const instance = coordinator();
+    await instance.handleConflicts([{ key: "note.md", previous: previous("note.md", 6, 10, "A"), observedLocal: localEntry("note.md", 6, 50), observedRemote: { key: "note.md", size: 7, etag: "B", lastModified: 1 } }]);
+    expect(await instance.list()).toHaveLength(1);
+    // Switching namespace must not carry the previous channel's records, intents, or attempt history.
+    instance.setChannel("B".repeat(43));
+    expect(await instance.list()).toHaveLength(0);
   });
 });

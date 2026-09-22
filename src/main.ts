@@ -102,7 +102,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       mergeBase: this.conflictStores,
       conflicts: this.conflictStores,
       intents: this.conflictStores,
-      requestReconcile: () => this.scheduler?.requestReconcile("conflict-auto-merge"),
+      requestReconcile: (reason) => this.scheduler?.requestReconcile(reason),
       debug: (message) => this.debug(message),
     });
     this.scheduler = new SyncScheduler({
@@ -316,8 +316,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
 
   /**
-   * Conflict handling runs after the cycle, with the channel pinned for that cycle, so every record
-   * and intent it writes belongs to the namespace the plan was built for.
+   * Conflict handling runs after every cycle, including one with no conflicts.
+   *
+   * The empty case matters: it is how the coordinator learns that a conflict it recorded is no longer
+   * active and must be dropped. The channel is re-derived here so records and intents always belong to
+   * the namespace the cycle that produced them was built for.
    */
   private async handleConflicts(conflicts: ConflictObservation[]): Promise<void> {
     const coordinator = this.coordinator;

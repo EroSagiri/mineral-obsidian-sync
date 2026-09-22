@@ -15,7 +15,8 @@ import { CONFLICT_PROTOCOL_VERSION, type ConflictRecord, type ResolutionIntent }
 export interface ConflictResolverDependencies {
   list(): Promise<ConflictRecord[]>;
   /** Persists a resolution intent only; never mutates content. */
-  propose(intent: ResolutionIntent): Promise<void>;
+  /** Persists a resolution intent only; never mutates content. */
+  propose(intent: ResolutionIntent, reason: "conflict-auto-merge" | "conflict-manual-resolution"): Promise<void>;
   /** Exposed so a test can assert that the UI never reaches for a transport or the Vault. */
   debug?(message: string): void;
 }
@@ -145,7 +146,7 @@ export class ConflictResolverModal extends Modal {
     };
     try {
       if (type === "merged" && this.draft) intent.merged = await mergedContentOf(this.draft.text);
-      await this.dependencies.propose(intent);
+      await this.dependencies.propose(intent, "conflict-manual-resolution");
     }
     catch { new Notice("Mineral Sync: the resolution could not be recorded."); return; }
     this.dependencies.debug?.(`conflict resolution requested type=${type} path-hash=${shortConflictId(record.conflictId)}`);

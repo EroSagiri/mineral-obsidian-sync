@@ -189,7 +189,11 @@ export class SyncScheduler {
     // Conflicts are handed to the coordinator after the cycle has fully executed. Nothing here
     // rewrites the plan that just ran; a resolution the coordinator records is applied by a later
     // cycle, which keeps `planner` the only decision maker and `event != operation` intact.
-    if (conflicts.length && this.dependencies.onConflicts) {
+    //
+    // The hook runs on *every* cycle, including one with no conflicts at all. An empty list is
+    // meaningful: it is how the coordinator learns that records it still holds are no longer active
+    // and must be dropped. Skipping the call would leave a resolved conflict visible in the UI forever.
+    if (this.dependencies.onConflicts) {
       try { await this.dependencies.onConflicts(conflicts); }
       catch { this.dependencies.debug?.("conflict coordination failed"); }
     }
