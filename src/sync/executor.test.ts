@@ -41,7 +41,7 @@ function vault(contents: Record<string, number[]>, mtime = 10) {
 }
 function state(fails = false): StateStore & { entries: PreviousEntry[] } {
   const entries: PreviousEntry[] = [];
-  return { entries, loadAll: async () => new Map(), saveAll: async () => {}, saveVerified: async () => {}, put: async (entry) => { if (fails) throw new Error("IDB unavailable"); entries.push(entry); } };
+  return { entries, loadAll: async () => new Map(), saveAll: async () => {}, saveVerified: async () => {}, put: async (entry) => { if (fails) throw new Error("IDB unavailable"); entries.push(entry); }, delete: async () => { if (fails) throw new Error("IDB unavailable"); } };
 }
 function remote(overrides: Partial<R2Client> = {}): R2Client {
   // Mirrors the real client: a write response yields only the size we sent and the server ETag.
@@ -99,10 +99,88 @@ describe("SafeExecutor", () => {
     expect(saved.entries[0]!.remote).toEqual({ size: 3, etag: "new" });
     expect(saved.entries[0]!.remote!.lastModified).toBeUndefined();
   });
-  it("hard-blocks both deletion operations", async () => {
+  it("keeps remote deletion blocked because it cannot name a version", async () => {
     const executor = new SafeExecutor(vault({}) as never, remote(), state(), identity, "[]");
-    await expect(executor.execute({ type: "delete-local", key: "a", reason: "test" })).resolves.toMatchObject({ status: "blocked" });
-    await expect(executor.execute({ type: "delete-remote", key: "a", reason: "test" })).resolves.toMatchObject({ status: "blocked" });
+    await expect(executor.execute({ type: "delete-remote", key: "a", reason: "test" })).resolves.toEqual({ status: "blocked", key: "a", reason: "remote-deletion-requires-version-identity" });
+  });
+
+  describe("delete-local (recovery-first)", () => {
+    /** A Vault whose removal is observable, so the test can assert what was actually removed. */
+    function trashable(initial: Record<string, number[]>) {
+      const local = vault(initial);
+      const trashed: string[] = [];
+      let trashFails = false;
+      let unlinkAttempted = false;
+      const remover = { trash: async (file: { path: string }) => { if (trashFails) throw new Error("system trash is disabled"); trashed.push(file.path); local.files.delete(file.path); } };
+      return { local, remover, trashed, setTrashFails: (value: boolean) => { trashFails = value; }, unlinkAttempted: () => unlinkAttempted };
+    }
+    const deleteLocal = (key: string, size: number, mtime: number): Extract<SyncOperation, { type: "delete-local" }> => ({ type: "delete-local", key, reason: "test", expectedLocal: { key, size, mtime } });
+
+    it("trashes the file and retires the baseline when both sides become absent", async () => {
+      const { local, remover, trashed } = trashable({ "a.bin": [1, 2, 3] });
+      const saved = state(); saved.entries.push({ key: "a.bin", local: { size: 3, mtime: 10 }, remote: { size: 3, etag: "A" }, syncedAt: 1 });
+      const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]", remover).execute(deleteLocal("a.bin", 3, 10));
+      expect(result).toEqual({ status: "applied", key: "a.bin" });
+      expect(trashed).toEqual(["a.bin"]);
+      expect(local.files.has("a.bin")).toBe(false);
+    });
+
+    it("never removes a file that changed after the scan recorded it", async () => {
+      // The scan saw L1; the user then edited the file to L2. The destructive action must not happen.
+      const { local, remover, trashed } = trashable({ "a.bin": [1, 2, 3] });
+      // mtime 99 is what the vault reports now; the plan was built from mtime 10.
+      local.files.set("a.bin", { bytes: bytes([1, 2, 3, 4]), mtime: 99 });
+      const saved = state();
+      const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]", remover).execute(deleteLocal("a.bin", 3, 10));
+      expect(result).toEqual({ status: "stale", key: "a.bin", reason: "local-changed" });
+      expect(trashed).toEqual([]);
+      expect(local.files.has("a.bin")).toBe(true);
+      expect(saved.entries).toHaveLength(0);
+    });
+
+    it("treats an already-absent local file as a completed deletion and still retires the baseline", async () => {
+      const { local, remover, trashed } = trashable({});
+      const saved = state();
+      const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]", remover).execute(deleteLocal("a.bin", 3, 10));
+      expect(result).toEqual({ status: "applied", key: "a.bin" });
+      expect(trashed).toEqual([]);
+    });
+
+    it("fails safely, without unlinking, when no recovery path exists", async () => {
+      const { local, remover, setTrashFails } = trashable({ "a.bin": [1, 2, 3] });
+      setTrashFails(true);
+      const saved = state();
+      const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]", remover).execute(deleteLocal("a.bin", 3, 10));
+      expect(result).toMatchObject({ status: "failed", reason: "trash-unavailable" });
+      // The file survives: there is no permanent-unlink fallback.
+      expect(local.files.has("a.bin")).toBe(true);
+      expect(saved.entries).toHaveLength(0);
+    });
+
+    it("fails rather than unlinking when no remover is configured at all", async () => {
+      const local = vault({ "a.bin": [1, 2, 3] });
+      const result = await new SafeExecutor(local as never, remote(), state(), identity, "[]").execute(deleteLocal("a.bin", 3, 10));
+      expect(result).toMatchObject({ status: "failed", reason: "file-manager-unavailable" });
+      expect(local.files.has("a.bin")).toBe(true);
+    });
+  });
+
+  describe("prune-baseline (state GC)", () => {
+    it("removes the baseline entry and touches nothing else", async () => {
+      const local = vault({ "other.bin": [1, 2, 3] });
+      const deleted: string[] = [];
+      const saved: StateStore = { ...state(), delete: async (key) => { deleted.push(key); } };
+      const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]").execute({ type: "prune-baseline", key: "gone.bin", reason: "test" });
+      expect(result).toEqual({ status: "applied", key: "gone.bin" });
+      expect(deleted).toEqual(["gone.bin"]);
+      // No Vault content and no remote call was involved.
+      expect(local.files.has("other.bin")).toBe(true);
+    });
+
+    it("reports a failed bookkeeping removal as unresolved instead of claiming success", async () => {
+      const result = await new SafeExecutor(vault({}) as never, remote(), state(true), identity, "[]").execute({ type: "prune-baseline", key: "gone.bin", reason: "test" });
+      expect(result).toEqual({ status: "unresolved", key: "gone.bin", reason: "state-commit-failed" });
+    });
   });
   it("creates the missing parent folders before writing a nested download", async () => {
     const local = vault({}), saved = state();

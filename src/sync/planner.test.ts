@@ -44,7 +44,7 @@ describe("buildSyncPlan decision matrix", () => {
     ["both modified", local("note.md", 10, 101), remote("note.md", 10, "etag-b"), previous(), "conflict"],
     ["local deleted", undefined, remote(), previous(), "delete-remote"],
     ["remote deleted", local(), undefined, previous(), "delete-local"],
-    ["both deleted", undefined, undefined, previous(), "noop"],
+    ["both deleted", undefined, undefined, previous(), "prune-baseline"],
     ["local changed remote deleted", local("note.md", 10, 101), undefined, previous(), "conflict"],
     ["local deleted remote changed", undefined, remote("note.md", 10, "etag-b"), previous(), "conflict"],
   ] as const)("%s", (_name, l, r, p, expected) => expect(plan(l, r, p)?.type).toBe(expected));
@@ -69,6 +69,57 @@ describe("buildSyncPlan decision matrix", () => {
   });
   it("does not propagate a deletion without previous successful-state evidence", () => {
     expect(buildSyncPlan(new Map(), new Map([["only-remote.md", remote("only-remote.md")]]), new Map()).operations).toEqual([expect.objectContaining({ type: "download" })]);
+  });
+});
+
+describe("baseline GC and safe local deletion", () => {
+  it("retires a baseline only when the local and remote scans both prove absence", () => {
+    // Three baseline entries; only the fully-absent one may be forgotten.
+    const stored = new Map([
+      ["gone.md", previous("gone.md")],
+      ["local-only.md", previous("local-only.md")],
+      ["remote-only.md", previous("remote-only.md")],
+    ]);
+    const scannedLocal = new Map([["local-only.md", local("local-only.md")]]);
+    const scannedRemote = new Map([["remote-only.md", remote("remote-only.md")]]);
+    const operations = buildSyncPlan(scannedLocal, scannedRemote, stored).operations;
+    expect(operations).toEqual([
+      expect.objectContaining({ type: "prune-baseline", key: "gone.md" }),
+      expect.objectContaining({ type: "delete-local", key: "local-only.md" }),
+      // The third key still exists remotely while the local copy is gone, so the local absence is a
+      // deletion to propagate upward — and that direction stays blocked until D3 gives it a version.
+      expect.objectContaining({ type: "delete-remote", key: "remote-only.md" }),
+    ]);
+  });
+
+  it("forgets only the absent keys and leaves real content alone", () => {
+    // The same three-key baseline, scanned again: the GC candidate is exactly the absent one.
+    const stored = new Map([
+      ["gone.md", previous("gone.md")],
+      ["kept.md", previous("kept.md")],
+    ]);
+    const operations = buildSyncPlan(new Map([["kept.md", local("kept.md")]]), new Map([["kept.md", remote("kept.md")]]), stored).operations;
+    expect(operations.filter((operation) => operation.type === "prune-baseline").map((operation) => operation.key)).toEqual(["gone.md"]);
+    expect(operations.filter((operation) => operation.type === "noop").map((operation) => operation.key)).toEqual(["kept.md"]);
+  });
+
+  it("carries the observed local version on the delete-local decision", () => {
+    // The executor revalidates this exact observation before any destructive action, so the planner
+    // must hand over the version the decision was made from, not just the key. This local version
+    // still matches the baseline, which is what makes the deletion safe to plan at all.
+    const operation = plan(local("note.md", 10, 100), undefined, previous("note.md"));
+    expect(operation).toEqual({ type: "delete-local", key: "note.md", reason: expect.any(String), expectedLocal: { key: "note.md", size: 10, mtime: 100 } });
+  });
+
+  it("never turns a modified local file into a delete-local when the remote is gone", () => {
+    // Local changed after the baseline, remote absent: this is a conflict, never a deletion.
+    expect(plan(local("note.md", 10, 999), undefined, previous("note.md"))?.type).toBe("conflict");
+  });
+
+  it("never emits prune-baseline or delete-local without a previous entry", () => {
+    expect(buildSyncPlan(new Map(), new Map(), new Map()).operations).toEqual([]);
+    // A brand-new remote-only object is a download; a brand-new local-only file is an upload.
+    expect(buildSyncPlan(new Map([["new.md", local("new.md")]]), new Map(), new Map()).operations).toEqual([expect.objectContaining({ type: "upload" })]);
   });
 });
 

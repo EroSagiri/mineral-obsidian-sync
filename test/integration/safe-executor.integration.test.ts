@@ -137,12 +137,28 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(vault.files.get(key)!.bytes).toEqual(new Uint8Array([9, 9]));
   });
 
-  it("keeps deletion hard-blocked through the real executor", async () => {
+  it("keeps remote deletion blocked, because it cannot name the version it would remove", async () => {
     const { context, scratch } = await build();
     const executor = new SafeExecutor(context.vault, context.client, context.state, context.identity, context.ignorePolicy);
     const key = scratch.key("test-file.md");
 
-    await expect(executor.execute({ type: "delete-remote", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "deletion-not-supported-in-phase-2a" });
-    await expect(executor.execute({ type: "delete-local", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "deletion-not-supported-in-phase-2a" });
+    await expect(executor.execute({ type: "delete-remote", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "remote-deletion-requires-version-identity" });
+  });
+
+  it("propagates a remote deletion to the local file through trash, then retires the baseline", async () => {
+    const { context, vault, state, scratch } = await build();
+    const key = scratch.key("deletion-target.md");
+    await vault.createBinary(key, new Uint8Array([1, 2, 3]).buffer);
+    state.put({ key, local: { size: 3, mtime: 1 }, remote: { size: 3, etag: "A" }, syncedAt: 1 });
+    const stat = await vault.adapter.stat(key);
+    const trashed: string[] = [];
+    const executor = new SafeExecutor(context.vault, context.client, context.state, context.identity, context.ignorePolicy, { trash: async (target) => { trashed.push(target.path); await vault.remove(target); } });
+
+    const result = await executor.execute({ type: "delete-local", key, reason: "integration", expectedLocal: { key, size: stat!.size, mtime: stat!.mtime } });
+    expect(result).toEqual({ status: "applied", key });
+    expect(trashed).toEqual([key]);
+    expect(vault.getFileByPath(key)).toBeNull();
+    // Both sides are now absent, so the baseline that described this key has been retired.
+    expect(state.entries.has(key)).toBe(false);
   });
 });

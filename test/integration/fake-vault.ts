@@ -17,6 +17,9 @@ export function createMemoryStateStore(): StateStore & { entries: Map<string, Pr
     put: async (entry) => {
       entries.set(entry.key, entry);
     },
+    delete: async (key) => {
+      entries.delete(key);
+    },
   };
 }
 
@@ -43,6 +46,8 @@ export interface FakeVault {
   createBinary(path: string, bytes: ArrayBuffer): Promise<FakeLocalFile>;
   modifyBinary(file: FakeLocalFile, bytes: ArrayBuffer): Promise<void>;
   readBinary(file: FakeLocalFile): Promise<ArrayBuffer>;
+  /** Stands in for a trash/removal call; the harness never uses a permanent unlink itself. */
+  remove(file: FakeLocalFile): Promise<void>;
   adapter: {
     exists(path: string): Promise<boolean>;
     mkdir(path: string): Promise<void>;
@@ -118,6 +123,9 @@ export function createFakeVault(initial: Record<string, Uint8Array> = {}, option
       const entry = files.get(target.path);
       if (!entry) throw new Error(`ENOENT: no such file or directory, open '${target.path}'`);
       return entry.bytes.slice(0).buffer;
+    },
+    remove: async (target) => {
+      if (!files.delete(target.path)) throw new Error(`ENOENT: no such file or directory, unlink '${target.path}'`);
     },
     adapter: {
       exists: async (path) => folderExists(path) || files.has(path),

@@ -65,6 +65,9 @@ describe("writer notification coalescing", () => {
       { name: "conflict", operations: [{ type: "conflict", key: "a.md", conflict: "both-modified", reason: "test" }], execute: async () => ({ status: "failed", key: "x", error: "should not run" }) },
       { name: "blocked delete", operations: [{ type: "delete-remote", key: "a.md", reason: "test" }], execute: async (operation) => ({ status: "blocked", key: operation.key, reason: "deletion-not-supported-in-phase-2a" }) },
       { name: "stable upload failure", operations: [upload("a.md")], execute: async (operation) => ({ status: "failed", key: operation.key, error: "path", reason: "parent-path-is-file" }) },
+      // Phase 4C.5: neither of these touches R2, so neither may wake other devices.
+      { name: "baseline GC", operations: [{ type: "prune-baseline", key: "gone.md", reason: "test" }], execute: async (operation) => ({ status: "applied", key: operation.key }) },
+      { name: "delete-local", operations: [{ type: "delete-local", key: "a.md", reason: "test", expectedLocal: { key: "a.md", size: 1, mtime: 1 } }], execute: async (operation) => ({ status: "applied", key: operation.key }) },
     ];
     for (const testCase of cases) {
       const harness = setup(() => base(testCase.operations, testCase.execute), true);
