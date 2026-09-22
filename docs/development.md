@@ -246,6 +246,33 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 
 ## 真实验证记录
 
+### Phase 4C — 已部署的 Sync Gateway（控制平面）
+
+`mineral-sync-gateway` 已部署到 Cloudflare（worker hostname `mineral-sync-gateway.i-68b.workers.dev`）。
+只部署了 `sync-gateway`；**没有**部署 `mcp` 或 `vault`。`SYNC_GATEWAY_TOKEN` 以 Worker secret 形式设置，
+值不进入本仓库、不进入日志。
+
+部署后用 `scripts/validate-sync-gateway-deployment.mjs`（backend 仓库）对真实端点做过一次控制面验证：
+
+| 检查 | 结果 |
+| --- | --- |
+| 未认证 GET 被拒（在任何 DO 路由之前） | **PASS**（HTTP 401） |
+| 认证 GET 返回 generation | **PASS** |
+| `markDirty` 推进 durable generation | **PASS** |
+| ticket 可签发，且不含长期 token | **PASS** |
+| ticket 端点本身需要认证 | **PASS**（HTTP 401） |
+| 仅凭 ticket 即可建立 WebSocket | **PASS** |
+| WS 首帧是 `current-generation` 快照 | **PASS** |
+| `markDirty` 通过 WS 到达为 `remote-dirty` | **PASS** |
+| 伪造 ticket 被拒（socket 被拒绝，未进入 DO） | **PASS** |
+| ticket 不能授权普通 HTTP 读取（作用域仅限 WS） | **PASS** |
+
+**11 / 11 PASS。**
+
+> 这验证的是**控制平面**。跨设备自动同步需要两台真实 Obsidian，属于下表的真机项。
+
+### Phase 2A / 2A.5 — 数据平面
+
 环境：Windows 桌面版 Obsidian，真实 Cloudflare R2 bucket，真实凭据，`environment: obsidian-requesturl`。
 
 | 时间 (UTC) | 内容 | 结果 |
@@ -267,6 +294,20 @@ Obsidian **能创建点目录、能写文件**，但**不把点目录下的文�
 | 2026-09-21T18:10:16Z | Transport Self-Test（桌面，移除确认 HEAD 后的构建） | **9 / 9 PASS**：18 项原语矩阵全绿；`remote-advanced-after-write` 不在此套 |
 | 2026-09-21T18:10:47Z | Convergence Self-Test（桌面，含 `remote-advanced-after-write`） | **9 / 9 PASS** |
 | 2026-09-21T18:11:59Z | Convergence Self-Test（**Android**，含 `remote-advanced-after-write`） | **9 / 9 PASS**；落盘核对：`remote-advanced.md` 内容为外部写者的 v2，确认跟进下载真的收敛 |
+
+### Phase 3A / 4C — 真机自动同步（待执行）
+
+| 项目 | 状态 |
+| --- | --- |
+| Windows → Android 自动收敛 | **NOT RUN** |
+| Android → Windows 自动收敛 | **NOT RUN** |
+| 连续输入不产生 markDirty 风暴 | **NOT RUN** |
+| 断线重连后追赶 | **NOT RUN** |
+| Gateway 不可达不影响 R2 写入 | **NOT RUN** |
+
+执行方式见 [`gateway-integration.md`](gateway-integration.md) 第 11 节。要点：两端配置相同的
+R2 endpoint/bucket/prefix 与相同的 Gateway endpoint/token；先用 `Mineral Sync: Gateway Status`
+确认两端 channel 指纹一致；验证过程中**不要**用 focus/resume 或 Sync Now 辅助触发。
 
 构建归属（避免把不同构建的结果混在一起）：
 
