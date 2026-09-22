@@ -2,6 +2,7 @@ import { MarkdownView, Notice, Platform, Plugin, TFolder, type TFile } from "obs
 import { scanLocal, scanLocalAdapterMetadata } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
+import { RemoteHttpError } from "./remote/errors";
 import { scanRemote } from "./remote/scan-remote";
 import { DEFAULT_SETTINGS, R2SyncSettingTab, type R2SyncSettings } from "./settings";
 import { IndexedDbStateStore } from "./state/state-store";
@@ -20,6 +21,8 @@ import { resolveGatewayConfig } from "./gateway/config";
 import type { GatewayConfigState } from "./gateway/types";
 import { gatewayConnectionConfig } from "./gateway/types";
 import { deriveRemoteChangeChannel } from "@mineral/sync-core/channel";
+import type { RemoteChange } from "@mineral/sync-core/sync-change";
+import { canonicalKey } from "./sync/path";
 import { IndexedDbConflictStores } from "./conflict/stores";
 import { createMergeBaseRecorder, recordMergeBaseBatch, type MergeBaseInput } from "./conflict/merge-base";
 import { ConflictCoordinator } from "./conflict/coordinator";
@@ -31,6 +34,7 @@ type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, R
 
 const ANDROID_LOCAL_DRIFT_INTERVAL_MS = 15_000;
 const ANDROID_EDITOR_SAVE_DEBOUNCE_MS = 500;
+const INTEGRITY_RECONCILE_TICK_MS = 60_000;
 
 export default class R2PersonalSyncPlugin extends Plugin {
   settings: R2SyncSettings = { ...DEFAULT_SETTINGS };
@@ -52,6 +56,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private lastConflictCount = 0;
   /** The derived channel for the current settings, refreshed once per cycle. */
   private resolvedChannel?: string;
+  private lastIntegrityRequestedAt = 0;
 
   async onload(): Promise<void> {
     const persisted = (await this.loadData() ?? {}) as Partial<R2SyncSettings> & { ignoredFolders?: unknown; ignoredFiles?: unknown };
@@ -90,9 +95,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
       {
         // A Gateway announcement is only ever a reason to reconcile. It carries no path, no
         // operation, and no instruction; the planner still decides everything.
-        onAnnounced: (generation, source) => {
-          this.debug(`gateway announce generation=${generation} source=${source}`);
-          this.scheduler?.requestReconcile("remote-change");
+        onAnnounced: (generation, source, changes) => {
+          this.debug(`gateway event remoteGeneration=${generation} lastAppliedGeneration=${this.gateway?.lastReconciled() ?? "0"} source=${source} changes=${changes?.length ?? 0}`);
+          this.scheduler?.requestRemoteChange(generation, changes);
         },
         onStatusChanged: () => this.scheduler?.refreshStatus(),
       },
@@ -120,16 +125,18 @@ export default class R2PersonalSyncPlugin extends Plugin {
         hasPending: () => this.gateway?.hasPending() ?? false,
         readGeneration: () => this.gateway?.readGeneration() ?? Promise.resolve({ ok: false as const, kind: "misconfigured" }),
         confirmReconciled: async (generation) => { await this.gateway?.confirmReconciled(generation); },
-        notifyRemoteDirty: () => this.gateway?.markRemoteDirty() ?? Promise.resolve({ ok: false as const, kind: "misconfigured" }),
+        notifyRemoteDirty: (changes) => this.gateway?.markRemoteDirty(changes) ?? Promise.resolve({ ok: false as const, kind: "misconfigured" }),
+        canApplyIncrementally: (generation) => this.gateway?.canApplyIncrementally(generation) ?? false,
       },
     });
     this.app.workspace.onLayoutReady(() => {
       this.registerVaultListeners();
       this.registerAndroidLocalDriftDetector();
+      this.registerInterval(window.setInterval(() => this.maybeRequestIntegrityReconcile(), INTEGRITY_RECONCILE_TICK_MS));
       this.registerDomEvent(document, "visibilitychange", () => this.onVisibilityChanged(document.visibilityState !== "hidden"));
       // The channel is a digest, so it is resolved once before the first cycle, which is what lets the
       // planner receive valid resolution intents synchronously instead of doing its own I/O.
-      void this.resolveChannel().then(() => this.scheduler?.requestReconcile("startup"));
+      void this.resolveChannel().then(() => { this.lastIntegrityRequestedAt = Date.now(); this.scheduler?.requestReconcile("startup"); });
       void this.applyGatewayConfig(true);
     });
   }
@@ -202,10 +209,18 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
 
   private onVisibilityChanged(visible: boolean): void {
+    if (visible) this.lastIntegrityRequestedAt = Date.now();
     this.scheduler?.visibilityChanged(visible);
     // Phone resume is the one moment a device learns what happened while it was away; the socket is
     // closed while hidden so no background reconnect storm can occur.
     this.gateway?.setVisible(visible);
+  }
+  private maybeRequestIntegrityReconcile(): void {
+    if (document.visibilityState === "hidden") return;
+    const interval = Math.max(10, Math.min(30, this.settings.integrityReconcileIntervalMinutes || 20)) * 60_000;
+    if (Date.now() - this.lastIntegrityRequestedAt < interval) return;
+    this.lastIntegrityRequestedAt = Date.now();
+    this.scheduler?.requestReconcile("integrity-check");
   }
   private client(): SignedR2ListClient { return new SignedR2ListClient(this.settings); }
   /** Debug-only operational telemetry: intentionally no paths, content, credentials, or signed headers. */
@@ -323,6 +338,58 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
       scanRemote: () => scanRemote(client, filter, (message) => this.debug(message)),
+      incrementalObservations: async (changes: RemoteChange[]) => {
+        const keys = new Set<string>();
+        const remote = new Map<string, RemoteEntry>();
+        for (const change of changes) {
+          if (change.op === "rename") { keys.add(canonicalKey(change.from)); keys.add(canonicalKey(change.to)); }
+          else keys.add(canonicalKey(change.path));
+        }
+        for (const change of changes) {
+          if (change.op === "delete") { remote.delete(canonicalKey(change.path)); continue; }
+          if (change.op === "rename") {
+            remote.delete(canonicalKey(change.from));
+            const key = canonicalKey(change.to);
+            if (!filter.ignores(key)) remote.set(key, await client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
+            continue;
+          }
+          const key = canonicalKey(change.path);
+          if (filter.ignores(key)) continue;
+          // A complete put fact avoids another request. Any omitted field is intentionally filled by
+          // one exact HEAD rather than guessed from wall-clock time or a stale local baseline.
+          const modified = change.modified ? Date.parse(change.modified) : NaN;
+          if (change.etag && typeof change.size === "number" && Number.isFinite(modified)) remote.set(key, { key, etag: change.etag, size: change.size, lastModified: modified });
+          else remote.set(key, await client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
+        }
+        const local = new Map<string, LocalEntry>();
+        for (const key of keys) {
+          if (filter.ignores(key)) continue;
+          const stat = await this.app.vault.adapter.stat(key);
+          if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
+        }
+        const all = await this.stateStore.loadAll();
+        const previous = new Map([...all].filter(([key, entry]) => keys.has(key) && !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
+        return { local, remote, previous };
+      },
+      localIncrementalObservations: async (keys: string[]) => {
+        const local = new Map<string, LocalEntry>();
+        const remote = new Map<string, RemoteEntry>();
+        for (const key of keys) {
+          const stat = await this.app.vault.adapter.stat(key);
+          if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
+          try {
+            // An exact HEAD is sufficient for create/modify/delete planning. A logically deleted
+            // predecessor remains physically readable at the same ETag, which deliberately makes
+            // a repeated local delete idempotent and a later local modification a conditional revive.
+            remote.set(key, await client.headObject(key));
+          } catch (error) {
+            if (!(error instanceof RemoteHttpError && error.status === 404)) throw error;
+          }
+        }
+        const all = await this.stateStore.loadAll();
+        const previous = new Map([...all].filter(([key, entry]) => keys.includes(key) && !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
+        return { local, remote, previous };
+      },
       loadPrevious: () => this.stateStore.loadAll(),
       filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
       buildPlan: (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => buildSyncPlan(local, remote, previous, this.coordinator?.resolutions()),

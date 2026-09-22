@@ -1,7 +1,8 @@
 import type { OperationResult } from "../sync/executor";
+import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
 
-export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
+export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "foreground-resume" | "integrity-check" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
 export type SchedulerState = "idle" | "debouncing" | "running" | "rerun-pending" | "blocked-by-auth";
 export type FailureClass = "retryable" | "stable" | "auth";
 /**
@@ -27,6 +28,10 @@ export type CycleRemoteMutation = "confirmed" | "possible";
 export interface CycleDependencies {
   scanLocal(): Map<string, LocalEntry> | Promise<Map<string, LocalEntry>>;
   scanRemote(): Promise<Map<string, RemoteEntry>>;
+  /** Exact-path observations for a trusted gateway event; never lists R2 or tombstones. */
+  incrementalObservations?(changes: RemoteChange[]): Promise<{ local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> }>;
+  /** Exact-path observations for coalesced local Vault events; never lists R2 or tombstones. */
+  localIncrementalObservations?(keys: string[]): Promise<{ local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> }>;
   loadPrevious(): Promise<Map<string, PreviousEntry>>;
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
   buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
@@ -66,7 +71,9 @@ export interface SchedulerRemoteChange {
   /** Records the generation a completed window proved. Never called on an incomplete window. */
   confirmReconciled(generation: string): Promise<void>;
   /** Best-effort wake-up for other clients. Its result never changes a cycle's outcome. */
-  notifyRemoteDirty(): Promise<{ ok: true; generation: string } | { ok: false; kind: string }>;
+  notifyRemoteDirty(changes?: RemoteChange[]): Promise<{ ok: true; generation: string } | { ok: false; kind: string }>;
+  /** The persisted cursor makes this generation the exact next remote event. */
+  canApplyIncrementally(generation: string): boolean;
 }
 
 export interface SchedulerDependencies {

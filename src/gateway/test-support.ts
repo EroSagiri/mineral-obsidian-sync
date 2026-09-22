@@ -106,6 +106,7 @@ export class FakeRemoteChange implements SchedulerRemoteChange {
   script(...generations: string[]): void { this.scripted = [...generations]; }
   announce(generation: string): void { if (BigInt(generation) > BigInt(this.announced)) this.announced = generation; }
   hasPending(): boolean { return BigInt(this.announced) > BigInt(this.reconciled); }
+  canApplyIncrementally(generation: string): boolean { return BigInt(generation) === BigInt(this.reconciled) + 1n; }
   async readGeneration(): Promise<{ ok: true; generation: string } | { ok: false; kind: string }> {
     if (this.readFailure) return { ok: false, kind: this.readFailure };
     const next = this.scripted.length ? this.scripted.shift()! : this.announced;

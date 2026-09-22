@@ -2,6 +2,7 @@ import { RemoteHttpError, RemoteTransportError } from "../remote/errors";
 import { canonicalKey } from "../sync/path";
 import type { OperationResult } from "../sync/executor";
 import type { LocalEntry, SyncOperation } from "../sync/types";
+import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
 
 const LOCAL_DEBOUNCE = 1200;
@@ -36,6 +37,8 @@ export class SyncScheduler {
   private lastHandshakeStart?: string;
   private lastConfirmation?: ConfirmationOutcome["kind"];
   private lastCycleRemoteMutation = false;
+  private incrementalStateTrusted = false;
+  private readonly pendingRemoteChanges: Array<{ generation: string; changes: RemoteChange[] }> = [];
 
   constructor(private readonly dependencies: SchedulerDependencies) { this.timers = dependencies.timers ?? defaultTimers; }
 
@@ -44,6 +47,15 @@ export class SyncScheduler {
     if (this.state === "running") { this.rerunRequested = true; this.rerunReason = reason; return; }
     this.pendingReason = reason;
     this.scheduleDebounce(this.delayFor(reason));
+  }
+
+  /** Queues a concrete remote delta. Unknown or non-contiguous events deliberately use full mode. */
+  requestRemoteChange(generation: string, changes?: RemoteChange[]): void {
+    if (!changes?.length) { this.requestReconcile("remote-change"); return; }
+    const existing = this.pendingRemoteChanges.find((entry) => entry.generation === generation);
+    if (existing) existing.changes = changes;
+    else this.pendingRemoteChanges.push({ generation, changes });
+    this.requestReconcile("remote-change");
   }
 
   /** Accepts only relevant file paths; callers deliberately do not pass event kind into planning. */
@@ -69,8 +81,8 @@ export class SyncScheduler {
   }
 
   visibilityChanged(visible: boolean): void {
-    if (!visible) { this.clearTimer("debounce"); this.clearTimer("retry"); if (this.state === "debouncing") this.state = "idle"; this.publish(); return; }
-    if (this.state !== "blocked-by-auth") this.requestReconcile("focus-resume");
+    if (!visible) { this.incrementalStateTrusted = false; this.clearTimer("debounce"); this.clearTimer("retry"); if (this.state === "debouncing") this.state = "idle"; this.publish(); return; }
+    if (this.state !== "blocked-by-auth") this.requestReconcile("foreground-resume");
   }
 
   stop(): void {
@@ -85,7 +97,7 @@ export class SyncScheduler {
   }
 
   private delayFor(reason: ReconcileReason): number {
-    if (reason === "manual" || reason === "conflict-manual-resolution" || reason === "remote-change") return 0;
+    if (reason === "manual" || reason === "conflict-manual-resolution" || reason === "remote-change" || reason === "foreground-resume" || reason === "integrity-check") return 0;
     if (reason === "editor-change") return 300;
     if (reason === "config-change") return CONFIG_DEBOUNCE;
     if (reason === "focus-resume") return FOCUS_DEBOUNCE;
@@ -115,33 +127,54 @@ export class SyncScheduler {
     const generation = this.configGeneration;
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
     let remoteMutation: CycleRemoteMutation | undefined;
+    const remoteChanges: RemoteChange[] = [];
     const localWrites = new Map<string, LocalEntry>();
     const resultDetails = new Map<string, number>();
     const conflicts: ConflictObservation[] = [];
     const handshake: RemoteGenerationHandshake = { startFailed: false, observationComplete: true };
+    const incremental = reason === "remote-change" && this.incrementalStateTrusted ? this.pendingRemoteChanges.shift() : undefined;
+    const useRemoteIncremental = Boolean(incremental && this.dependencies.remoteChange?.canApplyIncrementally(incremental.generation));
+    // The dirty map is already path-coalesced. Snapshot the keys before any I/O so events received
+    // while this cycle is running remain dirty for a follow-up instead of being accidentally folded in.
+    const localIncrementalKeys = (reason === "local-event" || reason === "editor-change")
+      ? [...this.dirty.entries()].filter(([, version]) => version <= startVersion).map(([key]) => key)
+      : [];
+    const useLocalIncremental = !useRemoteIncremental && localIncrementalKeys.length > 0;
     let cycle: ReturnType<SchedulerDependencies["captureCycle"]> | undefined;
     const cycleStartedAt = Date.now();
     this.lastCycleStartedAt = cycleStartedAt; this.lastCycleReason = reason; this.lastHandshakeStart = undefined; this.lastConfirmation = undefined; this.lastCycleRemoteMutation = false;
-    this.dependencies.debug?.(`cycle start reason=${reason} generation=${generation}`);
+    const cycleMode = useRemoteIncremental ? "incremental" : useLocalIncremental ? "local-incremental" : "full-reconcile";
+    this.dependencies.debug?.(`cycle start reason=${reason} mode=${cycleMode} remoteGeneration=${incremental?.generation ?? "n/a"} localPaths=${localIncrementalKeys.length} incrementalStateTrusted=${this.incrementalStateTrusted}`);
     try {
       cycle = this.dependencies.captureCycle();
       if (this.shouldStop(generation)) halted = true;
       if (!halted) {
-        // The opening generation boundary is captured before any remote observation. It is only
+        // The opening generation boundary is captured before any complete remote observation. It is only
         // attempted when a remote signal actually exists, so an ordinary local-only cycle pays no
         // extra round trip for a window it was never asked to prove.
-        const openingHandshakeStartedAt = Date.now();
-        await this.captureHandshakeStart(handshake);
-        if (handshake.start !== undefined || handshake.startFailed) this.dependencies.debug?.(`cycle gateway-start durationMs=${Date.now() - openingHandshakeStartedAt}`);
-        const localScanStartedAt = Date.now();
-        const local = await cycle.scanLocal();
-        this.dependencies.debug?.(`cycle local-scan entries=${local.size} durationMs=${Date.now() - localScanStartedAt}`);
-        const remoteScanStartedAt = Date.now();
-        const [remote, stored] = await Promise.all([cycle.scanRemote(), cycle.loadPrevious()]);
-        this.dependencies.debug?.(`cycle remote-scan entries=${remote.size} previous-stored=${stored.size} durationMs=${Date.now() - remoteScanStartedAt}`);
+        let local: Map<string, LocalEntry>; let remote: Map<string, import("../sync/types").RemoteEntry>; let stored: Map<string, import("../sync/types").PreviousEntry>;
+        if (useRemoteIncremental && incremental && cycle.incrementalObservations) {
+          const startedAt = Date.now();
+          ({ local, remote, previous: stored } = await cycle.incrementalObservations(incremental.changes));
+          this.dependencies.debug?.(`incremental observations changes=${incremental.changes.length} entries=${remote.size} durationMs=${Date.now() - startedAt}`);
+        } else if (useLocalIncremental && cycle.localIncrementalObservations) {
+          const startedAt = Date.now();
+          ({ local, remote, previous: stored } = await cycle.localIncrementalObservations(localIncrementalKeys));
+          this.dependencies.debug?.(`local incremental observations paths=${localIncrementalKeys.length} entries=${remote.size} durationMs=${Date.now() - startedAt}`);
+        } else {
+          const openingHandshakeStartedAt = Date.now();
+          await this.captureHandshakeStart(handshake);
+          if (handshake.start !== undefined || handshake.startFailed) this.dependencies.debug?.(`cycle gateway-start durationMs=${Date.now() - openingHandshakeStartedAt}`);
+          const localScanStartedAt = Date.now();
+          local = await cycle.scanLocal();
+          this.dependencies.debug?.(`cycle local-scan entries=${local.size} durationMs=${Date.now() - localScanStartedAt}`);
+          const remoteScanStartedAt = Date.now();
+          [remote, stored] = await Promise.all([cycle.scanRemote(), cycle.loadPrevious()]);
+          this.dependencies.debug?.(`cycle remote-scan entries=${remote.size} previous-stored=${stored.size} durationMs=${Date.now() - remoteScanStartedAt}`);
+        }
         if (this.shouldStop(generation)) halted = true;
         if (!halted) {
-          const observations = { local, remote, previous: cycle.filterPrevious(stored) };
+          const observations = { local, remote, previous: useRemoteIncremental || useLocalIncremental ? stored : cycle.filterPrevious(stored) };
           const plan = cycle.buildPlan(local, remote, observations.previous);
           if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict"), observations));
           const planCounts = new Map<string, number>();
@@ -160,6 +193,10 @@ export class SyncScheduler {
             if (result.status === "stale" || result.status === "partial") stale = true;
             const mutation = observeRemoteMutation(operation, result);
             if (mutation === "confirmed" || (mutation === "possible" && remoteMutation !== "confirmed")) remoteMutation = mutation;
+            if (mutation) {
+              const change = remoteChangeForOperation(operation);
+              if (change) remoteChanges.push(change);
+            }
             // A resolution that actually applied is retired here, once, outside the planner: the
             // conflict it described no longer exists, and keeping its intent would let a stale decision
             // be replayed later.
@@ -199,13 +236,21 @@ export class SyncScheduler {
     let outcome: ConfirmationOutcome = { kind: "not-requested" };
     const confirmationStartedAt = Date.now();
     try {
-      outcome = await this.finishGenerationHandshake(handshake, { halted, counts, stale, remoteMutation });
+      if (useRemoteIncremental && incremental) {
+        const complete = isRemoteObservationComplete({ counts, stale, halted });
+        if (complete) {
+          await this.dependencies.remoteChange?.confirmReconciled(incremental.generation);
+          outcome = { kind: "confirmed", generation: incremental.generation };
+        } else outcome = { kind: "observation-incomplete" };
+      } else outcome = await this.finishGenerationHandshake(handshake, { halted, counts, stale, remoteMutation, remoteChanges });
       failure = applyConfirmationFailure(outcome, failure);
     } catch {
       outcome = { kind: "notify-failed" };
       if (failure === undefined) failure = "retryable";
     }
     this.lastConfirmation = outcome.kind;
+    if (!useRemoteIncremental && outcome.kind === "confirmed") { this.incrementalStateTrusted = true; this.pendingRemoteChanges.length = 0; }
+    if (useRemoteIncremental && outcome.kind !== "confirmed" && incremental) this.pendingRemoteChanges.unshift(incremental);
     if (outcome.kind !== "not-requested") this.dependencies.debug?.(`cycle gateway-end outcome=${outcome.kind} durationMs=${Date.now() - confirmationStartedAt}`);
 
     this.lastCycleFinishedAt = Date.now(); this.lastResultCounts = counts; this.lastFailureClass = failure;
@@ -273,14 +318,14 @@ export class SyncScheduler {
    * re-listing forever without any external change. `stale`, `unresolved`, `failed`, and a missing
    * boundary are the cases where the window genuinely may not have seen the truth.
    */
-  private async finishGenerationHandshake(handshake: RemoteGenerationHandshake, state: { halted: boolean; counts: ResultCounts; stale: boolean; remoteMutation: CycleRemoteMutation | undefined }): Promise<ConfirmationOutcome> {
+  private async finishGenerationHandshake(handshake: RemoteGenerationHandshake, state: { halted: boolean; counts: ResultCounts; stale: boolean; remoteMutation: CycleRemoteMutation | undefined; remoteChanges: RemoteChange[] }): Promise<ConfirmationOutcome> {
     const remote = this.dependencies.remoteChange;
     const outcome = await this.confirmGeneration(handshake, state);
     if (remote && state.remoteMutation !== undefined) {
       // Writer notification, coalesced to one call per cycle and issued once the boundary is final.
       // Notification can neither roll back a committed write nor reclassify any operation result.
       try {
-        const notified = await remote.notifyRemoteDirty();
+        const notified = await remote.notifyRemoteDirty(state.remoteChanges);
         if (!notified.ok) this.dependencies.debug?.(`gateway notify failed kind=${notified.kind}`);
       } catch { this.dependencies.debug?.("gateway notify failed kind=transport"); }
     }
@@ -317,6 +362,9 @@ export class SyncScheduler {
     if (this.configGeneration !== generation) { this.state = "idle"; this.requestReconcile("config-change"); return; }
     if (failure === "auth") { this.clearTimer("debounce"); this.clearTimer("retry"); this.state = "blocked-by-auth"; this.publish(); return; }
     if (!this.dependencies.visible()) { this.state = "idle"; this.publish(); return; }
+    // A foreground recovery is a correctness boundary after a background suspension. It must not
+    // wait behind editor debounce, even when an executor-owned or user edit event also arrived.
+    if (rerunReason === "foreground-resume") { this.pendingReason = rerunReason; this.scheduleDebounce(0); return; }
     if (localDirty) { this.retryDelay = RETRY_INITIAL; this.pendingReason = "local-event"; this.scheduleRerun(); return; }
     // A Gateway announcement (including our own just-confirmed R2 write) must be observed again,
     // but it has no unstable editor buffer to protect. Run its confirmation window immediately.
@@ -335,6 +383,12 @@ export class SyncScheduler {
     this.state = "idle"; this.publish();
   }
   private publish(): void { this.dependencies.onStatus?.(this.state, this.lastResultCounts); }
+}
+
+function remoteChangeForOperation(operation: SyncOperation): RemoteChange | undefined {
+  if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") return { op: "delete", path: operation.key };
+  if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") return { op: "put", path: operation.key };
+  return undefined;
 }
 
 /**

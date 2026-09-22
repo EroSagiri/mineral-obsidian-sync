@@ -3,8 +3,8 @@ import type R2PersonalSyncPlugin from "./main";
 import { R2Configuration } from "./remote/r2-client";
 import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings } from "./gateway/types";
 
-export interface R2SyncSettings extends R2Configuration, GatewaySettings { debugLogging: boolean; ignoredPaths: string[]; }
-export const DEFAULT_SETTINGS: R2SyncSettings = { ...DEFAULT_GATEWAY_SETTINGS, endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "", debugLogging: false, ignoredPaths: [] };
+export interface R2SyncSettings extends R2Configuration, GatewaySettings { debugLogging: boolean; ignoredPaths: string[]; integrityReconcileIntervalMinutes: number; }
+export const DEFAULT_SETTINGS: R2SyncSettings = { ...DEFAULT_GATEWAY_SETTINGS, endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "", debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20 };
 
 export class R2SyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: R2PersonalSyncPlugin) { super(app, plugin); }
@@ -37,6 +37,11 @@ export class R2SyncSettingTab extends PluginSettingTab {
     text("Gateway endpoint", "Example: https://mineral-sync-gateway.<subdomain>.workers.dev", "gatewayEndpoint");
     text("Gateway token", "The Gateway bearer secret. Stored locally; never logged and never placed in a URL.", "gatewayToken", true);
     new Setting(containerEl).setName("Gateway status").setDesc(this.plugin.gatewayStatusText());
+    new Setting(containerEl).setName("Integrity reconcile interval").setDesc("While the app is in the foreground, run a full R2 and tombstone verification at this interval (10–30 minutes). Foreground resume always verifies immediately.").addText((input) => {
+      input.setValue(String(this.plugin.settings.integrityReconcileIntervalMinutes)).setPlaceholder("20");
+      input.inputEl.type = "number";
+      input.onChange(async (value) => { this.plugin.settings.integrityReconcileIntervalMinutes = Math.max(10, Math.min(30, Number.parseInt(value, 10) || 20)); await this.plugin.saveSettings(); });
+    });
     new Setting(containerEl).setName("Test Connection").setDesc("Runs a read-only R2 ListObjectsV2 request.").addButton((button) => button.setButtonText("Test Connection").onClick(async () => this.plugin.testConnection()));
     new Setting(containerEl).setName("Inspect Sync State").setDesc("Scans metadata, safely verifies ambiguous equal-size pairs, and records only verified-identical initial baselines. It never writes local files or R2 objects.").addButton((button) => button.setButtonText("Inspect").setCta().onClick(async () => this.plugin.inspectSyncState()));
   }

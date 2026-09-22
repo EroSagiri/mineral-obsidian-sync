@@ -8,8 +8,8 @@ import { join } from "node:path";
  * This is enforced as a source audit rather than a behavioral test because the failure it guards
  * against is an *addition*: a future change that adds a periodic R2 LIST to compensate for a broken
  * socket would pass every behavioral test while quietly turning the plugin into a poller. The only
- * permitted recurring timer in the whole plugin is the Android local metadata probe, which reads the
- * local adapter and never the network.
+ * permitted recurring timers are the Android local metadata probe and the explicitly named,
+ * foreground-only integrity verification requested by the sync contract.
  */
 
 function sourceFiles(directory: string): string[] {
@@ -23,14 +23,14 @@ function sourceFiles(directory: string): string[] {
 describe("no desktop remote polling", () => {
   const files = sourceFiles(join(process.cwd(), "src"));
 
-  it("has exactly one recurring interval, and it is the Android local metadata probe", () => {
+  it("has only the Android local probe and foreground integrity verification intervals", () => {
     const intervalSites = files.flatMap((path) => {
       const text = readFileSync(path, "utf8");
       const matches = [...text.matchAll(/setInterval\(/g)];
       return matches.map(() => path.replace(`${process.cwd()}\\`, "").replace(/\\/g, "/"));
     });
-    expect(intervalSites).toHaveLength(1);
-    expect(intervalSites[0]).toContain("main.ts");
+    expect(intervalSites).toHaveLength(2);
+    expect(intervalSites.every((path) => path.includes("main.ts"))).toBe(true);
     const main = readFileSync(join(process.cwd(), "src", "main.ts"), "utf8");
     // The method body, not the call site inside onLayoutReady.
     const definition = main.lastIndexOf("private registerAndroidLocalDriftDetector");
@@ -39,6 +39,11 @@ describe("no desktop remote polling", () => {
     expect(intervalBlock).toContain("Platform.isAndroidApp");
     expect(intervalBlock).toContain("scanLocalAdapterMetadata");
     expect(intervalBlock).not.toContain("scanRemote");
+    const integrity = main.lastIndexOf("private maybeRequestIntegrityReconcile");
+    expect(integrity).toBeGreaterThan(-1);
+    const integrityBlock = main.slice(integrity, integrity + 700);
+    expect(integrityBlock).toContain('document.visibilityState === "hidden"');
+    expect(integrityBlock).toContain('requestReconcile("integrity-check")');
   });
 
   it("never lists R2 from the gateway layer", () => {

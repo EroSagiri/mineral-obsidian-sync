@@ -117,6 +117,23 @@ describe("SyncScheduler", () => {
     expect(timers.delays()).toEqual([0]);
   });
 
+  it("uses only exact local observations for coalesced local paths", async () => {
+    let fullRemoteScans = 0; let fullLocalScans = 0; const executed: string[] = []; let observed: string[] = [];
+    const { scheduler, timers } = setup(() => ({
+      ...base([upload("note.md")], async (operation) => { executed.push(operation.key); return { status: "applied", key: operation.key }; }),
+      scanLocal: () => { fullLocalScans++; return new Map(); },
+      scanRemote: async () => { fullRemoteScans++; return new Map(); },
+      localIncrementalObservations: async (keys) => { observed = keys; return { local: new Map([["note.md", { key: "note.md", size: 7, mtime: 1 }]]), remote: new Map(), previous: new Map() }; },
+    }));
+    scheduler.markLocalPaths(["note.md"], () => false);
+    scheduler.markLocalPaths(["note.md"], () => false);
+    timers.fire(1200); await flush();
+    expect(observed).toEqual(["note.md"]);
+    expect(fullLocalScans).toBe(0);
+    expect(fullRemoteScans).toBe(0);
+    expect(executed).toEqual(["note.md"]);
+  });
+
   it("uses immediate stale replan only without local dirtiness", async () => {
     let cycle = 0; const { scheduler, timers } = setup(() => base(cycle++ === 0 ? [upload("a.md")] : [], async (operation) => ({ status: "stale", key: operation.key, reason: "local-changed" })));
     scheduler.requestReconcile("startup"); timers.fire(); await flush(); expect(timers.delays()).toEqual([0]); timers.fire(0); await flush(); expect(cycle).toBe(2);
@@ -136,7 +153,7 @@ describe("SyncScheduler", () => {
     let release!: () => void; const pending = new Promise<void>((resolve) => { release = resolve; }); const started: string[] = [];
     const env = setup(() => base([upload("a.md"), upload("b.md"), upload("c.md")], async (operation) => { started.push(operation.key); if (operation.key === "b.md") await pending; return { status: "applied", key: operation.key }; }));
     env.scheduler.requestReconcile("startup"); env.timers.fire(); await flush(); env.hide(); release(); await flush();
-    expect(started).toEqual(["a.md", "b.md"]); env.show(); expect(env.timers.delays()).toEqual([800]);
+    expect(started).toEqual(["a.md", "b.md"]); env.show(); expect(env.timers.delays()).toEqual([0]);
   });
 
   it("treats auth as cycle-global, retryable outcomes as exponential backoff, and stable failures as quiet", async () => {

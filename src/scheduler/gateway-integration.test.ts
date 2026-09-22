@@ -299,6 +299,28 @@ describe("remote observation completeness", () => {
 });
 
 describe("remote-change triggering", () => {
+  it("uses exact incremental observations for one contiguous path without another R2 list", async () => {
+    let fullScans = 0; let incremental = 0;
+    const harness = setup(() => ({ ...base([]), scanRemote: async () => { fullScans++; return new Map(); }, incrementalObservations: async () => { incremental++; return { local: new Map(), remote: new Map(), previous: new Map() }; } }), true);
+    harness.remote!.announce("1"); harness.remote!.script("1", "1");
+    harness.scheduler.requestReconcile("remote-change"); harness.timers.fire(0); await flush();
+    expect(fullScans).toBe(1);
+    harness.remote!.announce("2");
+    harness.scheduler.requestRemoteChange("2", [{ op: "put", path: "notes/one.md", etag: "e2", size: 1, modified: "2026-09-22T00:00:00.000Z" }]);
+    harness.timers.fire(0); await flush();
+    expect(incremental).toBe(1);
+    expect(fullScans).toBe(1);
+    expect(harness.remote!.confirmCalls).toEqual(["1", "2"]);
+  });
+
+  it("falls back to a full observation on a generation gap", async () => {
+    let fullScans = 0; let incremental = 0;
+    const harness = setup(() => ({ ...base([]), scanRemote: async () => { fullScans++; return new Map(); }, incrementalObservations: async () => { incremental++; return { local: new Map(), remote: new Map(), previous: new Map() }; } }), true);
+    harness.remote!.announce("1"); harness.remote!.script("1", "1"); harness.scheduler.requestReconcile("remote-change"); harness.timers.fire(0); await flush();
+    harness.remote!.announce("3"); harness.remote!.script("3", "3"); harness.scheduler.requestRemoteChange("3", [{ op: "put", path: "notes/gap.md" }]); harness.timers.fire(0); await flush();
+    expect(incremental).toBe(0);
+    expect(fullScans).toBe(2);
+  });
   it("coalesces a burst of announcements into one cycle", async () => {
     let cycles = 0;
     const harness = setup(() => { cycles++; return base([]); }, true);

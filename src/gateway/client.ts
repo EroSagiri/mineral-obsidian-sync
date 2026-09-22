@@ -14,6 +14,7 @@ import {
   parseGenerationCursor,
 } from "@mineral/sync-core/sync-change";
 import type { RemoteGeneration, RemoteGenerationCursor } from "@mineral/sync-core/sync-change";
+import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import { GatewayRequestError } from "./errors";
 import type { GatewayErrorKind } from "./errors";
 import type { GatewayCursorStore, GatewayConnectionConfig } from "./types";
@@ -57,7 +58,7 @@ export type GatewayClientDiagnostics = {
 
 export interface GatewayClientHooks {
   /** A valid generation was announced (snapshot, notification, or our own mark). */
-  onAnnounced(generation: RemoteGeneration, source: "snapshot" | "notification" | "http"): void;
+  onAnnounced(generation: RemoteGeneration, source: "snapshot" | "notification" | "http", changes?: RemoteChange[]): void;
   onStatusChanged?(): void;
 }
 
@@ -116,6 +117,9 @@ export class GatewayClient {
   lastReconciled(): RemoteGeneration { return this.cursor.lastReconciledGeneration; }
   connectionState(): GatewayConnectionState { return this.state; }
   currentChannel(): string | undefined { return this.channel; }
+  canApplyIncrementally(generation: RemoteGeneration): boolean {
+    return this.visible && compareRemoteGeneration(generation, this.cursor.lastReconciledGeneration) === 1 && BigInt(generation) === BigInt(this.cursor.lastReconciledGeneration) + 1n;
+  }
 
   /**
    * A control-plane read. A failure is reported, never thrown into a caller doing data-plane work,
@@ -142,7 +146,7 @@ export class GatewayClient {
    * already succeeded (or already failed) before this runs, and a control-plane outage is not a
    * write failure. There is no retry here — delivery robustness is a Queue's job, not this client's.
    */
-  async markRemoteDirty(): Promise<{ ok: true; generation: RemoteGeneration } | { ok: false; kind: GatewayErrorKind }> {
+  async markRemoteDirty(changes?: RemoteChange[]): Promise<{ ok: true; generation: RemoteGeneration } | { ok: false; kind: GatewayErrorKind }> {
     const channel = this.channel;
     if (!this.settings().enabled) return { ok: false, kind: "misconfigured" };
     if (!channel) return { ok: false, kind: "misconfigured" };
@@ -151,7 +155,7 @@ export class GatewayClient {
         url: `${baseUrl(this.settings().endpoint)}/v1/channels/${channel}/dirty`,
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ source: "obsidian", kind: "upsert" }),
+        body: JSON.stringify({ source: "obsidian", kind: "upsert", ...(changes?.length ? { changes } : {}) }),
         token: this.settings().token,
         timeoutMs: 15000,
       });
@@ -162,7 +166,7 @@ export class GatewayClient {
       this.lastErrorKind = undefined;
       // Our own advance is an announcement, not a confirmation: the cycle that caused it never
       // observed the generation it created, so `lastReconciled` must not move here.
-      this.announce(parsed.generation, "http");
+      this.announce(parsed.generation, "http", changes);
       return { ok: true, generation: parsed.generation };
     } catch (error) {
       return { ok: false, kind: this.fail(error instanceof GatewayRequestError ? error.kind : "transport") };
@@ -213,12 +217,12 @@ export class GatewayClient {
     await this.openSocketIfPossible();
   }
 
-  private announce(generation: RemoteGeneration, source: "snapshot" | "notification" | "http"): void {
+  private announce(generation: RemoteGeneration, source: "snapshot" | "notification" | "http", changes?: RemoteChange[]): void {
     const advanced = compareRemoteGeneration(generation, this.cursor.highestAnnouncedGeneration) > 0;
     this.cursor = advanceAnnouncedGeneration(this.cursor, generation);
     if (!advanced) return;
     this.dependencies.debug?.(`gateway announced generation=${generation} source=${source} pending=${isRemoteReconcilePending(this.cursor)}`);
-    this.hooks.onAnnounced(generation, source);
+    this.hooks.onAnnounced(generation, source, changes);
   }
 
   /** The single place `lastReconciledGeneration` can move. Only ever called after a proven window. */
@@ -278,7 +282,7 @@ export class GatewayClient {
       this.dependencies.debug?.("gateway socket frame rejected");
       return;
     }
-    this.announce(message.generation, message.type === "current-generation" ? "snapshot" : "notification");
+    this.announce(message.generation, message.type === "current-generation" ? "snapshot" : "notification", message.type === "remote-change" ? message.changes : undefined);
   }
 
   private async fetchTicket(channel: string): Promise<string | undefined> {
