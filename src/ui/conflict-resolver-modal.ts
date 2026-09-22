@@ -143,8 +143,10 @@ export class ConflictResolverModal extends Modal {
       expectedRemoteETag: record.observedRemoteETag,
       createdAt: Date.now(),
     };
-    if (type === "merged" && this.draft) intent.merged = await mergedContentOf(this.draft.text);
-    try { await this.dependencies.propose(intent); }
+    try {
+      if (type === "merged" && this.draft) intent.merged = await mergedContentOf(this.draft.text);
+      await this.dependencies.propose(intent);
+    }
     catch { new Notice("Mineral Sync: the resolution could not be recorded."); return; }
     this.dependencies.debug?.(`conflict resolution requested type=${type} path-hash=${shortConflictId(record.conflictId)}`);
     new Notice("Mineral Sync: resolution recorded. It will be applied on the next reconciliation.");
