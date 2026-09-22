@@ -24,6 +24,15 @@ function vaultOf(files: string[] = [], folders: string[] = []) {
       folderSet.add(path);
       return { path };
     },
+    adapter: {
+      exists: async (path: string): Promise<boolean> => folderSet.has(path) || fileSet.has(path),
+      mkdir: async (path: string): Promise<void> => {
+        if (folderSet.has(path) || fileSet.has(path)) throw new Error(`already exists: ${path}`);
+        const parent = path.split("/").slice(0, -1).join("/");
+        if (parent && !folderSet.has(parent)) throw new Error(`ENOENT: ${path}`);
+        folderSet.add(path);
+      },
+    },
   };
 }
 
@@ -60,8 +69,15 @@ describe("ensureParentFolders", () => {
     expect([...vault.fileSet]).toEqual(["a/b"]);
   });
 
-  it("reports a folder-create failure that leaves the path unusable", async () => {
-    const vault = { ...vaultOf(), createFolder: async () => { throw new Error("EACCES: permission denied"); } };
+  it("falls back to adapter.mkdir when createFolder fails", async () => {
+    const vault = vaultOf();
+    const fallback = { ...vault, createFolder: async () => { throw new Error("EACCES: permission denied"); } };
+    await expect(ensureParentFolders(asVault(fallback), "a/b/note.md")).resolves.toEqual({ ok: true, created: ["a", "a/b"] });
+    expect([...vault.folderSet].sort()).toEqual(["a", "a/b"]);
+  });
+
+  it("reports a folder-create failure only when both Vault and adapter creation fail", async () => {
+    const vault = { ...vaultOf(), createFolder: async () => { throw new Error("EACCES: permission denied"); }, adapter: { exists: async () => false, mkdir: async () => { throw new Error("EACCES: permission denied"); } } };
     await expect(ensureParentFolders(asVault(vault), "a/note.md")).resolves.toMatchObject({ ok: false, reason: "folder-create-failed", path: "a" });
   });
 
@@ -85,6 +101,10 @@ describe("ensureParentFolders", () => {
         if (path === "a/b") throw new Error("EACCES: permission denied");
         vault.folderSet.add(path);
         return { path };
+      },
+      adapter: {
+        exists: async (path: string) => vault.folderSet.has(path) || vault.fileSet.has(path),
+        mkdir: async (path: string) => { if (path === "a/b") throw new Error("EACCES: permission denied"); vault.folderSet.add(path); },
       },
     };
     await expect(ensureParentFolders(asVault(partial), "a/b/note.md")).resolves.toMatchObject({ ok: false, reason: "folder-create-failed", path: "a/b" });

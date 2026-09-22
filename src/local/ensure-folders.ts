@@ -34,6 +34,10 @@ function occupied(vault: Vault, path: string): boolean {
   return fileAt(vault, path) || vault.getAbstractFileByPath(path) !== null;
 }
 
+async function adapterExists(vault: Vault, path: string): Promise<boolean> {
+  try { return await vault.adapter.exists(path); } catch { return false; }
+}
+
 function parentSegments(filePath: string): string[] {
   const segments = filePath.split("/").filter((segment) => segment.length > 0);
   segments.pop();
@@ -50,15 +54,19 @@ export async function ensureParentFolders(vault: Vault, filePath: string): Promi
     if (fileAt(vault, current)) return { ok: false, reason: "parent-path-is-file", path: current, error: `Vault path "${current}" is a file, not a folder` };
     if (occupied(vault, current)) continue;
 
-    try {
-      await vault.createFolder(current);
-    } catch (error) {
-      // Another writer may have won the race between the check and the create.
-      if (fileAt(vault, current)) return { ok: false, reason: "parent-path-is-file", path: current, error: `Vault path "${current}" is a file, not a folder` };
-      if (!occupied(vault, current)) return { ok: false, reason: "folder-create-failed", path: current, error: `could not create the Vault folder "${current}": ${errorText(error)}` };
-      continue;
-    }
-    created.push(current);
+    let failure: unknown;
+    let createdNow = false;
+    try { await vault.createFolder(current); createdNow = true; } catch (error) { failure = error; }
+    // createFolder may report an already-created folder before the Vault index catches up.
+    if (fileAt(vault, current)) return { ok: false, reason: "parent-path-is-file", path: current, error: `Vault path "${current}" is a file, not a folder` };
+    if (occupied(vault, current) || await adapterExists(vault, current)) { if (createdNow) created.push(current); continue; }
+
+    // The real Vault test harness already uses this fallback: some adapter-backed Vaults reject
+    // createFolder while their filesystem adapter can safely create the same explicit segment.
+    try { await vault.adapter.mkdir(current); createdNow = true; } catch (error) { failure ??= error; }
+    if (fileAt(vault, current)) return { ok: false, reason: "parent-path-is-file", path: current, error: `Vault path "${current}" is a file, not a folder` };
+    if (occupied(vault, current) || await adapterExists(vault, current)) { if (createdNow) created.push(current); continue; }
+    return { ok: false, reason: "folder-create-failed", path: current, error: `could not create the Vault folder "${current}": ${errorText(failure)}` };
   }
 
   return { ok: true, created };
