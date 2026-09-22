@@ -1,7 +1,7 @@
 import { RemoteHttpError, RemoteTransportError } from "../remote/errors";
 import { canonicalKey } from "../sync/path";
 import type { OperationResult } from "../sync/executor";
-import type { SyncOperation } from "../sync/types";
+import type { LocalEntry, SyncOperation } from "../sync/types";
 import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
 
 const LOCAL_DEBOUNCE = 1200;
@@ -26,6 +26,8 @@ export class SyncScheduler {
   private retryDelay = RETRY_INITIAL;
   private pendingReason?: ReconcileReason;
   private rerunRequested = false;
+  /** A remote announcement during a cycle needs another observation, but is not local typing. */
+  private rerunReason?: ReconcileReason;
   private lastCycleStartedAt?: number;
   private lastCycleFinishedAt?: number;
   private lastCycleReason?: ReconcileReason;
@@ -39,13 +41,13 @@ export class SyncScheduler {
 
   requestReconcile(reason: ReconcileReason): void {
     if (this.stopped || !this.dependencies.visible() || this.state === "blocked-by-auth") return;
+    if (this.state === "running") { this.rerunRequested = true; this.rerunReason = reason; return; }
     this.pendingReason = reason;
-    if (this.state === "running") { this.rerunRequested = true; return; }
     this.scheduleDebounce(this.delayFor(reason));
   }
 
   /** Accepts only relevant file paths; callers deliberately do not pass event kind into planning. */
-  markLocalPaths(paths: string[], ignores: (key: string) => boolean): boolean {
+  markLocalPaths(paths: string[], ignores: (key: string) => boolean, reason: "local-event" | "editor-change" = "local-event"): boolean {
     const keys = new Set<string>();
     for (const path of paths) {
       try { const key = canonicalKey(path); if (!ignores(key)) keys.add(key); } catch { /* malformed event paths carry no sync fact */ }
@@ -53,7 +55,7 @@ export class SyncScheduler {
     if (!keys.size) return false;
     const version = ++this.syncDirtyVersion;
     for (const key of keys) this.dirty.set(key, version);
-    this.requestReconcile("local-event");
+    this.requestReconcile(reason);
     return true;
   }
 
@@ -83,7 +85,8 @@ export class SyncScheduler {
   }
 
   private delayFor(reason: ReconcileReason): number {
-    if (reason === "manual" || reason === "conflict-manual-resolution") return 0;
+    if (reason === "manual" || reason === "conflict-manual-resolution" || reason === "remote-change") return 0;
+    if (reason === "editor-change") return 300;
     if (reason === "config-change") return CONFIG_DEBOUNCE;
     if (reason === "focus-resume") return FOCUS_DEBOUNCE;
     if (reason === "stale" || reason === "retry") return 0;
@@ -107,44 +110,54 @@ export class SyncScheduler {
   private async runCycle(): Promise<void> {
     if (this.stopped || !this.dependencies.visible() || this.state === "blocked-by-auth") return;
     const reason = this.pendingReason ?? "local-event";
-    this.pendingReason = undefined; this.rerunRequested = false; this.state = "running"; this.publish();
+    this.pendingReason = undefined; this.rerunRequested = false; this.rerunReason = undefined; this.state = "running"; this.publish();
     const startVersion = this.syncDirtyVersion;
     const generation = this.configGeneration;
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
     let remoteMutation: CycleRemoteMutation | undefined;
+    const localWrites = new Map<string, LocalEntry>();
     const resultDetails = new Map<string, number>();
     const conflicts: ConflictObservation[] = [];
     const handshake: RemoteGenerationHandshake = { startFailed: false, observationComplete: true };
-    this.lastCycleStartedAt = Date.now(); this.lastCycleReason = reason; this.lastHandshakeStart = undefined; this.lastConfirmation = undefined; this.lastCycleRemoteMutation = false;
+    let cycle: ReturnType<SchedulerDependencies["captureCycle"]> | undefined;
+    const cycleStartedAt = Date.now();
+    this.lastCycleStartedAt = cycleStartedAt; this.lastCycleReason = reason; this.lastHandshakeStart = undefined; this.lastConfirmation = undefined; this.lastCycleRemoteMutation = false;
     this.dependencies.debug?.(`cycle start reason=${reason} generation=${generation}`);
     try {
-      const cycle = this.dependencies.captureCycle();
+      cycle = this.dependencies.captureCycle();
       if (this.shouldStop(generation)) halted = true;
       if (!halted) {
         // The opening generation boundary is captured before any remote observation. It is only
         // attempted when a remote signal actually exists, so an ordinary local-only cycle pays no
         // extra round trip for a window it was never asked to prove.
+        const openingHandshakeStartedAt = Date.now();
         await this.captureHandshakeStart(handshake);
+        if (handshake.start !== undefined || handshake.startFailed) this.dependencies.debug?.(`cycle gateway-start durationMs=${Date.now() - openingHandshakeStartedAt}`);
+        const localScanStartedAt = Date.now();
         const local = await cycle.scanLocal();
-        this.dependencies.debug?.(`cycle local-scan entries=${local.size}`);
+        this.dependencies.debug?.(`cycle local-scan entries=${local.size} durationMs=${Date.now() - localScanStartedAt}`);
+        const remoteScanStartedAt = Date.now();
         const [remote, stored] = await Promise.all([cycle.scanRemote(), cycle.loadPrevious()]);
-        this.dependencies.debug?.(`cycle remote-scan entries=${remote.size} previous-stored=${stored.size}`);
+        this.dependencies.debug?.(`cycle remote-scan entries=${remote.size} previous-stored=${stored.size} durationMs=${Date.now() - remoteScanStartedAt}`);
         if (this.shouldStop(generation)) halted = true;
         if (!halted) {
-          const plan = cycle.buildPlan(local, remote, cycle.filterPrevious(stored));
-          if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict")));
+          const observations = { local, remote, previous: cycle.filterPrevious(stored) };
+          const plan = cycle.buildPlan(local, remote, observations.previous);
+          if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict"), observations));
           const planCounts = new Map<string, number>();
           for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);
           this.dependencies.debug?.(`cycle plan operations=${plan.operations.length} counts=${JSON.stringify(Object.fromEntries(planCounts))}`);
+          const operationsStartedAt = Date.now();
           for (const operation of plan.operations) {
             if (this.shouldStop(generation)) { halted = true; break; }
             // Each operation is executed exactly once and its result classified once: the loop and
             // the `finally` block must never disagree about what counts as a shortfall.
             const result = await this.apply(operation, cycle);
             counts[result.status]++;
+            if (result.status === "applied" && result.localWrite) localWrites.set(result.localWrite.key, result.localWrite);
             const detail = resultDetail(result);
             if (detail) resultDetails.set(detail, (resultDetails.get(detail) ?? 0) + 1);
-            if (result.status === "stale") stale = true;
+            if (result.status === "stale" || result.status === "partial") stale = true;
             const mutation = observeRemoteMutation(operation, result);
             if (mutation === "confirmed" || (mutation === "possible" && remoteMutation !== "confirmed")) remoteMutation = mutation;
             // A resolution that actually applied is retired here, once, outside the planner: the
@@ -165,6 +178,15 @@ export class SyncScheduler {
             else if (classified === "stable" && failure === undefined) failure = "stable";
             if (this.shouldStop(generation)) { halted = true; break; }
           }
+          this.dependencies.debug?.(`cycle operations durationMs=${Date.now() - operationsStartedAt}`);
+          if (!halted && cycle.observeConverged) {
+            const mergeBaseStartedAt = Date.now();
+            const noops = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "noop" }> => entry.type === "noop");
+            try {
+              await cycle.observeConverged(noops, observations);
+              this.dependencies.debug?.(`cycle merge-base-backfill noops=${noops.length} durationMs=${Date.now() - mergeBaseStartedAt}`);
+            } catch { this.dependencies.debug?.("merge-base backfill failed"); }
+          }
         }
       }
     } catch (error) {
@@ -175,6 +197,7 @@ export class SyncScheduler {
     // The exit handshake runs before the dirty-version pruning in `finally`, because a mismatched
     // window must schedule a follow-up on its own terms rather than through the debounce path.
     let outcome: ConfirmationOutcome = { kind: "not-requested" };
+    const confirmationStartedAt = Date.now();
     try {
       outcome = await this.finishGenerationHandshake(handshake, { halted, counts, stale, remoteMutation });
       failure = applyConfirmationFailure(outcome, failure);
@@ -183,6 +206,7 @@ export class SyncScheduler {
       if (failure === undefined) failure = "retryable";
     }
     this.lastConfirmation = outcome.kind;
+    if (outcome.kind !== "not-requested") this.dependencies.debug?.(`cycle gateway-end outcome=${outcome.kind} durationMs=${Date.now() - confirmationStartedAt}`);
 
     this.lastCycleFinishedAt = Date.now(); this.lastResultCounts = counts; this.lastFailureClass = failure;
     this.lastCycleRemoteMutation = remoteMutation !== undefined;
@@ -197,11 +221,21 @@ export class SyncScheduler {
       try { await this.dependencies.onConflicts(conflicts); }
       catch { this.dependencies.debug?.("conflict coordination failed"); }
     }
-    // No await occurs between comparison and pruning, so a later event cannot be swallowed.
+    // An executor-originated Vault write emits the same event as a user edit. Consume it only after
+    // rechecking its exact size/mtime; a later user/plugin write therefore remains dirty and reruns.
+    if (cycle?.localWriteStillMatches) {
+      for (const [key, written] of localWrites) {
+        const dirtyVersion = this.dirty.get(key);
+        if (dirtyVersion !== undefined && dirtyVersion > startVersion && await cycle.localWriteStillMatches(written)) this.dirty.delete(key);
+      }
+    }
+    // No await occurs between the version comparison and pruning, so a later event cannot be swallowed.
     for (const [key, version] of this.dirty) if (version <= startVersion) this.dirty.delete(key);
-    const localDirty = this.syncDirtyVersion > startVersion || this.rerunRequested || outcome.kind === "mismatch";
-    this.finishCycle(generation, failure, stale, localDirty, halted);
-    this.dependencies.debug?.(`cycle end counts=${JSON.stringify(counts)} details=${JSON.stringify(Object.fromEntries(resultDetails))} confirmation=${outcome.kind} mutation=${remoteMutation ?? "none"} dirty=${this.dirty.size}`);
+    const localDirty = [...this.dirty.values()].some((version) => version > startVersion);
+    const queuedRemoteReason = this.rerunRequested && this.rerunReason !== "local-event" && this.rerunReason !== "editor-change" ? this.rerunReason : undefined;
+    const remoteRerun = queuedRemoteReason ?? (outcome.kind === "mismatch" ? "remote-change" : undefined);
+    this.finishCycle(generation, failure, stale, localDirty, remoteRerun, halted);
+    this.dependencies.debug?.(`cycle end durationMs=${Date.now() - cycleStartedAt} counts=${JSON.stringify(counts)} details=${JSON.stringify(Object.fromEntries(resultDetails))} confirmation=${outcome.kind} mutation=${remoteMutation ?? "none"} dirty=${this.dirty.size}`);
   }
   private async apply(operation: SyncOperation, cycle: ReturnType<SchedulerDependencies["captureCycle"]>): Promise<OperationResult | { status: "noop" | "conflict" }> {
     if (operation.type === "noop") return { status: "noop" };
@@ -278,12 +312,15 @@ export class SyncScheduler {
     await remote.confirmReconciled(handshake.start);
     return { kind: "confirmed", generation: handshake.start };
   }
-  private finishCycle(generation: number, failure: FailureClass | undefined, stale: boolean, localDirty: boolean, _halted: boolean): void {
+  private finishCycle(generation: number, failure: FailureClass | undefined, stale: boolean, localDirty: boolean, rerunReason: ReconcileReason | undefined, _halted: boolean): void {
     if (this.stopped) { this.state = "idle"; this.publish(); return; }
     if (this.configGeneration !== generation) { this.state = "idle"; this.requestReconcile("config-change"); return; }
     if (failure === "auth") { this.clearTimer("debounce"); this.clearTimer("retry"); this.state = "blocked-by-auth"; this.publish(); return; }
     if (!this.dependencies.visible()) { this.state = "idle"; this.publish(); return; }
     if (localDirty) { this.retryDelay = RETRY_INITIAL; this.pendingReason = "local-event"; this.scheduleRerun(); return; }
+    // A Gateway announcement (including our own just-confirmed R2 write) must be observed again,
+    // but it has no unstable editor buffer to protect. Run its confirmation window immediately.
+    if (rerunReason) { this.pendingReason = rerunReason; this.scheduleDebounce(this.delayFor(rerunReason)); return; }
     if (failure === "retryable") {
       this.state = "idle"; const delay = this.retryDelay; this.retryDelay = Math.min(RETRY_MAX, this.retryDelay * 2);
       this.retryTimer = this.timers.set(delay, () => { this.retryTimer = undefined; this.requestReconcile("retry"); }); this.publish(); return;
@@ -312,13 +349,14 @@ export class SyncScheduler {
  *
  * - `stale` — an observation was proven wrong during execution, so a write was not attempted.
  * - `unresolved` — a PUT's outcome is unknown, so remote state may differ from the LIST.
+ * - `partial` — a confirmed R2 write exists, but its local counterpart changed before commit.
  * - `halted` — config/visibility/unload stopped the cycle before the loop reached its end, so the
  *   remote was never fully observed.
  */
 export function isRemoteObservationComplete(counts: { counts: ResultCounts; stale: boolean; halted: boolean }): boolean {
   if (counts.halted) return false;
   if (counts.stale) return false;
-  return counts.counts.unresolved === 0;
+  return counts.counts.unresolved === 0 && (counts.counts.partial ?? 0) === 0;
 }
 
 function applyConfirmationFailure(outcome: ConfirmationOutcome, failure: FailureClass | undefined): FailureClass | undefined {
@@ -333,15 +371,15 @@ function applyConfirmationFailure(outcome: ConfirmationOutcome, failure: Failure
  * needs the same wake-up. `resolve-keep-remote` writes only locally and must not notify.
  */
 export function observeRemoteMutation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): CycleRemoteMutation | undefined {
-  const writesRemote = operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged";
+  const writesRemote = operation.type === "upload" || operation.type === "delete-remote" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged" || operation.type === "resolve-accept-local-delete";
   if (!writesRemote) return undefined;
   if (result.status === "applied") return "confirmed";
   // An ambiguous PUT may or may not have landed. The executor's verdict stays `unresolved` and no
   // baseline is committed; an extra best-effort wake-up is what keeps a landed write from being
   // invisible to other devices.
   if (result.status === "unresolved" && result.reason === "ambiguous-put") return "possible";
-  // A `partial` resolution DID reach R2 — that is precisely what partial means — so other devices must
-  // still be woken even though this device could not finish its own half.
+  // A partial transfer DID reach R2, so other devices must still be woken even though this device
+  // could not finish its own local-baseline half.
   if (result.status === "partial" && result.reason === "remote-applied-local-changed") return "confirmed";
   // `stale` is decided before the conditional request, and a 4xx/blocked upload provably did not
   // change the remote, so none of them justifies waking other clients.
@@ -349,8 +387,8 @@ export function observeRemoteMutation(operation: SyncOperation, result: Operatio
 }
 
 /** Resolutions are the only operations carrying a conflict identity. */
-function isResolution(operation: SyncOperation): operation is Extract<SyncOperation, { type: "resolve-keep-local" | "resolve-keep-remote" | "resolve-merged" }> {
-  return operation.type === "resolve-keep-local" || operation.type === "resolve-keep-remote" || operation.type === "resolve-merged";
+function isResolution(operation: SyncOperation): operation is Extract<SyncOperation, { type: "resolve-keep-local" | "resolve-keep-remote" | "resolve-merged" | "resolve-accept-remote-delete" | "resolve-accept-local-delete" }> {
+  return operation.type === "resolve-keep-local" || operation.type === "resolve-keep-remote" || operation.type === "resolve-merged" || operation.type === "resolve-accept-remote-delete" || operation.type === "resolve-accept-local-delete";
 }
 
 function classify(result: OperationResult | { status: "noop" | "conflict" }): FailureClass | undefined {

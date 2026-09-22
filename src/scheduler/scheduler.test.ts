@@ -44,6 +44,15 @@ describe("SyncScheduler", () => {
     expect(cycles).toBe(1);
   });
 
+  it("uses a short debounce for an editor save while preserving the normal local-event debounce", async () => {
+    const { scheduler, timers } = setup(() => base([]));
+    scheduler.markLocalPaths(["note.md"], () => false, "editor-change");
+    expect(timers.delays()).toEqual([300]);
+    timers.fire(300); await flush();
+    scheduler.markLocalPaths(["note.md"], () => false);
+    expect(timers.delays()).toEqual([1200]);
+  });
+
   it("supports an asynchronous local metadata scan", async () => {
     let plannedSize: number | undefined;
     const { scheduler, timers } = setup(() => ({
@@ -72,11 +81,40 @@ describe("SyncScheduler", () => {
     timers.fire(); await flush(); expect(scheduler.diagnostics().pendingDirtyCount).toBe(0);
   });
 
-  it("accepts self-write events and converges through one follow-up full cycle", async () => {
+  it("suppresses an executor-owned local-write event only after its exact version is rechecked", async () => {
     let cycle = 0; let scheduler!: SyncScheduler;
-    const env = setup(() => base(cycle++ === 0 ? [upload("remote.md")] : [], async (operation) => { scheduler.markLocalPaths([operation.key], () => false); return { status: "applied", key: operation.key }; })); scheduler = env.scheduler;
+    const env = setup(() => ({ ...base(cycle++ === 0 ? [upload("remote.md")] : [], async (operation) => { scheduler.markLocalPaths([operation.key], () => false); return { status: "applied", key: operation.key, localWrite: { key: operation.key, size: 1, mtime: 2 } }; }), localWriteStillMatches: async () => true })); scheduler = env.scheduler;
     scheduler.requestReconcile("startup"); env.timers.fire(1200); await flush();
-    expect(env.timers.delays()).toEqual([1200]); env.timers.fire(1200); await flush(); expect(cycle).toBe(2);
+    expect(env.timers.delays()).toEqual([]); expect(cycle).toBe(1);
+  });
+
+  it("keeps a self-write event dirty when the local version moved again", async () => {
+    let scheduler!: SyncScheduler;
+    const env = setup(() => ({ ...base([upload("remote.md")], async (operation) => { scheduler.markLocalPaths([operation.key], () => false); return { status: "applied", key: operation.key, localWrite: { key: operation.key, size: 1, mtime: 2 } }; }), localWriteStillMatches: async () => false })); scheduler = env.scheduler;
+    scheduler.requestReconcile("startup"); env.timers.fire(1200); await flush();
+    expect(env.timers.delays()).toEqual([1200]);
+  });
+
+  it("runs a Gateway announcement received during a cycle immediately, while retaining local debounce", async () => {
+    let cycle = 0; let scheduler!: SyncScheduler;
+    const env = setup(() => ({ ...base([]), scanRemote: async () => {
+      cycle++;
+      if (cycle === 1) scheduler.requestReconcile("remote-change");
+      return new Map();
+    } }));
+    scheduler = env.scheduler;
+    scheduler.requestReconcile("startup"); env.timers.fire(); await flush();
+    expect(env.timers.delays()).toEqual([0]); env.timers.fire(0); await flush();
+    expect(cycle).toBe(2);
+
+    scheduler.markLocalPaths(["edited.md"], () => false); env.timers.fire(1200); await flush();
+    expect(env.timers.delays()).toEqual([]);
+  });
+
+  it("starts an idle remote announcement without the local-edit debounce", () => {
+    const { scheduler, timers } = setup(() => base([]));
+    scheduler.requestReconcile("remote-change");
+    expect(timers.delays()).toEqual([0]);
   });
 
   it("uses immediate stale replan only without local dirtiness", async () => {
@@ -113,6 +151,27 @@ describe("SyncScheduler", () => {
   it("surfaces blocked deletes and conflicts without preventing unrelated operations", async () => {
     const executed: string[] = []; const { scheduler, timers } = setup(() => base([{ type: "conflict", key: "a", conflict: "both-modified", reason: "test" }, { type: "delete-remote", key: "b", reason: "test" }, upload("c")], async (operation) => { executed.push(operation.key); return operation.type === "delete-remote" ? { status: "blocked", key: operation.key, reason: "deletion-not-supported-in-phase-2a" } : { status: "applied", key: operation.key }; }));
     scheduler.requestReconcile("startup"); timers.fire(); await flush(); expect(executed).toEqual(["b", "c"]); expect(scheduler.diagnostics().lastResultCounts).toMatchObject({ conflict: 1, blocked: 1, applied: 1 }); expect(timers.delays()).toEqual([]);
+  });
+
+  it("hands the exact planning observations to conflict handling and converged-base backfill", async () => {
+    const local = new Map([["a.md", { key: "a.md", size: 3, mtime: 20 }]]);
+    const remote = new Map([["a.md", { key: "a.md", size: 3, etag: "etag-2", lastModified: 2 }]]);
+    const previous = new Map([["a.md", { key: "a.md", local: { size: 2, mtime: 10 }, remote: { size: 2, etag: "etag-1" }, syncedAt: 1 }]]);
+    let conflictObservations: unknown;
+    const conflict = setup(() => ({
+      ...base([{ type: "conflict", key: "a.md", conflict: "both-modified", reason: "test" }]), scanLocal: () => local, scanRemote: async () => remote, loadPrevious: async () => previous,
+      observeConflicts: (_operations, observations) => { conflictObservations = observations; return []; },
+    }));
+    conflict.scheduler.requestReconcile("manual"); conflict.timers.fire(0); await flush();
+    expect(conflictObservations).toEqual({ local, remote, previous });
+
+    let convergedObservations: unknown;
+    const converged = setup(() => ({
+      ...base([{ type: "noop", key: "a.md", reason: "unchanged" }]), scanLocal: () => local, scanRemote: async () => remote, loadPrevious: async () => previous,
+      observeConverged: async (operations, observations) => { expect(operations).toMatchObject([{ type: "noop", key: "a.md" }]); convergedObservations = observations; },
+    }));
+    converged.scheduler.requestReconcile("manual"); converged.timers.fire(0); await flush();
+    expect(convergedObservations).toEqual({ local, remote, previous });
   });
 
   it("unload prevents the next operation after the in-flight one completes", async () => {

@@ -1,7 +1,7 @@
 import type { OperationResult } from "../sync/executor";
-import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
+import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
 
-export type ReconcileReason = "startup" | "manual" | "local-event" | "focus-resume" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
+export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
 export type SchedulerState = "idle" | "debouncing" | "running" | "rerun-pending" | "blocked-by-auth";
 export type FailureClass = "retryable" | "stable" | "auth";
 /**
@@ -31,12 +31,27 @@ export interface CycleDependencies {
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
   buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
   execute(operation: SyncOperation): Promise<OperationResult>;
+  /** Confirms an executor-originated Vault write has not been changed again before its event is ignored. */
+  localWriteStillMatches?(entry: LocalEntry): Promise<boolean>;
   /**
    * The identity inputs behind a conflicted key, gathered from the maps the planner already received.
    * This carries no content and performs no I/O: the coordinator reads content itself, after the
    * cycle, so a running plan is never mutated by conflict handling.
    */
-  observeConflicts?(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>): ConflictObservation[];
+  observeConflicts?(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, observations: {
+    local: Map<string, LocalEntry>;
+    remote: Map<string, RemoteEntry>;
+    previous: Map<string, PreviousEntry>;
+  }): ConflictObservation[];
+  /**
+   * Lets the application seed merge bases from files that this plan proved were already converged.
+   * This is observation-only bookkeeping; a conflict is never eligible for a backfilled base.
+   */
+  observeConverged?(operations: Array<Extract<SyncOperation, { type: "noop" }>>, observations: {
+    local: Map<string, LocalEntry>;
+    remote: Map<string, RemoteEntry>;
+    previous: Map<string, PreviousEntry>;
+  }): Promise<void>;
 }
 
 /**
@@ -81,6 +96,7 @@ export interface ConflictObservation {
   previous?: PreviousEntry;
   observedLocal?: LocalEntry;
   observedRemote?: RemoteEntry;
+  observedRemoteDeletion?: RemoteDeletionIdentity;
 }
 
 export type RemoteGenerationHandshake = {

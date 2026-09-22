@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
 import { scanLocal, scanLocalAdapterMetadata } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
@@ -21,13 +21,16 @@ import type { GatewayConfigState } from "./gateway/types";
 import { gatewayConnectionConfig } from "./gateway/types";
 import { deriveRemoteChangeChannel } from "@mineral/sync-core/channel";
 import { IndexedDbConflictStores } from "./conflict/stores";
-import { createMergeBaseRecorder } from "./conflict/merge-base";
+import { createMergeBaseRecorder, recordMergeBaseBatch, type MergeBaseInput } from "./conflict/merge-base";
 import { ConflictCoordinator } from "./conflict/coordinator";
 import { ConflictResolverModal } from "./ui/conflict-resolver-modal";
-import type { LocalEntry, PreviousEntry, RemoteEntry, RemoteIdentity, SyncOperation } from "./sync/types";
+import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
 
+type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
+
 const ANDROID_LOCAL_DRIFT_INTERVAL_MS = 15_000;
+const ANDROID_EDITOR_SAVE_DEBOUNCE_MS = 500;
 
 export default class R2PersonalSyncPlugin extends Plugin {
   settings: R2SyncSettings = { ...DEFAULT_SETTINGS };
@@ -42,6 +45,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private gatewayConfig: GatewayConfigState = { kind: "disabled" };
   private androidLocalSnapshot?: Map<string, LocalEntry>;
   private androidLocalDriftPollRunning = false;
+  /** One quiet-period save per edited path; Android can otherwise defer Vault modify until view close. */
+  private readonly androidEditorSaveTimers = new Map<string, number>();
   /** Conflict ids already announced, so a Notice is shown once per conflict rather than per cycle. */
   private readonly announcedConflicts = new Set<string>();
   private lastConflictCount = 0;
@@ -132,6 +137,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
   onunload(): void {
     this.activeAnalysis?.abort();
     this.scheduler?.stop();
+    for (const handle of this.androidEditorSaveTimers.values()) window.clearTimeout(handle);
+    this.androidEditorSaveTimers.clear();
     // Closing the socket and cancelling reconnect timers happens before any further work can start.
     this.gateway?.stop();
   }
@@ -208,7 +215,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
     if (state === "running") return this.setStatus("… syncing");
     if (state === "debouncing" || state === "rerun-pending") return this.setStatus("… pending");
     if (state === "blocked-by-auth") return this.setStatus("○ auth blocked");
-    if (counts.conflict) return this.setStatus(`! conflicts (${counts.conflict})`);
+    // A plan-level conflict is only a detection. The Resolve command can act only on the durable
+    // record that the coordinator established from it, so the status bar must never advertise a
+    // number the resolver cannot actually display.
+    if (this.lastConflictCount) return this.setStatus(`! conflicts (${this.lastConflictCount})`);
+    if (counts.conflict) return this.setStatus("○ conflict state unavailable");
     if (counts.unresolved || counts.failed) return this.setStatus("○ offline/error");
     this.setStatus("✓ idle");
   }
@@ -219,6 +230,44 @@ export default class R2PersonalSyncPlugin extends Plugin {
     // A deleted folder cannot be reliably distinguished after removal; treating it as dirty is the safe side.
     this.registerEvent(this.app.vault.on("delete", (file) => mark(file.path)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => { if (!(file instanceof TFolder)) this.scheduler?.markLocalPaths([oldPath, file.path], (key) => createVaultPathFilter(this.settings).ignores(key)); }));
+    if (Platform.isAndroidApp) {
+      this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
+        if (info instanceof MarkdownView && info.file) this.scheduleAndroidEditorSave(info);
+      }));
+    }
+  }
+
+  /**
+   * Obsidian Android can retain edits in the active MarkdownView until that view loses focus. Save
+   * the view after a short quiet period so the normal Vault event and normal sync pipeline can see
+   * it. The editor buffer is never uploaded directly: after save, SafeExecutor rereads stable Vault
+   * bytes and still applies the usual remote preconditions.
+   */
+  private scheduleAndroidEditorSave(view: MarkdownView): void {
+    const path = view.file?.path;
+    if (!path || createVaultPathFilter(this.settings).ignores(path)) return;
+    const previous = this.androidEditorSaveTimers.get(path);
+    if (previous !== undefined) window.clearTimeout(previous);
+    const handle = window.setTimeout(() => {
+      this.androidEditorSaveTimers.delete(path);
+      void this.flushAndroidEditorSave(view, path);
+    }, ANDROID_EDITOR_SAVE_DEBOUNCE_MS);
+    this.androidEditorSaveTimers.set(path, handle);
+  }
+
+  private async flushAndroidEditorSave(view: MarkdownView, path: string): Promise<void> {
+    if (document.visibilityState === "hidden" || view.file?.path !== path) return;
+    try {
+      await view.save();
+      // `save()` normally emits Vault modify. Mark explicitly as well so a mobile adapter that
+      // delays that event still gets the low-latency editor-change reconciliation.
+      this.scheduler?.markLocalPaths([path], (key) => createVaultPathFilter(this.settings).ignores(key), "editor-change");
+      this.debug("android editor-change saved");
+    } catch {
+      // A view may close or be replaced while its debounce is pending. The ordinary Vault listener
+      // remains the fallback; this must not turn an editor lifecycle race into a sync failure.
+      this.debug("android editor-change save failed");
+    }
   }
   /** Android foreground-only fallback for missed Vault events; it never schedules an unchanged vault. */
   private registerAndroidLocalDriftDetector(): void {
@@ -264,31 +313,60 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const filter = createVaultPathFilter(settings);
     const ignorePolicy = ignorePolicyFingerprint(settings);
     const identity = remoteIdentity(settings);
-    const client = new SignedR2ListClient(settings);
+    const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
     const channel = this.currentChannel();
     const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined);
     // Scanned once per cycle and shared by planning and conflict observation, so both see exactly the
     // same observations and no second scan can disagree with the planner's inputs.
-    let previousFiltered = new Map<string, PreviousEntry>();
     return {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
-      scanRemote: () => scanRemote(client, filter),
+      scanRemote: () => scanRemote(client, filter, (message) => this.debug(message)),
       loadPrevious: () => this.stateStore.loadAll(),
-      filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => {
-        previousFiltered = new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
-        return previousFiltered;
-      },
+      filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
       buildPlan: (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => buildSyncPlan(local, remote, previous, this.coordinator?.resolutions()),
       execute: (operation: Parameters<SafeExecutor["execute"]>[0]) => executor.execute(operation),
-      observeConflicts: (conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>) => this.conflictObservations(conflicts, previousFiltered),
+      localWriteStillMatches: async (entry: LocalEntry) => {
+        const observed = await this.app.vault.adapter.stat(entry.key);
+        return Boolean(observed && observed.size === entry.size && observed.mtime === entry.mtime);
+      },
+      observeConflicts: (conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, observations: CycleObservations) => this.conflictObservations(conflicts, observations.local, observations.remote, observations.previous),
+      observeConverged: (operations: Array<Extract<SyncOperation, { type: "noop" }>>, observations: CycleObservations) => this.recordConvergedMergeBases(operations, observations.local, observations.remote, observations.previous, channel),
     };
   }
 
   /** Gathers identity inputs for conflicted keys from the maps the planner already received. */
-  private conflictObservations(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, previous: Map<string, PreviousEntry>) {
-    return conflicts.map((conflict) => ({ key: conflict.key, previous: previous.get(conflict.key) }));
+  private conflictObservations(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): ConflictObservation[] {
+    const output: ConflictObservation[] = [];
+    for (const conflict of conflicts) {
+      const observedLocal = local.get(conflict.key), observedRemote = remote.get(conflict.key);
+      // Delete conflicts deliberately have an absent side. Preserve the effective deletion identity
+      // separately so an old resolver choice cannot apply after a path is recreated or re-deleted.
+      if (isRemoteDeleted(observedRemote)) { if (observedLocal) output.push({ key: conflict.key, previous: previous.get(conflict.key), observedLocal, observedRemoteDeletion: observedRemote.deleted }); }
+      else if (previous.has(conflict.key) && (observedLocal || observedRemote)) output.push({ key: conflict.key, previous: previous.get(conflict.key), observedLocal, observedRemote });
+    }
+    return output;
+  }
+
+  /**
+   * Backfills a merge base only after the planner proved the exact local/remote pair already
+   * converged. Conflicts are deliberately absent from this path: neither divergent side is a base.
+   */
+  private async recordConvergedMergeBases(operations: Array<Extract<SyncOperation, { type: "noop" }>>, local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>, channel: string | undefined): Promise<void> {
+    if (!channel) return;
+    const startedAt = Date.now();
+    const candidates: MergeBaseInput[] = [];
+    for (const operation of operations) {
+      const localVersion = local.get(operation.key), remoteVersion = remote.get(operation.key), baseline = previous.get(operation.key);
+      if (!localVersion || !remoteVersion || !baseline?.local || !baseline.remote?.etag) continue;
+      if (baseline.local.size !== localVersion.size || baseline.local.mtime !== localVersion.mtime || baseline.remote.etag !== remoteVersion.etag) continue;
+      candidates.push({ path: operation.key, baseline: { localVersion, remoteETag: remoteVersion.etag } });
+    }
+    const existing = await this.conflictStores.getMany(channel, candidates.map((candidate) => candidate.path));
+    const missing = candidates.filter((candidate) => !existing.has(candidate.path));
+    await recordMergeBaseBatch(this.app.vault, channel, this.conflictStores, missing);
+    this.debug(`merge-base candidates=${candidates.length} missing=${missing.length} durationMs=${Date.now() - startedAt}`);
   }
 
   /**
@@ -305,14 +383,40 @@ export default class R2PersonalSyncPlugin extends Plugin {
     return this.resolvedChannel;
   }
 
-  private openConflictResolver(): void {
+  private async openConflictResolver(): Promise<void> {
     const coordinator = this.coordinator;
     if (!coordinator) return;
+    // A status-bar count may have come from an earlier cycle. Re-observe before opening the modal
+    // so its contents are built from the same current local/remote/baseline facts as the count.
+    // This path is read-only except for conflict metadata and resolution proposals; it never writes
+    // a Vault file or an R2 object.
+    try { await this.refreshConflictsForResolver(); }
+    catch { this.debug("conflict resolver refresh failed"); }
     new ConflictResolverModal(this.app, {
       list: () => coordinator.list(),
       propose: (intent) => coordinator.propose(intent),
       debug: (message) => this.debug(message),
     }).open();
+  }
+
+  private async refreshConflictsForResolver(): Promise<void> {
+    const coordinator = this.coordinator;
+    if (!coordinator) return;
+    const channel = await this.resolveChannel();
+    if (!channel) return;
+    coordinator.setChannel(channel);
+    const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
+    const filter = createVaultPathFilter(settings);
+    const identity = remoteIdentity(settings);
+    const local = Platform.isAndroidApp ? await scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter);
+    const [remote, stored] = await Promise.all([scanRemote(new SignedR2ListClient(settings), filter), this.stateStore.loadAll()]);
+    const previous = new Map([...stored].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicyFingerprint(settings) && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
+    // Deliberately do not consume a pending intent here. The command is rebuilding user-visible
+    // observations; the scheduler remains the only place that executes the resolution.
+    const plan = buildSyncPlan(local, remote, previous);
+    const conflicts = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict");
+    await coordinator.handleConflicts(this.conflictObservations(conflicts, local, remote, previous));
+    await this.refreshConflictStatus();
   }
 
   /**

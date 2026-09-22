@@ -120,7 +120,7 @@ describe("resolve-keep-remote", () => {
     const saved = state(); const base = baseRecorder();
     let condition: unknown;
     const result = await new SafeExecutor(local as never, remote({ getObject: async (_key, options) => { condition = options; return textBytes("remote\n"); } }), saved, identity, "[]", undefined, base.recorder).execute(keepRemote());
-    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(result).toMatchObject({ status: "applied", key: "a.md", localWrite: { key: "a.md" } });
     expect(condition).toEqual({ ifMatch: "R" });
     expect(decode(local.files.get("a.md")!.bytes)).toBe("remote\n");
     expect(saved.entries).toHaveLength(1);
@@ -168,7 +168,7 @@ describe("resolve-merged", () => {
     const saved = state(); const base = baseRecorder();
     let putBody: ArrayBuffer | undefined; let condition: unknown;
     const result = await new SafeExecutor(local as never, remote({ putObject: async (_key, body, options) => { putBody = body; condition = options; return { size: 9, etag: "MERGED" }; } }), saved, identity, "[]", undefined, base.recorder).execute(merged("merged\n"));
-    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(result).toMatchObject({ status: "applied", key: "a.md", localWrite: { key: "a.md" } });
     expect(condition).toEqual({ ifMatch: "R" });
     expect(decode(putBody!)).toBe("merged\n");
     expect(decode(local.files.get("a.md")!.bytes)).toBe("merged\n");
@@ -223,7 +223,7 @@ describe("resolve-merged", () => {
     const stored = state(); const base = baseRecorder(); base.fail();
     const result = await new SafeExecutor(vault({ "a.md": [1, 2, 3] }) as never, remote({ putObject: async () => ({ size: 9, etag: "MERGED" }) }), stored, identity, "[]", undefined, base.recorder).execute(merged("merged\n"));
     // Losing a snapshot costs future merge ability, never this write's correctness.
-    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(result).toMatchObject({ status: "applied", key: "a.md", localWrite: { key: "a.md" } });
     expect(stored.entries).toHaveLength(1);
   });
 });
@@ -256,9 +256,9 @@ describe("merge base recording on ordinary transfers", () => {
 });
 
 describe("delete stays out of scope", () => {
-  it("still blocks delete-remote with a version-identity reason", async () => {
+  it("still blocks delete-remote when no exact version identity is supplied", async () => {
     const result = await new SafeExecutor(vault({}) as never, remote(), state(), identity, "[]").execute({ type: "delete-remote", key: "a.md", reason: "test" });
-    expect(result).toEqual({ status: "blocked", key: "a.md", reason: "remote-deletion-requires-version-identity" });
+    expect(result).toEqual({ status: "blocked", key: "a.md", reason: "missing-remote-etag" });
   });
 
   it("keeps delete-local recovery-first and unrelated to conflict resolution", async () => {

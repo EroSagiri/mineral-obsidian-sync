@@ -1,8 +1,9 @@
 import type { TFile, Vault } from "obsidian";
 import { ensureParentFolders } from "../local/ensure-folders";
-import { LocalFileChangedError, readStableLocalBytes } from "../local/read-local";
+import { LocalFileChangedError, readCurrentStableLocalBytes, readStableLocalBytes } from "../local/read-local";
 import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
+import { TOMBSTONE_PROTOCOL, type RemoteTombstone } from "../remote/tombstones";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, RemoteVersion, SyncOperation } from "./types";
 
@@ -36,7 +37,7 @@ export type VaultTrashFailure = "trash-unavailable" | "target-is-folder" | "file
 export type ResolutionWriteFailure = "target-missing" | "target-path-is-folder" | "parent-path-is-file" | "folder-create-failed";
 
 export type OperationResult =
-  | { status: "applied"; key: string }
+  | { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" | "conflict-superseded" }
   | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" | "remote-deletion-requires-version-identity" }
   /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
@@ -88,15 +89,14 @@ export class SafeExecutor {
   ) {}
 
   async execute(operation: SyncOperation): Promise<OperationResult> {
-    // Remote deletion stays blocked. R2's DeleteObject has no conditional form, so it cannot name the
-    // exact version it intends to remove; an unconditional DELETE could destroy a version another
-    // writer created after our scan. It needs a version-identity protocol, not a shortcut.
-    if (operation.type === "delete-remote") return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
+    if (operation.type === "delete-remote") return this.deleteRemote(operation);
     if (operation.type === "prune-baseline") return this.prune(operation.key);
     if (operation.type === "delete-local") return this.deleteLocal(operation);
     if (operation.type === "resolve-keep-local") return this.resolveKeepLocal(operation);
     if (operation.type === "resolve-keep-remote") return this.resolveKeepRemote(operation);
     if (operation.type === "resolve-merged") return this.resolveMerged(operation);
+    if (operation.type === "resolve-accept-remote-delete") return this.acceptRemoteDelete(operation);
+    if (operation.type === "resolve-accept-local-delete") return this.deleteRemote({ type: "delete-remote", key: operation.key, reason: operation.reason, expectedRemoteETag: operation.expectedRemoteETag });
     if (operation.type !== "upload" && operation.type !== "download") return { status: "failed", key: operation.key, error: `operation ${operation.type} is not executable` };
     return operation.type === "upload" ? this.upload(operation) : this.download(operation);
   }
@@ -142,6 +142,32 @@ export class SafeExecutor {
     catch { return { status: "unresolved", key, reason: "state-commit-failed" }; }
   }
 
+  /**
+   * Propagates a local deletion without issuing DeleteObject. A conditional HEAD proves the exact
+   * scanned version is still current; the immutable tombstone then makes only that version absent.
+   * If the tombstone PUT is ambiguous, no baseline is retired and the next full scan decides truth.
+   */
+  private async deleteRemote(operation: Extract<SyncOperation, { type: "delete-remote" }>): Promise<OperationResult> {
+    const etag = operation.expectedRemoteETag;
+    if (!etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
+    if (!this.r2.putTombstone) return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
+    try {
+      await this.r2.headObject(operation.key, { ifMatch: etag });
+    } catch (error) {
+      if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
+      return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
+    }
+    const record: RemoteTombstone = { protocol: TOMBSTONE_PROTOCOL, path: operation.key, deletedRemoteETag: etag, createdAt: new Date().toISOString() };
+    try {
+      await this.r2.putTombstone(record);
+    } catch (error) {
+      // A received 4xx means no record was accepted; a transport failure or 5xx remains ambiguous.
+      if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
+      return uploadFailure("PutObject tombstone", operation.key, error);
+    }
+    return this.pruneResult(operation.key);
+  }
+
   // ---- conflict resolution ----------------------------------------------------------------------
 
   /**
@@ -152,14 +178,14 @@ export class SafeExecutor {
    * the remote since the conflict was recorded, R2 answers 412 and nothing is overwritten.
    */
   private async resolveKeepLocal(operation: Extract<SyncOperation, { type: "resolve-keep-local" }>): Promise<OperationResult> {
-    if (!operation.expectedRemoteETag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
+    if (!operation.expectedRemoteETag && !operation.expectedRemoteAbsent) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     // The user's decision is only valid for the local version they were shown.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "conflict-superseded" };
     let bytes: ArrayBuffer;
     try { bytes = await readStableLocalBytes(this.vault, operation.expectedLocal); }
     catch (error) { return error instanceof LocalFileChangedError ? { status: "stale", key: operation.key, reason: "local-changed" } : { status: "failed", key: operation.key, error: message(error) }; }
     let remote: RemoteVersion;
-    try { remote = await this.r2.putObject(operation.key, bytes, { ifMatch: operation.expectedRemoteETag }); }
+    try { remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemoteAbsent ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemoteETag! }); }
     catch (error) { return uploadFailure("PutObject", operation.key, error); }
     // The remote now holds L. If the local file moved on during the PUT, the baseline cannot describe
     // both sides, so it is left uncommitted and the next reconciliation picks the divergence up.
@@ -191,12 +217,12 @@ export class SafeExecutor {
     }
     // Fetching widened the window, so the local precondition is confirmed again before the overwrite.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
-    const written = await this.writeLocal(operation.key, bytes);
+    const written = await this.writeLocal(operation.key, bytes, "kind" in operation.expectedLocal);
     if ("status" in written) return written;
     const commit = await this.commit({ key: operation.key, local: written.version, remote: { size: bytes.byteLength, etag: operation.expectedRemoteETag }, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
     if (commit) return commit;
     await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...written.version }, remoteETag: operation.expectedRemoteETag });
-    return { status: "applied", key: operation.key };
+    return { status: "applied", key: operation.key, localWrite: { key: operation.key, ...written.version } };
   }
 
   /**
@@ -223,7 +249,7 @@ export class SafeExecutor {
     const commit = await this.commit({ key: operation.key, local: written.version, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
     if (commit) return commit;
     await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...written.version }, remoteETag: remote.etag });
-    return { status: "applied", key: operation.key };
+    return { status: "applied", key: operation.key, localWrite: { key: operation.key, ...written.version } };
   }
 
   /**
@@ -231,14 +257,32 @@ export class SafeExecutor {
    * resolution always has an existing local file (the conflict was observed on it), so a missing
    * target is reported rather than recreated.
    */
-  private async writeLocal(key: string, bytes: ArrayBuffer): Promise<{ version: { size: number; mtime: number } } | OperationResult> {
+  private async acceptRemoteDelete(operation: Extract<SyncOperation, { type: "resolve-accept-remote-delete" }>): Promise<OperationResult> {
+    // Reconfirm the physical object still is the version named by the tombstone. A later B object
+    // survives tombstone(A), and must also stop an old "accept delete" click from trashing local B.
+    if (operation.expectedDeletion.objectPresent) try { await this.r2.headObject(operation.key, { ifMatch: operation.expectedDeletion.deletedRemoteETag }); }
+    catch (error) {
+      if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "conflict-superseded" };
+      return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
+    }
+    // The local version is checked again by deleteLocal immediately before the recovery-first trash.
+    return this.deleteLocal({ type: "delete-local", key: operation.key, reason: operation.reason, expectedLocal: operation.expectedLocal });
+  }
+
+  private async writeLocal(key: string, bytes: ArrayBuffer, allowCreate = false): Promise<{ version: { size: number; mtime: number } } | OperationResult> {
     const file = this.vault.getFileByPath(key);
     if (!file) {
       if (this.vault.getAbstractFileByPath(key) !== null) return { status: "failed", key, error: `Vault path "${key}" is a folder, not a file`, reason: "target-path-is-folder" };
-      return { status: "failed", key, error: "the conflicted local file no longer exists", reason: "target-missing" };
+      if (!allowCreate) return { status: "failed", key, error: "the conflicted local file no longer exists", reason: "target-missing" };
+      const folders = await ensureParentFolders(this.vault, key);
+      if (!folders.ok) return { status: "failed", key, error: folders.error, reason: folders.reason };
+      if (this.vault.getFileByPath(key)) return { status: "stale", key, reason: "local-changed" };
+      try { await this.vault.createBinary(key, bytes); }
+      catch (error) { return { status: "failed", key, error: message(error) }; }
+    } else {
+      try { await this.vault.modifyBinary(file, bytes); }
+      catch (error) { return { status: "failed", key, error: message(error) }; }
     }
-    try { await this.vault.modifyBinary(file, bytes); }
-    catch (error) { return { status: "failed", key, error: message(error) }; }
     const local = await this.vault.adapter.stat(key);
     if (!local) return { status: "failed", key, error: "Vault write did not produce a file" };
     return { version: { size: local.size, mtime: local.mtime } };
@@ -264,7 +308,7 @@ export class SafeExecutor {
     try {
       const remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemote.kind === "absent" ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemote.value! });
       const localStat = await this.vault.adapter.stat(operation.key);
-      if (!same(localStat, operation.expectedLocal)) return { status: "stale", key: operation.key, reason: "local-changed" };
+      if (!same(localStat, operation.expectedLocal)) return this.catchUpLatestLocalUpload(operation.key, remote);
       const version = { size: localStat!.size, mtime: localStat!.mtime };
       const commit = await this.commit({ key: operation.key, local: version, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
       if (commit) return commit;
@@ -272,6 +316,29 @@ export class SafeExecutor {
       return { status: "applied", key: operation.key };
     } catch (error) {
       return uploadFailure("PutObject", operation.key, error);
+    }
+  }
+
+  /**
+   * The first conditional PUT already landed, but the editor saved a newer local version before its
+   * baseline could be committed. One conditional catch-up PUT preserves that latest local version
+   * without ever overwriting an intervening writer: only the ETag we just received is accepted.
+   */
+  private async catchUpLatestLocalUpload(key: string, landedRemote: RemoteVersion): Promise<OperationResult> {
+    let latest: Awaited<ReturnType<typeof readCurrentStableLocalBytes>>;
+    try { latest = await readCurrentStableLocalBytes(this.vault, key); }
+    catch { return { status: "partial", key, reason: "remote-applied-local-changed" }; }
+    try {
+      const remote = await this.r2.putObject(key, latest.bytes, { ifMatch: landedRemote.etag });
+      if (!same(await this.vault.adapter.stat(key), latest.version)) return { status: "partial", key, reason: "remote-applied-local-changed" };
+      const commit = await this.commit({ key, local: { size: latest.version.size, mtime: latest.version.mtime }, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
+      if (commit) return commit;
+      await this.recordMergeBase(key, { localVersion: latest.version, remoteETag: remote.etag });
+      return { status: "applied", key };
+    } catch {
+      // The first PUT is known to have landed. A failed catch-up must therefore be surfaced as a
+      // partial result so the scheduler wakes peers and re-observes rather than forgetting it.
+      return { status: "partial", key, reason: "remote-applied-local-changed" };
     }
   }
   private async download(operation: Extract<SyncOperation, { type: "download" }>): Promise<OperationResult> {
@@ -305,7 +372,7 @@ export class SafeExecutor {
       const commit = await this.commit({ key: operation.key, local: version, remote: operation.expectedRemote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
       if (commit) return commit;
       await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...version }, remoteETag: operation.expectedRemote.etag });
-      return { status: "applied", key: operation.key };
+      return { status: "applied", key: operation.key, localWrite: { key: operation.key, ...version } };
     } catch (error) { return { status: "failed", key: operation.key, error: message(error) }; }
   }
 }

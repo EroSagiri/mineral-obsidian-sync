@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { setRequestUrlHandler } from "../../test/obsidian";
 import { RemoteHttpError, RemoteObjectChangedError, SignedR2ListClient } from "./r2-client";
+import { encodeTombstone, tombstoneKey } from "./tombstones";
 
 const client = () => new SignedR2ListClient({ endpoint: "https://example.r2.cloudflarestorage.com", bucket: "bucket", accessKeyId: "key", secretAccessKey: "secret", remotePrefix: "sync" }, () => new Date("2026-09-21T00:00:00.000Z"));
 
@@ -51,5 +52,38 @@ describe("SignedR2ListClient.putObject", () => {
 
     await expect(client().putObject("folder/a.bin", new Uint8Array([1]).buffer, { ifMatch: "etag-a" })).rejects.toThrow("returned no ETag");
     expect(methods).toEqual(["PUT"]);
+  });
+});
+
+describe("SignedR2ListClient.listTombstones", () => {
+  it("reads independent immutable records concurrently while retaining list order", async () => {
+    const first = { protocol: 1, path: "first.md", deletedRemoteETag: "first-etag", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    const second = { protocol: 1, path: "second.md", deletedRemoteETag: "second-etag", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    const [firstKey, secondKey] = await Promise.all([tombstoneKey(first.path, first.deletedRemoteETag), tombstoneKey(second.path, second.deletedRemoteETag)]);
+    let getCalls = 0;
+    let releaseReads: (() => void) | undefined;
+    const bothReadsStarted = new Promise<void>((resolve) => { releaseReads = resolve; });
+    let observeBothReads: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { observeBothReads = resolve; });
+    const subject = client() as unknown as {
+      listRaw(prefix: string): Promise<Array<{ key: string; size: number; etag?: string; lastModified: number }>>;
+      getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
+      listTombstones(): ReturnType<SignedR2ListClient["listTombstones"]>;
+    };
+    subject.listRaw = async () => [
+      { key: `sync/${firstKey}`, size: 1, etag: "meta-1", lastModified: 0 },
+      { key: `sync/${secondKey}`, size: 1, etag: "meta-2", lastModified: 0 },
+    ];
+    subject.getObject = async (key) => {
+      getCalls++;
+      if (getCalls === 2) observeBothReads?.();
+      await bothReadsStarted;
+      return key === firstKey ? encodeTombstone(first) : encodeTombstone(second);
+    };
+    const pending = subject.listTombstones();
+    await started;
+    expect(getCalls).toBe(2);
+    releaseReads?.();
+    await expect(pending).resolves.toMatchObject([{ tombstone: first }, { tombstone: second }]);
   });
 });

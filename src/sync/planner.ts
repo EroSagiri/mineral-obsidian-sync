@@ -1,5 +1,5 @@
 import { localChanged, remoteChanged } from "./fingerprint";
-import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation, SyncPlan } from "./types";
+import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type SyncOperation, type SyncPlan } from "./types";
 
 /**
  * The planner's view of a pending resolution.
@@ -15,7 +15,7 @@ import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation, SyncPlan } 
 export interface ResolutionProposal {
   intent: {
     conflictId: string;
-    type: "keep-local" | "keep-remote" | "merged";
+    type: "keep-local" | "keep-remote" | "accept-remote-delete" | "accept-local-delete" | "merged";
     merged?: { content: string; sha256: string; encoding: { bom: boolean; eol: "lf" | "crlf" | "mixed"; trailingNewline: boolean } };
   };
 }
@@ -39,6 +39,24 @@ function resolutionOperation(candidate: ResolutionProposal | undefined, key: str
   return { type: "resolve-merged", ...base, merged: candidate.intent.merged };
 }
 
+function deletedRemoteResolution(candidate: ResolutionProposal | undefined, key: string, here: LocalEntry, deletion: import("./types").RemoteDeletionIdentity): SyncOperation | undefined {
+  if (!candidate) return undefined;
+  const base = { key, conflictId: candidate.intent.conflictId, reason: `user resolution (${candidate.intent.type}) for the observed deletion conflict` };
+  if (candidate.intent.type === "keep-local") return deletion.objectPresent
+    ? { type: "resolve-keep-local", ...base, expectedLocal: here, expectedRemoteETag: deletion.deletedRemoteETag }
+    : { type: "resolve-keep-local", ...base, expectedLocal: here, expectedRemoteAbsent: true };
+  if (candidate.intent.type === "accept-remote-delete") return { type: "resolve-accept-remote-delete", ...base, expectedLocal: here, expectedDeletion: deletion };
+  return undefined;
+}
+
+function deletedLocalResolution(candidate: ResolutionProposal | undefined, key: string, there: RemoteEntry): SyncOperation | undefined {
+  if (!candidate || !there.etag) return undefined;
+  const base = { key, conflictId: candidate.intent.conflictId, reason: `user resolution (${candidate.intent.type}) for the observed deletion conflict`, expectedRemoteETag: there.etag };
+  if (candidate.intent.type === "keep-remote") return { type: "resolve-keep-remote", ...base, expectedLocal: { kind: "absent" } };
+  if (candidate.intent.type === "accept-local-delete") return { type: "resolve-accept-local-delete", ...base };
+  return undefined;
+}
+
 export function buildSyncPlan(
   local: Map<string, LocalEntry>,
   remote: Map<string, RemoteEntry>,
@@ -49,6 +67,15 @@ export function buildSyncPlan(
   const operations: SyncOperation[] = [];
   for (const key of [...keys].sort((a, b) => a.localeCompare(b))) {
     const here = local.get(key), there = remote.get(key), before = previous.get(key);
+    if (isRemoteDeleted(there)) {
+      // A tombstone is remote metadata, not a remotely-created user file. It cannot bootstrap a
+      // baseline and it must never be offered to the ordinary download path.
+      if (!here) continue;
+      if (!before) operations.push({ type: "upload", key, reason: "new local file after remote logical deletion", expectedLocal: here, expectedRemote: there.deleted.objectPresent ? { kind: "etag", value: there.deleted.deletedRemoteETag } : { kind: "absent" } });
+      else if (localChanged(here, before)) operations.push(deletedRemoteResolution(resolutions?.get(key), key, here, there.deleted) ?? operation("conflict", key, "remote logically deleted while local changed", "local-modified-remote-deleted"));
+      else operations.push({ type: "delete-local", key, reason: "remote logical deletion since previous successful sync", expectedLocal: here });
+      continue;
+    }
     if (!before) {
       if (here && !there) operations.push({ type: "upload", key, reason: "new local file", expectedLocal: here, expectedRemote: { kind: "absent" } });
       else if (!here && there) operations.push({ type: "download", key, reason: "new remote object", expectedLocal: { kind: "absent" }, expectedRemote: there });
@@ -66,8 +93,8 @@ export function buildSyncPlan(
       // a permanent, unresolvable key in every future plan; forgetting it touches no user data.
       operations.push({ type: "prune-baseline", key, reason: "absent locally and remotely since the previous successful sync" });
     } else if (!here && there) {
-      if (remoteChanged(there, before)) operations.push(operation("conflict", key, "local deleted while remote changed", "local-deleted-remote-modified"));
-      else operations.push({ type: "delete-remote", key, reason: "local deletion since previous successful sync" });
+      if (remoteChanged(there, before)) operations.push(deletedLocalResolution(resolutions?.get(key), key, there) ?? operation("conflict", key, "local deleted while remote changed", "local-deleted-remote-modified"));
+      else operations.push({ type: "delete-remote", key, reason: "local deletion since previous successful sync", expectedRemoteETag: there.etag });
     } else if (here && !there) {
       if (localChanged(here, before)) operations.push(operation("conflict", key, "remote deleted while local changed", "local-modified-remote-deleted"));
       // The remote is gone and the local file still provably matches the recorded baseline, so the

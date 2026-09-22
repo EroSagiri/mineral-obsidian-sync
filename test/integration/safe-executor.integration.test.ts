@@ -137,12 +137,12 @@ describe("SafeExecutor integration over an in-process R2 emulator", () => {
     expect(vault.files.get(key)!.bytes).toEqual(new Uint8Array([9, 9]));
   });
 
-  it("keeps remote deletion blocked, because it cannot name the version it would remove", async () => {
+  it("rejects a logical deletion that does not name the remote version", async () => {
     const { context, scratch } = await build();
     const executor = new SafeExecutor(context.vault, context.client, context.state, context.identity, context.ignorePolicy);
     const key = scratch.key("test-file.md");
 
-    await expect(executor.execute({ type: "delete-remote", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "remote-deletion-requires-version-identity" });
+    await expect(executor.execute({ type: "delete-remote", key, reason: "integration" })).resolves.toEqual({ status: "blocked", key, reason: "missing-remote-etag" });
   });
 
   it("propagates a remote deletion to the local file through trash, then retires the baseline", async () => {

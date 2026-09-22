@@ -61,6 +61,33 @@ describe("SafeExecutor", () => {
     await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, remote({ putObject: async () => { throw new RemoteObjectChangedError(); } }), saved, identity, "[]").execute(op)).resolves.toMatchObject({ status: "stale", reason: "remote-changed" });
     expect(saved.entries).toHaveLength(0);
   });
+  it("catches up one newer local save using only the ETag returned by its own first PUT", async () => {
+    const local = vault({ "a.bin": [1, 2, 3] }), saved = state();
+    const writes: Array<{ body: number[]; options: unknown }> = [];
+    const client = remote({ putObject: async (_key, body, options) => {
+      writes.push({ body: [...new Uint8Array(body)], options });
+      if (writes.length === 1) {
+        // Simulate a second editor save while the first R2 PUT is in flight.
+        local.files.set("a.bin", { bytes: bytes([4, 5, 6, 7]), mtime: 20 });
+        return { size: 3, etag: "first" };
+      }
+      return { size: 4, etag: "latest" };
+    } });
+
+    await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "applied", key: "a.bin" });
+    expect(writes).toEqual([{ body: [1, 2, 3], options: { ifNoneMatch: "*" } }, { body: [4, 5, 6, 7], options: { ifMatch: "first" } }]);
+    expect(saved.entries).toMatchObject([{ local: { size: 4, mtime: 20 }, remote: { etag: "latest" } }]);
+  });
+  it("does not overwrite an intervening remote writer while catching up a local save", async () => {
+    const local = vault({ "a.bin": [1, 2, 3] }), saved = state(); let calls = 0;
+    const client = remote({ putObject: async () => {
+      calls++;
+      if (calls === 1) { local.files.set("a.bin", { bytes: bytes([4, 5, 6, 7]), mtime: 20 }); return { size: 3, etag: "first" }; }
+      throw new RemoteObjectChangedError();
+    } });
+    await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "partial", key: "a.bin", reason: "remote-applied-local-changed" });
+    expect(saved.entries).toHaveLength(0);
+  });
   it("will not overwrite a locally-created download target", async () => {
     const local = vault({ "a.bin": [9] }), saved = state();
     await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(download())).resolves.toMatchObject({ status: "stale", reason: "local-changed" });
@@ -68,7 +95,7 @@ describe("SafeExecutor", () => {
   });
   it("writes binary download bytes and commits only after the Vault write", async () => {
     const local = vault({}), saved = state();
-    await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(download())).resolves.toEqual({ status: "applied", key: "a.bin" });
+    await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(download())).resolves.toMatchObject({ status: "applied", key: "a.bin", localWrite: { key: "a.bin", size: 2, mtime: 20 } });
     expect(new Uint8Array(local.files.get("a.bin")!.bytes)).toEqual(new Uint8Array([7, 8])); expect(saved.entries).toHaveLength(1);
   });
   it("reports a successful transfer with failed state persistence as unresolved", async () => {
@@ -99,9 +126,28 @@ describe("SafeExecutor", () => {
     expect(saved.entries[0]!.remote).toEqual({ size: 3, etag: "new" });
     expect(saved.entries[0]!.remote!.lastModified).toBeUndefined();
   });
-  it("keeps remote deletion blocked because it cannot name a version", async () => {
+  it("refuses a remote logical deletion that lacks an exact version", async () => {
     const executor = new SafeExecutor(vault({}) as never, remote(), state(), identity, "[]");
-    await expect(executor.execute({ type: "delete-remote", key: "a", reason: "test" })).resolves.toEqual({ status: "blocked", key: "a", reason: "remote-deletion-requires-version-identity" });
+    await expect(executor.execute({ type: "delete-remote", key: "a", reason: "test" })).resolves.toEqual({ status: "blocked", key: "a", reason: "missing-remote-etag" });
+  });
+  it("creates an immutable tombstone only after proving the expected object version", async () => {
+    const created: unknown[] = [], deleted: string[] = [];
+    const saved: StateStore = { ...state(), delete: async (key) => { deleted.push(key); } };
+    const client = remote({
+      headObject: async (_key, options) => ({ key: "a", size: 3, etag: options?.ifMatch, lastModified: 1 }),
+      putTombstone: async (record) => { created.push(record); return { tombstone: record }; },
+    });
+    const result = await new SafeExecutor(vault({}) as never, client, saved, identity, "[]").execute({ type: "delete-remote", key: "a", reason: "test", expectedRemoteETag: "A" });
+    expect(result).toEqual({ status: "applied", key: "a" });
+    expect(created).toMatchObject([{ path: "a", deletedRemoteETag: "A", protocol: 1 }]);
+    expect(deleted).toEqual(["a"]);
+  });
+  it("does not retire a baseline when a tombstone PUT outcome is ambiguous", async () => {
+    const deleted: string[] = [];
+    const saved: StateStore = { ...state(), delete: async (key) => { deleted.push(key); } };
+    const client = remote({ headObject: async () => ({ key: "a", size: 3, etag: "A", lastModified: 1 }), putTombstone: async () => { throw new RemoteHttpError("PutObject", 503); } });
+    await expect(new SafeExecutor(vault({}) as never, client, saved, identity, "[]").execute({ type: "delete-remote", key: "a", reason: "test", expectedRemoteETag: "A" })).resolves.toEqual({ status: "unresolved", key: "a", reason: "ambiguous-put" });
+    expect(deleted).toEqual([]);
   });
 
   describe("delete-local (recovery-first)", () => {
@@ -186,7 +232,7 @@ describe("SafeExecutor", () => {
     const local = vault({}), saved = state();
     const nested: Extract<SyncOperation, { type: "download" }> = { type: "download", key: "a/b/c/note.md", reason: "test", expectedLocal: { kind: "absent" }, expectedRemote: { key: "a/b/c/note.md", size: 2, etag: "old", lastModified: 1 } };
 
-    await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(nested)).resolves.toEqual({ status: "applied", key: "a/b/c/note.md" });
+    await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(nested)).resolves.toMatchObject({ status: "applied", key: "a/b/c/note.md", localWrite: { key: "a/b/c/note.md", size: 2, mtime: 20 } });
     expect([...local.folders].sort()).toEqual(["a", "a/b", "a/b/c"]);
     expect(new Uint8Array(local.files.get("a/b/c/note.md")!.bytes)).toEqual(new Uint8Array([7, 8]));
     expect(saved.entries).toHaveLength(1);

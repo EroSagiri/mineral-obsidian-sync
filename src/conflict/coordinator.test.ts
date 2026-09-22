@@ -4,10 +4,10 @@ import { createFakeVault } from "../../test/integration/fake-vault";
 import type { FakeVault } from "../../test/integration/fake-vault";
 import { createMemoryConflictStores } from "./stores";
 import type { MemoryConflictStores } from "./stores";
-import { createMergeBaseRecorder } from "./merge-base";
+import { createMergeBaseRecorder, recordMergeBaseBatch } from "./merge-base";
 import { ConflictCoordinator } from "./coordinator";
 import { baselineMatches, conflictIdFor, shortConflictId } from "./identity";
-import { CONFLICT_PROTOCOL_VERSION, type ConflictRecord, type MergeBaseRecord } from "./types";
+import { CONFLICT_PROTOCOL_VERSION, type ConflictRecord, type MergeBaseRecord, type MergeBaseStore } from "./types";
 import type { R2Client } from "../remote/r2-client";
 import type { LocalEntry, PreviousEntry } from "../sync/types";
 import type { Vault } from "obsidian";
@@ -67,6 +67,39 @@ describe("merge base store", () => {
     expect(await stores.get(CHANNEL, "note.md")).toBeDefined();
     expect(await stores.get(CHANNEL, "other.md")).toBeUndefined();
     expect(await stores.get("C".repeat(43), "note.md")).toBeUndefined();
+  });
+
+  it("backfills several missing snapshots with one batch write and one prune", async () => {
+    const vault = createFakeVault({}, {});
+    vault.files.set("one.md", { bytes: new TextEncoder().encode("one\n"), mtime: 10 });
+    vault.files.set("two.md", { bytes: new TextEncoder().encode("two\n"), mtime: 11 });
+    const records = new Map<string, MergeBaseRecord>();
+    let putManyCalls = 0, pruneCalls = 0;
+    const store: MergeBaseStore = {
+      get: async () => undefined,
+      getMany: async () => new Map(),
+      put: async () => undefined,
+      putMany: async (batch) => { putManyCalls++; for (const record of batch) records.set(record.path, record); },
+      remove: async () => undefined,
+      prune: async () => { pruneCalls++; },
+    };
+
+    await recordMergeBaseBatch(vault as unknown as Vault, CHANNEL, store, [
+      { path: "one.md", baseline: { localVersion: localEntry("one.md", 4, 10), remoteETag: "one" } },
+      { path: "two.md", baseline: { localVersion: localEntry("two.md", 4, 11), remoteETag: "two" } },
+      { path: "binary.png", baseline: { localVersion: localEntry("binary.png", 1, 12), remoteETag: "skip" } },
+    ]);
+
+    expect([...records.keys()].sort()).toEqual(["one.md", "two.md"]);
+    expect(putManyCalls).toBe(1);
+    expect(pruneCalls).toBe(1);
+  });
+
+  it("looks up merge bases in one channel-scoped batch", async () => {
+    const stores = createMemoryConflictStores();
+    await stores.put({ protocolVersion: CONFLICT_PROTOCOL_VERSION, channel: CHANNEL, path: "one.md", baseline: { localVersion: localEntry("one.md", 1, 1) }, sha256: "a", byteLength: 1, encoding: { bom: false, eol: "lf", trailingNewline: false }, content: "a", updatedAt: 1 });
+    const found = await stores.getMany(CHANNEL, ["one.md", "missing.md"]);
+    expect([...found.keys()]).toEqual(["one.md"]);
   });
 
   it("treats a snapshot as void once the baseline has moved", () => {
@@ -283,6 +316,20 @@ describe("conflict coordinator", () => {
     reconcileReasons = [];
     await instance.propose({ protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "c", channel: CHANNEL, path: "note.md", type: "keep-remote", expectedLocalVersion: localEntry("note.md", 1, 1), createdAt: 1 });
     expect(reconcileReasons).toEqual(["conflict-manual-resolution"]);
+  });
+
+  it("schedules a second immediate cycle once a manual intent is validated", async () => {
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
+    remoteBodies.set("note.md", "remote\n");
+    const input = { key: "note.md", previous: previous("note.md", 6, 10, "A"), observedLocal: localEntry("note.md", 6, 50), observedRemote: { key: "note.md", size: 7, etag: "B", lastModified: 1 } };
+    const instance = coordinator();
+    await instance.handleConflicts([input]);
+    const [record] = await env.stores.listConflicts(CHANNEL);
+    reconcileReasons = [];
+    await instance.propose({ protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: record.conflictId, channel: CHANNEL, path: "note.md", type: "keep-local", expectedLocalVersion: input.observedLocal, expectedRemoteETag: "B", createdAt: 1 });
+    await instance.handleConflicts([input]);
+    expect(instance.resolutions().get("note.md")?.intent.type).toBe("keep-local");
+    expect(reconcileReasons).toEqual(["conflict-manual-resolution", "conflict-manual-resolution"]);
   });
 
   it("reconciles stored records even when a cycle reports no conflicts at all", async () => {

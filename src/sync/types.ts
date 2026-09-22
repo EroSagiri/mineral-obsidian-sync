@@ -1,7 +1,11 @@
 export interface LocalEntry { key: string; size: number; mtime: number; }
 
 /** A remote object **as observed on the wire**: every field is a fact the server supplied. */
-export interface RemoteEntry { key: string; size: number; etag?: string; lastModified: number; }
+export interface RemoteEntry { key: string; size: number; etag?: string; lastModified: number; deleted?: RemoteDeletionIdentity; }
+/** An effective deletion is metadata, not a user object; it never has bytes to download. */
+export interface RemoteDeletionIdentity { path: string; deletedRemoteETag: string; createdAt: string; metadataETag?: string; objectPresent: boolean; }
+export interface RemoteDeletedEntry extends RemoteEntry { deleted: RemoteDeletionIdentity; }
+export function isRemoteDeleted(entry: RemoteEntry | undefined): entry is RemoteDeletedEntry { return Boolean(entry && "deleted" in entry); }
 
 /**
  * What is known about a remote object version after a successful conditional write.
@@ -55,7 +59,7 @@ export type SyncOperation =
    * changed after the scan is never the file that gets removed.
    */
   | { type: "delete-local"; key: string; reason: string; expectedLocal: LocalEntry }
-  | { type: "delete-remote"; key: string; reason: string }
+  | { type: "delete-remote"; key: string; reason: string; expectedRemoteETag?: string }
   /**
    * Device-local bookkeeping removal. It is **not** a deletion of user data: it only forgets a
    * baseline entry for a key that is provably absent both locally and remotely, so it can stop
@@ -70,9 +74,11 @@ export type SyncOperation =
    * Every variant is bound to the exact conflict identity it was decided from, so a resolution can
    * never be applied to a version the user did not see.
    */
-  | { type: "resolve-keep-local"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string }
-  | { type: "resolve-keep-remote"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string }
+  | { type: "resolve-keep-local"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string; expectedRemoteAbsent?: true }
+  | { type: "resolve-keep-remote"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry | { kind: "absent" }; expectedRemoteETag?: string }
   | { type: "resolve-merged"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedRemoteETag?: string; merged: { content: string; sha256: string; encoding: { bom: boolean; eol: "lf" | "crlf" | "mixed"; trailingNewline: boolean } } }
+  | { type: "resolve-accept-remote-delete"; key: string; reason: string; conflictId: string; expectedLocal: LocalEntry; expectedDeletion: RemoteDeletionIdentity }
+  | { type: "resolve-accept-local-delete"; key: string; reason: string; conflictId: string; expectedRemoteETag: string }
   | { type: "conflict"; key: string; conflict: ConflictKind; reason: string };
 
 export interface SyncPlan { operations: SyncOperation[]; }

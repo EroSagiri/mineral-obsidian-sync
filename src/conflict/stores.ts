@@ -75,10 +75,33 @@ export class IndexedDbConflictStores implements MergeBaseStore, ConflictStore, R
     } finally { db.close(); }
   }
 
+  async getMany(channel: string, paths: readonly string[]): Promise<Map<string, MergeBaseRecord>> {
+    if (!paths.length) return new Map();
+    const db = await this.database();
+    try {
+      return await transaction(db, [MERGE_BASE], "readonly", async (tx) => {
+        const store = tx.objectStore(MERGE_BASE);
+        const records = await Promise.all(paths.map(async (path) => [path, await request(store.get([channel, path]) as IDBRequest<MergeBaseRecord | undefined>)] as const));
+        return new Map(records.filter((entry): entry is readonly [string, MergeBaseRecord] => entry[1] !== undefined));
+      });
+    } finally { db.close(); }
+  }
+
   async put(record: MergeBaseRecord): Promise<void> {
     const db = await this.database();
     try { await transaction(db, [MERGE_BASE], "readwrite", (tx) => { tx.objectStore(MERGE_BASE).put(record); }); }
     finally { db.close(); }
+  }
+
+  async putMany(records: readonly MergeBaseRecord[]): Promise<void> {
+    if (!records.length) return;
+    const db = await this.database();
+    try {
+      await transaction(db, [MERGE_BASE], "readwrite", (tx) => {
+        const store = tx.objectStore(MERGE_BASE);
+        for (const record of records) store.put(record);
+      });
+    } finally { db.close(); }
   }
 
   async remove(channel: string, paths: string[]): Promise<void> {
@@ -182,7 +205,12 @@ export function createMemoryConflictStores(): MemoryConflictStores {
   return {
     mergeBase, conflicts, intents,
     get: async (channel: string, path: string) => mergeBase.get(key(channel, path)),
+    getMany: async (channel: string, paths: readonly string[]) => new Map(paths.flatMap((path) => {
+      const record = mergeBase.get(key(channel, path));
+      return record ? [[path, record] as const] : [];
+    })),
     put: async (record: MergeBaseRecord) => { mergeBase.set(key(record.channel, record.path), record); },
+    putMany: async (records: readonly MergeBaseRecord[]) => { for (const record of records) mergeBase.set(key(record.channel, record.path), record); },
     remove: async (channel: string, paths: string[]) => { for (const path of paths) mergeBase.delete(key(channel, path)); },
     prune: async (channel: string, maxRecords: number) => {
       const mine = [...mergeBase.values()].filter((record) => record.channel === channel);

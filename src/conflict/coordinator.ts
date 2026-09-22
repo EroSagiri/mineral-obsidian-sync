@@ -1,7 +1,7 @@
 import type { Vault } from "obsidian";
 import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
-import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "../sync/types";
+import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation } from "../sync/types";
 import { MAX_MERGEABLE_BYTES, decodeText, isMergeablePath } from "../sync/text";
 import { threeWayMerge } from "../sync/merge";
 import { baselineMatches, conflictIdFor, sha256Hex, shortConflictId } from "./identity";
@@ -46,6 +46,7 @@ export interface ConflictDetectionInput {
   previous?: PreviousEntry;
   observedLocal?: LocalEntry;
   observedRemote?: RemoteEntry;
+  observedRemoteDeletion?: RemoteDeletionIdentity;
 }
 
 export class ConflictCoordinator {
@@ -120,14 +121,21 @@ export class ConflictCoordinator {
     // decision can never be applied to it later.
     try { await this.dependencies.conflicts.reconcile(this.dependencies.channel, active); } catch { this.dependencies.debug?.("conflict store reconcile failed"); }
     // Refresh the proposals the *next* plan may apply, from this cycle's real observations.
-    await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])));
+    const intentBecameValid = await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])));
+    // A manual choice is persisted between cycles. Its first follow-up cycle is deliberately still
+    // a conflict while this method validates it against fresh observations; now that it is valid,
+    // schedule one immediate *additional* cycle for the planner to execute it. Without this, the
+    // intent remains stored but is never consumed until an unrelated later event happens.
     if (followUp) this.dependencies.requestReconcile("conflict-auto-merge");
+    else if (intentBecameValid) this.dependencies.requestReconcile("conflict-manual-resolution");
   }
 
   /** Reads the intents that match the current observations and caches them for the planner. */
-  private async refreshValidIntents(observations: Map<string, ConflictDetectionInput>): Promise<void> {
+  private async refreshValidIntents(observations: Map<string, ConflictDetectionInput>): Promise<boolean> {
+    const previouslyActive = new Map(this.active);
     this.active.clear();
-    if (!this.dependencies.channel) return;
+    if (!this.dependencies.channel) return false;
+    const stale: string[] = [];
     for (const intent of await this.intents()) {
       const observation = observations.get(intent.path);
       if (!observation) continue;
@@ -135,7 +143,14 @@ export class ConflictCoordinator {
       // The intent carries the conflict identity it was authored against. Equality here is the whole
       // guarantee that a decision cannot be applied to versions the user never saw.
       if (currentId === intent.conflictId) this.active.set(intent.path, { intent });
+      // A record from an older conflict model, or a click against an earlier version, can never
+      // become valid again for this observation. Remove only that proven-stale proposal; an intent
+      // for a path absent from this scan is retained because the scan may simply be incomplete.
+      else stale.push(intent.conflictId);
     }
+    if (stale.length) try { await this.dependencies.intents.removeIntents(this.dependencies.channel, stale); }
+    catch { this.dependencies.debug?.("stale resolution-intent cleanup failed"); }
+    return [...this.active.entries()].some(([path, proposal]) => previouslyActive.get(path)?.intent.conflictId !== proposal.intent.conflictId);
   }
 
   private async intents(): Promise<ResolutionIntent[]> {
@@ -182,22 +197,26 @@ export class ConflictCoordinator {
    * trustworthy base snapshot exists for exactly this baseline.
    */
   private async inspect(input: ConflictDetectionInput): Promise<ConflictRecord | undefined> {
-    const { key, previous, observedLocal, observedRemote } = input;
-    if (!observedLocal || !observedRemote) return undefined;
+    const { key, previous, observedLocal, observedRemote, observedRemoteDeletion } = input;
+    if (!previous || (!observedLocal && !observedRemote)) return undefined;
     const conflictId = await this.identityOf(input);
     const base: ConflictRecord = {
       protocolVersion: CONFLICT_PROTOCOL_VERSION,
       conflictId,
       channel: this.dependencies.channel,
       path: key,
-      previous: { localVersion: previous?.local ? { key, size: previous.local.size, mtime: previous.local.mtime } : observedLocal, remoteETag: previous?.remote?.etag },
+      previous: { localVersion: previous.local ? { key, size: previous.local.size, mtime: previous.local.mtime } : observedLocal!, remoteETag: previous.remote?.etag },
       observedLocal,
-      observedRemoteETag: observedRemote.etag,
+      observedRemoteETag: observedRemote?.etag,
+      observedRemoteDeletion,
       detectedAt: this.now(),
       autoMergeStatus: "not-attempted",
       snapshot: { baseAvailable: false },
     };
 
+    // Deletion-vs-modify is a semantic conflict, never a text merge. It intentionally has no body
+    // reads and exposes only its two safe, version-bound decisions in the resolver.
+    if (!observedLocal || !observedRemote || observedRemoteDeletion) return { ...base, autoMergeStatus: "manual-required", reason: observedRemoteDeletion ? "remote logical deletion conflicts with a local modification" : "local deletion conflicts with a remote modification" };
     // Policy gates come first: an unsupported type or an oversized body is manual by definition and
     // must not even be read.
     if (!isMergeablePath(key)) return { ...base, autoMergeStatus: "unsupported", reason: "only markdown and plain-text files are merged automatically" };

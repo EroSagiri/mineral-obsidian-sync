@@ -85,9 +85,17 @@ export class ConflictResolverModal extends Modal {
     actions.style.gap = "8px";
     actions.style.flexWrap = "wrap";
 
-    this.button(actions, "Keep Local", () => this.apply("keep-local"));
-    this.button(actions, "Keep Remote", () => this.apply("keep-remote"));
-    this.button(actions, this.draft ? "Apply Merged" : "Edit Merged Result", () => this.editMerged(record));
+    if (record.observedRemoteDeletion) {
+      this.button(actions, "Keep Local / Restore", () => this.apply("keep-local"));
+      this.button(actions, "Accept Remote Delete", () => this.apply("accept-remote-delete"));
+    } else if (!record.observedLocal) {
+      this.button(actions, "Restore Remote", () => this.apply("keep-remote"));
+      this.button(actions, "Accept Local Delete", () => this.apply("accept-local-delete"));
+    } else {
+      this.button(actions, "Keep Local", () => this.apply("keep-local"));
+      this.button(actions, "Keep Remote", () => this.apply("keep-remote"));
+      this.button(actions, this.draft ? "Apply Merged" : "Edit Merged Result", () => this.editMerged(record));
+    }
   }
 
   private panel(parent: HTMLElement, title: string, text: string): void {
@@ -142,6 +150,7 @@ export class ConflictResolverModal extends Modal {
       type,
       expectedLocalVersion: record.observedLocal,
       expectedRemoteETag: record.observedRemoteETag,
+      expectedRemoteDeletion: record.observedRemoteDeletion,
       createdAt: Date.now(),
     };
     try {

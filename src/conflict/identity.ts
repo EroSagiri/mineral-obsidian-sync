@@ -1,4 +1,4 @@
-import type { LocalEntry, PreviousEntry, RemoteEntry } from "../sync/types";
+import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry } from "../sync/types";
 import { CONFLICT_PROTOCOL_VERSION, type BaselineIdentity } from "./types";
 
 /**
@@ -33,6 +33,7 @@ export function canonicalConflictInput(input: {
   previous?: PreviousEntry;
   observedLocal?: LocalEntry;
   observedRemote?: RemoteEntry;
+  observedRemoteDeletion?: RemoteDeletionIdentity;
 }): string {
   return [
     `v${CONFLICT_PROTOCOL_VERSION}`,
@@ -40,7 +41,7 @@ export function canonicalConflictInput(input: {
     segment(input.path),
     segment(baselineIdentity(input.previous)),
     segment(localIdentity(input.observedLocal)),
-    segment(input.observedRemote?.etag ?? "no-etag"),
+    segment(input.observedRemoteDeletion ? `deleted:${input.observedRemoteDeletion.path}:${input.observedRemoteDeletion.deletedRemoteETag}:${input.observedRemoteDeletion.createdAt}:${input.observedRemoteDeletion.objectPresent}` : input.observedRemote?.etag ?? "no-etag"),
   ].join(":");
 }
 
@@ -50,6 +51,7 @@ export async function conflictIdFor(input: {
   previous?: PreviousEntry;
   observedLocal?: LocalEntry;
   observedRemote?: RemoteEntry;
+  observedRemoteDeletion?: RemoteDeletionIdentity;
 }): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalConflictInput(input)));
   let binary = "";

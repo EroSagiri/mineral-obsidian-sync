@@ -159,8 +159,8 @@ describe("generation handshake", () => {
     expect(harness.remote!.reconciled).toBe("0");
     expect(harness.remote!.hasPending()).toBe(true);
     expect(harness.scheduler.diagnostics().lastConfirmation).toBe("mismatch");
-    // A follow-up cycle is scheduled by the debounce path, not by a busy loop.
-    expect(harness.timers.delays()).toEqual([1200]);
+    // It is a remote-only window mismatch, so re-observe immediately rather than waiting for typing.
+    expect(harness.timers.delays()).toEqual([0]);
   });
 
   it("covers the missed generation on the next cycle", async () => {
@@ -246,13 +246,14 @@ describe("generation handshake", () => {
 describe("remote observation completeness", () => {
   const counts = (partial: Partial<Record<string, number>>): Parameters<typeof isRemoteObservationComplete>[0]["counts"] => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, conflict: 0, noop: 0, ...partial } as never);
 
-  it("treats conflict and blocked as complete, and stale/unresolved/halted as incomplete", () => {
+  it("treats conflict and blocked as complete, and stale/unresolved/partial/halted as incomplete", () => {
     expect(isRemoteObservationComplete({ counts: counts({ conflict: 2 }), stale: false, halted: false })).toBe(true);
     expect(isRemoteObservationComplete({ counts: counts({ blocked: 3 }), stale: false, halted: false })).toBe(true);
     expect(isRemoteObservationComplete({ counts: counts({ failed: 1, reason: undefined } as never), stale: false, halted: false })).toBe(true);
     expect(isRemoteObservationComplete({ counts: counts({ applied: 5, noop: 5 }), stale: false, halted: false })).toBe(true);
     expect(isRemoteObservationComplete({ counts: counts({ stale: 1 }), stale: true, halted: false })).toBe(false);
     expect(isRemoteObservationComplete({ counts: counts({ unresolved: 1 }), stale: false, halted: false })).toBe(false);
+    expect(isRemoteObservationComplete({ counts: counts({ partial: 1 }), stale: false, halted: false })).toBe(false);
     expect(isRemoteObservationComplete({ counts: counts({ applied: 5 }), stale: false, halted: true })).toBe(false);
   });
 
@@ -308,8 +309,8 @@ describe("remote-change triggering", () => {
     harness.remote!.announce("3");
     harness.scheduler.requestReconcile("remote-change");
     expect(cycles).toBe(0);
-    expect(harness.timers.delays()).toEqual([1200]);
-    harness.timers.fire(1200);
+    expect(harness.timers.delays()).toEqual([0]);
+    harness.timers.fire(0);
     await flush();
     expect(cycles).toBe(1);
   });
@@ -330,8 +331,8 @@ describe("remote-change triggering", () => {
     release();
     await flush();
     expect(cycles).toBe(1);
-    expect(harness.timers.delays()).toEqual([1200]);
-    harness.timers.fire(1200);
+    expect(harness.timers.delays()).toEqual([0]);
+    harness.timers.fire(0);
     await flush();
     expect(cycles).toBe(2);
   });

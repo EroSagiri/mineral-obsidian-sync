@@ -1,0 +1,62 @@
+import { canonicalKey } from "../sync/path";
+
+/** Reserved below every configured remote prefix. It is never a Vault path. */
+export const TOMBSTONE_NAMESPACE = ".mineral-sync/tombstones/";
+export const TOMBSTONE_PROTOCOL = 1;
+
+export interface RemoteTombstone {
+  protocol: typeof TOMBSTONE_PROTOCOL;
+  path: string;
+  deletedRemoteETag: string;
+  createdAt: string;
+}
+
+export interface RemoteDeletion {
+  tombstone: RemoteTombstone;
+  /** The opaque R2 metadata-object identity, used only for diagnostics. */
+  metadataETag?: string;
+}
+
+export function isInternalRemoteKey(key: string): boolean {
+  return canonicalKey(key).startsWith(TOMBSTONE_NAMESPACE);
+}
+
+function base64url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+/**
+ * A tombstone is immutable and version-bound. Different remote versions of the same path have
+ * different metadata keys, so a later deletion never overwrites evidence for an earlier one.
+ */
+export async function tombstoneKey(path: string, deletedRemoteETag: string): Promise<string> {
+  const canonical = canonicalKey(path);
+  if (!deletedRemoteETag) throw new Error("Tombstone requires an exact remote ETag");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${canonical}\u0000${deletedRemoteETag}`));
+  return `${TOMBSTONE_NAMESPACE}${base64url(new Uint8Array(digest))}.json`;
+}
+
+export function encodeTombstone(record: RemoteTombstone): ArrayBuffer {
+  validateTombstone(record);
+  const bytes = new TextEncoder().encode(JSON.stringify(record));
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+/** Fail closed: malformed metadata never means a user object was deleted. */
+export function parseTombstone(body: ArrayBuffer): RemoteTombstone {
+  let value: unknown;
+  try { value = JSON.parse(new TextDecoder().decode(body)); }
+  catch { throw new Error("Malformed tombstone JSON"); }
+  validateTombstone(value);
+  return value;
+}
+
+export function validateTombstone(value: unknown): asserts value is RemoteTombstone {
+  if (!value || typeof value !== "object") throw new Error("Malformed tombstone record");
+  const record = value as Partial<RemoteTombstone>;
+  if (record.protocol !== TOMBSTONE_PROTOCOL || typeof record.path !== "string" || typeof record.deletedRemoteETag !== "string" || !record.deletedRemoteETag || typeof record.createdAt !== "string" || !record.createdAt) throw new Error("Unsupported or incomplete tombstone record");
+  if (canonicalKey(record.path) !== record.path || isInternalRemoteKey(record.path)) throw new Error("Tombstone contains an invalid path");
+  if (!Number.isFinite(Date.parse(record.createdAt))) throw new Error("Tombstone has an invalid creation time");
+}

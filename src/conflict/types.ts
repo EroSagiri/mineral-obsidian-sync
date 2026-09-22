@@ -1,4 +1,4 @@
-import type { LocalEntry } from "../sync/types";
+import type { LocalEntry, RemoteDeletionIdentity } from "../sync/types";
 
 /**
  * Conflict resolution state: the merge-base snapshot, the active conflict records, and the
@@ -45,8 +45,9 @@ export interface ConflictRecord {
   path: string;
   /** The baseline the disagreement is measured against. */
   previous: BaselineIdentity;
-  observedLocal: LocalEntry;
+  observedLocal?: LocalEntry;
   observedRemoteETag?: string;
+  observedRemoteDeletion?: RemoteDeletionIdentity;
   detectedAt: number;
   autoMergeStatus: AutoMergeStatus;
   reason?: string;
@@ -54,7 +55,7 @@ export interface ConflictRecord {
   snapshot: { local?: string; remote?: string; base?: string; draft?: string; baseAvailable: boolean };
 }
 
-export type ResolutionIntentType = "keep-local" | "keep-remote" | "merged";
+export type ResolutionIntentType = "keep-local" | "keep-remote" | "accept-remote-delete" | "accept-local-delete" | "merged";
 
 /**
  * A resolution is an explicit, version-bound proposal. It is never a mutation: the UI only ever
@@ -66,8 +67,9 @@ export interface ResolutionIntent {
   channel: string;
   path: string;
   type: ResolutionIntentType;
-  expectedLocalVersion: LocalEntry;
+  expectedLocalVersion?: LocalEntry;
   expectedRemoteETag?: string;
+  expectedRemoteDeletion?: RemoteDeletionIdentity;
   createdAt: number;
   /** Present for `merged`: the exact bytes the user or the auto-merge wants to become the truth. */
   merged?: { content: string; sha256: string; encoding: { bom: boolean; eol: "lf" | "crlf" | "mixed"; trailingNewline: boolean } };
@@ -75,7 +77,11 @@ export interface ResolutionIntent {
 
 export interface MergeBaseStore {
   get(channel: string, path: string): Promise<MergeBaseRecord | undefined>;
+  /** Batched lookup avoids one IndexedDB transaction per unchanged Vault file. */
+  getMany(channel: string, paths: readonly string[]): Promise<Map<string, MergeBaseRecord>>;
   put(record: MergeBaseRecord): Promise<void>;
+  /** Writes an already-validated batch atomically within this device-local facility. */
+  putMany(records: readonly MergeBaseRecord[]): Promise<void>;
   /** Removal is scoped to a channel and its paths; used when a key is gone on both sides. */
   remove(channel: string, paths: string[]): Promise<void>;
   /** Bounded eviction so the store cannot grow without limit. */
