@@ -15,7 +15,7 @@ class FakeTimers implements SchedulerTimers {
   }
   delays(): number[] { return [...this.jobs.values()].map((job) => job.delay); }
 }
-const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+const flush = async () => { for (let i = 0; i < 16; i++) await Promise.resolve(); };
 const upload = (key: string): SyncOperation => ({ type: "upload", key, reason: "test", expectedLocal: { key, size: 1, mtime: 1 }, expectedRemote: { kind: "absent" } });
 const base = (operations: SyncOperation[], execute: CycleDependencies["execute"] = async (operation) => ({ status: "applied", key: operation.key })): CycleDependencies => ({
   scanLocal: () => new Map(), scanRemote: async () => new Map(), loadPrevious: async () => new Map(), filterPrevious: (entries) => entries,
@@ -34,6 +34,25 @@ describe("SyncScheduler", () => {
     for (let i = 0; i < 100; i++) scheduler.markLocalPaths([`burst/${i}.md`], () => false);
     expect(cycles).toBe(0); expect(timers.delays()).toEqual([1200]);
     timers.fire(1200); await flush(); expect(cycles).toBe(1); expect(scheduler.diagnostics().syncDirtyVersion).toBe(102);
+  });
+
+  it("runs a user-requested sync immediately", async () => {
+    let cycles = 0; const { scheduler, timers } = setup(() => { cycles++; return base([]); });
+    scheduler.requestReconcile("manual");
+    expect(timers.delays()).toEqual([0]);
+    timers.fire(0); await flush();
+    expect(cycles).toBe(1);
+  });
+
+  it("supports an asynchronous local metadata scan", async () => {
+    let plannedSize: number | undefined;
+    const { scheduler, timers } = setup(() => ({
+      ...base([]),
+      scanLocal: async () => new Map([["note.md", { key: "note.md", size: 9, mtime: 99 }]]),
+      buildPlan: (local) => { plannedSize = local.get("note.md")?.size; return { operations: [] }; },
+    }));
+    scheduler.requestReconcile("manual"); timers.fire(0); await flush();
+    expect(plannedSize).toBe(9);
   });
 
   it("keeps cycles single-flight and coalesces events during an active scan", async () => {
