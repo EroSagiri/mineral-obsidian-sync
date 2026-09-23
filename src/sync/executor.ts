@@ -61,14 +61,25 @@ export type PartialReason =
    */
   | "local-delete-landing-unknown";
 
+/**
+ * What one operation did.
+ *
+ * `remote` is the revision a landed write left in R2, when this device knows it. It is a **report about
+ * what already happened**, never an input to anything: the planner does not read it, no precondition is
+ * derived from it, and no baseline depends on it. It exists because the side of the system that records
+ * remote mutations has to be told the exact revision, and only the response to the write itself can say
+ * what that is. Guessing, or re-reading the object afterwards, would either lie or race a later writer.
+ * It is present on every result that a landed PUT produced, including one whose baseline could not be
+ * committed — the write is a fact even when this device failed to account for it.
+ */
 export type OperationResult =
-  | { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry }
+  | { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry; remote?: RemoteVersion }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" | "conflict-superseded" }
   | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" | "remote-deletion-requires-version-identity" }
   /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
   | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure | VaultTrashFailure | ResolutionWriteFailure; httpStatus?: number }
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
-  | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed" }
+  | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed"; remote?: RemoteVersion }
   /**
    * A transfer that may have left a side effect this device cannot describe with a baseline.
    *
@@ -78,7 +89,7 @@ export type OperationResult =
    * write was proven superseded by the user. In every case exactly one more reconciliation is needed,
    * and the caller must not treat the remote window as fully observed.
    */
-  | { status: "partial"; key: string; reason: PartialReason; error?: string };
+  | { status: "partial"; key: string; reason: PartialReason; error?: string; remote?: RemoteVersion };
 
 /**
  * A conditional mismatch is a stale plan, not a plugin error. A received 4xx means the write
@@ -238,11 +249,11 @@ export class SafeExecutor {
     // same invariant every other landed PUT has. Leaving it uncommitted is what makes the device's own
     // resolution read as a remote concurrent edit on the next cycle.
     const floor = await this.commitFloorBaseline(operation.key, operation.expectedLocal, remote);
-    if (floor) return floor;
+    if (floor) return this.landed(floor, remote);
     await this.recordMergeBase(operation.key, { localVersion: operation.expectedLocal, remoteETag: remote.etag });
     // The confirmation only decides whether the *newest* local version is accounted for as well.
-    if (!same(await this.vault.adapter.stat(operation.key), operation.expectedLocal)) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed" };
-    return { status: "applied", key: operation.key };
+    if (!same(await this.vault.adapter.stat(operation.key), operation.expectedLocal)) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed", remote };
+    return { status: "applied", key: operation.key, remote };
   }
 
   /**
@@ -292,11 +303,11 @@ export class SafeExecutor {
     // The remote holds M. Re-check the local precondition before overwriting the user's file.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed" };
     const written = await this.writeLocal(operation.key, mergedBytes);
-    if ("status" in written) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed" };
+    if ("status" in written) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed", remote };
     const commit = await this.commit({ key: operation.key, local: written.version, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
-    if (commit) return commit;
+    if (commit) return this.landed(commit, remote);
     await this.recordMergeBase(operation.key, { localVersion: { key: operation.key, ...written.version }, remoteETag: remote.etag });
-    return { status: "applied", key: operation.key, localWrite: { key: operation.key, ...written.version } };
+    return { status: "applied", key: operation.key, remote, localWrite: { key: operation.key, ...written.version } };
   }
 
   /**
@@ -353,7 +364,18 @@ export class SafeExecutor {
     try { await this.mergeBase.record({ path: key, baseline }); } catch { /* snapshot unavailable; merge ability degrades only */ }
   }
 
-  private async commit(entry: PreviousEntry): Promise<OperationResult | undefined> {
+  /**
+   * Attaches the revision a landed PUT left to whatever result the write produced.
+   *
+   * The write is a fact the moment R2 answered, so this belongs on a `partial` or an `unresolved` just
+   * as much as on an `applied`: the baseline may have failed to commit, but another device can already
+   * see those bytes, and whatever records remote mutations must be able to report them.
+   */
+  private landed(result: Extract<OperationResult, { status: "unresolved" | "partial" }>, remote: RemoteVersion): OperationResult {
+    return { ...result, remote };
+  }
+
+  private async commit(entry: PreviousEntry): Promise<Extract<OperationResult, { status: "unresolved" }> | undefined> {
     try { await this.state.put(entry); return undefined; } catch { return { status: "unresolved", key: entry.key, reason: "state-commit-failed" }; }
   }
 
@@ -368,7 +390,7 @@ export class SafeExecutor {
    * is returned as `unresolved` for the caller to surface: a transfer whose baseline could not be
    * remembered is not a converged transfer.
    */
-  private async commitFloorBaseline(key: string, local: LocalEntry, remote: RemoteVersion): Promise<OperationResult | undefined> {
+  private async commitFloorBaseline(key: string, local: LocalEntry, remote: RemoteVersion): Promise<Extract<OperationResult, { status: "unresolved" }> | undefined> {
     const result = await this.commit({ key, local: { size: local.size, mtime: local.mtime }, remote, syncedAt: Date.now(), remoteIdentity: this.identity, ignorePolicy: this.ignorePolicy });
     if (!result) this.log(`floor-baseline committed path-digest=${pathDigest(key)} etag=${shortEtag(remote.etag)}`);
     return result;
@@ -400,11 +422,11 @@ export class SafeExecutor {
       const remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemote.kind === "absent" ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemote.value! });
       this.log(`upload landed path-digest=${pathDigest(operation.key)} etag=${shortEtag(remote.etag)}`);
       const floor = await this.commitFloorBaseline(operation.key, operation.expectedLocal, remote);
-      if (floor) return floor;
+      if (floor) return this.landed(floor, remote);
       await this.recordMergeBase(operation.key, { localVersion: operation.expectedLocal, remoteETag: remote.etag });
       const localStat = await this.vault.adapter.stat(operation.key);
       if (!same(localStat, operation.expectedLocal)) return this.catchUpLatestLocalUpload(operation.key, remote);
-      return { status: "applied", key: operation.key };
+      return { status: "applied", key: operation.key, remote };
     } catch (error) {
       return uploadFailure("PutObject", operation.key, error);
     }
@@ -419,13 +441,19 @@ export class SafeExecutor {
    */
   private async catchUpLatestLocalUpload(key: string, landedRemote: RemoteVersion): Promise<OperationResult> {
     this.log(`upload catch-up required path-digest=${pathDigest(key)} etag=${shortEtag(landedRemote.etag)}`);
-    const partial = (): OperationResult => {
+    /**
+     * `known` is the revision R2 holds once this result is returned, or `undefined` when that cannot be
+     * established. It is not the same question as the result status: the first PUT may have landed and
+     * the catch-up may not have been attempted at all, in which case the first revision is the truth.
+     */
+    const partial = (known?: RemoteVersion): OperationResult => {
       this.log(`upload catch-up partial path-digest=${pathDigest(key)} floorBaselineRetained=true`);
-      return { status: "partial", key, reason: "remote-applied-local-changed" };
+      return known === undefined ? { status: "partial", key, reason: "remote-applied-local-changed" } : { status: "partial", key, reason: "remote-applied-local-changed", remote: known };
     };
     let latest: Awaited<ReturnType<typeof readCurrentStableLocalBytes>>;
+    // Nothing was sent a second time, so the revision the first PUT produced is still what R2 holds.
     try { latest = await readCurrentStableLocalBytes(this.vault, key); }
-    catch { return partial(); }
+    catch { return partial(landedRemote); }
     try {
       const remote = await this.r2.putObject(key, latest.bytes, { ifMatch: landedRemote.etag });
       this.log(`upload catch-up landed path-digest=${pathDigest(key)} etag=${shortEtag(remote.etag)}`);
@@ -434,15 +462,20 @@ export class SafeExecutor {
       // device's own catch-up reads as a remote concurrent edit on the next cycle, which is a
       // `both-modified` conflict against itself.
       const floor = await this.commitFloorBaseline(key, latest.version, remote);
-      if (floor) return floor;
+      if (floor) return this.landed(floor, remote);
       await this.recordMergeBase(key, { localVersion: latest.version, remoteETag: remote.etag });
       // The confirmation only decides whether the *newest* local version is accounted for as well.
-      if (!same(await this.vault.adapter.stat(key), latest.version)) return partial();
-      return { status: "applied", key };
-    } catch {
+      if (!same(await this.vault.adapter.stat(key), latest.version)) return partial(remote);
+      return { status: "applied", key, remote };
+    } catch (error) {
       // The first PUT is known to have landed, so this must be surfaced as a partial result rather
       // than a failure: the floor baseline it committed is the only record of that transfer.
-      return partial();
+      //
+      // Which revision R2 now holds depends on why the catch-up did not complete. A refused conditional
+      // PUT provably wrote nothing, so the first PUT's revision is still the truth. Anything else — a
+      // 5xx, a timeout — leaves it genuinely unknown, and claiming either revision would be a guess
+      // about a state another device can already see.
+      return error instanceof RemoteObjectChangedError ? partial(landedRemote) : partial();
     }
   }
 

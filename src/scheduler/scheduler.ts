@@ -129,6 +129,15 @@ export class SyncScheduler {
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
     let remoteMutation: CycleRemoteMutation | undefined;
     const remoteChanges: RemoteChange[] = [];
+    /**
+     * Writes that definitely changed R2: the only things a mutation journal can be told.
+     *
+     * Kept separate from `remoteChanges` because the two audiences want different things. The Gateway
+     * wants to know that *something* may have changed, including a PUT whose outcome is ambiguous. A
+     * mutation journal wants a fact: an ambiguous PUT has no revision to name, and a made-up one would be
+     * rejected against R2 anyway.
+     */
+    const landedMutations: RemoteChange[] = [];
     const localWrites = new Map<string, LocalEntry>();
     const resultDetails = new Map<string, number>();
     const conflicts: ConflictObservation[] = [];
@@ -195,8 +204,13 @@ export class SyncScheduler {
             const mutation = observeRemoteMutation(operation, result);
             if (mutation === "confirmed" || (mutation === "possible" && remoteMutation !== "confirmed")) remoteMutation = mutation;
             if (mutation) {
-              const change = remoteChangeForOperation(operation);
+              const change = remoteChangeForOperation(operation, result);
               if (change) remoteChanges.push(change);
+              // Everything that definitely changed R2 is handed over, deletions included: what the journal
+              // can accept is the journal's contract, not something this cycle should pre-judge. A PUT whose
+              // outcome is unknown is *not* here — there is no revision to name — which is what keeps a
+              // report from ever being a guess.
+              if (mutation === "confirmed" && change) landedMutations.push(change);
             }
             // A resolution that actually applied is retired here, once, outside the planner: the
             // conflict it described no longer exists, and keeping its intent would let a stale decision
@@ -258,6 +272,15 @@ export class SyncScheduler {
     if (!useRemoteIncremental && outcome.kind === "confirmed") { this.incrementalStateTrusted = true; this.pendingRemoteChanges.length = 0; }
     if (useRemoteIncremental && outcome.kind !== "confirmed" && incremental) this.pendingRemoteChanges.unshift(incremental);
     if (outcome.kind !== "not-requested") this.dependencies.debug?.(`cycle gateway-end outcome=${outcome.kind} durationMs=${Date.now() - confirmationStartedAt}`);
+
+    // Mutations are reported on the way out of *every* cycle, after the boundary is final, and never
+    // through the handshake branch: a delta cycle that wrote R2 while reconciling has landed a fact just
+    // as much as a full one, and the fact must reach the journal whether or not a generation was
+    // confirmed here. The report cannot change any result: the write was durable before this ran.
+    if (landedMutations.length > 0 && this.dependencies.mutationIngress) {
+      try { await this.dependencies.mutationIngress.report(landedMutations); }
+      catch { this.dependencies.debug?.("mutation ingress report failed"); }
+    }
 
     this.lastCycleFinishedAt = Date.now(); this.lastResultCounts = counts; this.lastFailureClass = failure;
     this.lastCycleRemoteMutation = remoteMutation !== undefined;
@@ -412,9 +435,20 @@ export class SyncScheduler {
   private publish(): void { this.dependencies.onStatus?.(this.state, this.lastResultCounts); }
 }
 
-function remoteChangeForOperation(operation: SyncOperation): RemoteChange | undefined {
+/**
+ * The change one operation implies for the remote control plane, with the revision it left behind.
+ *
+ * The Gateway accepts `etag`/`size` as optional hints and validates them, and a mutation journal
+ * requires them: an ingress checks a reported `put` against R2 itself, so a report without the exact
+ * revision can only be rejected. Both therefore read the same value, taken from the write's own
+ * response — never re-read afterwards, which would race a later writer, and never guessed.
+ */
+function remoteChangeForOperation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): RemoteChange | undefined {
+  const revision = "remote" in result ? result.remote : undefined;
   if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") return { op: "delete", path: operation.key };
-  if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") return { op: "put", path: operation.key };
+  if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") {
+    return { op: "put", path: operation.key, ...(revision?.etag ? { etag: revision.etag } : {}), ...(typeof revision?.size === "number" ? { size: revision.size } : {}) };
+  }
   return undefined;
 }
 

@@ -65,7 +65,8 @@ describe("resolve-keep-local", () => {
     const local = vault({ "a.md": [1, 2, 3] });
     let condition: unknown;
     const result = await new SafeExecutor(local as never, remote({ putObject: async (_key, _body, options) => { condition = options; return { size: 3, etag: "NEW" }; } }), state(), identity, "[]").execute(keepLocal());
-    expect(result).toEqual({ status: "applied", key: "a.md" });
+    // The revision the PUT returned travels with the result, which is what a mutation journal needs.
+    expect(result).toMatchObject({ status: "applied", key: "a.md", remote: { size: 3, etag: "NEW" } });
     // Only the version the user saw may be replaced.
     expect(condition).toEqual({ ifMatch: "R" });
   });
@@ -86,7 +87,7 @@ describe("resolve-keep-local", () => {
     let condition: unknown;
     const result = await new SafeExecutor(local as never, remote({ putObject: async (_key, _body, options) => { condition = options; return { size: 3, etag: "NEW" }; } }), state(), identity, "[]").execute(keepLocal({ expectedRemoteETag: undefined, expectedRemoteAbsent: true }));
 
-    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(result).toMatchObject({ status: "applied", key: "a.md", remote: { etag: "NEW" } });
     expect(condition).toEqual({ ifNoneMatch: "*" });
   });
 
@@ -122,8 +123,9 @@ describe("resolve-keep-local", () => {
     const executor = new SafeExecutor(local as never, remote({ putObject: async () => { local.files.set("a.md", { bytes: bytes([9, 9, 9, 9]), mtime: 77 }); return { size: 3, etag: "NEW" }; } }), saved, identity, "[]");
     const result = await executor.execute(keepLocal());
     // The remote holds the resolved content, the local edit survives, and the newest local version is
-    // not claimed converged — but the PUT that did land is, because that pair is true.
-    expect(result).toEqual({ status: "partial", key: "a.md", reason: "remote-applied-local-changed" });
+    // not claimed converged — but the PUT that did land is, because that pair is true, and the revision
+    // it produced is reported so the write is not invisible to whatever records remote mutations.
+    expect(result).toMatchObject({ status: "partial", key: "a.md", reason: "remote-applied-local-changed", remote: { size: 3, etag: "NEW" } });
     expect(saved.entries).toMatchObject([{ local: { size: 3, mtime: 10 }, remote: { size: 3, etag: "NEW" } }]);
     expect([...new Uint8Array(local.files.get("a.md")!.bytes)]).toEqual([9, 9, 9, 9]);
 

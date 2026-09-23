@@ -2,9 +2,18 @@ import { App, PluginSettingTab, Setting } from "obsidian";
 import type R2PersonalSyncPlugin from "./main";
 import { R2Configuration } from "./remote/r2-client";
 import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings } from "./gateway/types";
+import { DEFAULT_MUTATION_INGRESS_SETTINGS, type MutationIngressSettingsFields } from "./gateway/mutation-ingress";
 
-export interface R2SyncSettings extends R2Configuration, GatewaySettings { debugLogging: boolean; ignoredPaths: string[]; integrityReconcileIntervalMinutes: number; }
-export const DEFAULT_SETTINGS: R2SyncSettings = { ...DEFAULT_GATEWAY_SETTINGS, endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "", debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20 };
+export interface R2SyncSettings extends R2Configuration, GatewaySettings, MutationIngressSettingsFields {
+  debugLogging: boolean;
+  ignoredPaths: string[];
+  integrityReconcileIntervalMinutes: number;
+}
+export const DEFAULT_SETTINGS: R2SyncSettings = {
+  ...DEFAULT_GATEWAY_SETTINGS, ...DEFAULT_MUTATION_INGRESS_SETTINGS,
+  endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "",
+  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20,
+};
 
 export class R2SyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: R2PersonalSyncPlugin) { super(app, plugin); }
@@ -37,6 +46,12 @@ export class R2SyncSettingTab extends PluginSettingTab {
     text("Gateway endpoint", "Example: https://mineral-sync-gateway.<subdomain>.workers.dev", "gatewayEndpoint");
     text("Gateway token", "The Gateway bearer secret. Stored locally; never logged and never placed in a URL.", "gatewayToken", true);
     new Setting(containerEl).setName("Gateway status").setDesc(this.plugin.gatewayStatusText());
+    containerEl.createEl("h3", { text: "Mutation journal (remote writes this device made)" });
+    containerEl.createEl("p", { text: "Optional. After an R2 write lands, this device can report the fact — the exact path and revision — to the Vault's mutation ingress, which verifies it against R2 and publishes it. It never changes a sync outcome: the write is already durable, so a failure only defers the report. Deletions are not reported yet, because this plugin deletes logically and the ingress expects the object to be gone." });
+    new Setting(containerEl).setName("Report landed writes").setDesc("When off, nothing is reported and the Gateway wake-up is the only notification.").addToggle((toggle) => toggle.setValue(this.plugin.settings.mutationIngressEnabled).onChange(async (value) => { this.plugin.settings.mutationIngressEnabled = value; await this.plugin.saveSettings(); }));
+    text("Ingress endpoint", "The Vault worker's base URL. The report is a POST to /internal/mutations.", "mutationIngressEndpoint");
+    text("Ingress token", "The mutation ingress bearer secret. Stored locally; never logged and never placed in a URL.", "mutationIngressToken", true);
+    new Setting(containerEl).setName("Ingress status").setDesc(this.plugin.mutationIngressStatusText());
     new Setting(containerEl).setName("Integrity reconcile interval").setDesc("While the app is in the foreground, run a full R2 and tombstone verification at this interval (10–30 minutes). Foreground resume always verifies immediately.").addText((input) => {
       input.setValue(String(this.plugin.settings.integrityReconcileIntervalMinutes)).setPlaceholder("20");
       input.inputEl.type = "number";

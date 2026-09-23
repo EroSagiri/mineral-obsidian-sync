@@ -76,10 +76,25 @@ export interface SchedulerRemoteChange {
   canApplyIncrementally(generation: string): boolean;
 }
 
+/**
+ * The remote-mutation journal, as the scheduler sees it.
+ *
+ * A second control-plane port rather than a method on the Gateway one, because it is a different
+ * service with a different contract: the Gateway is told "the remote may have changed", while a
+ * mutation is *the fact itself*, verified against R2 by the receiver. The scheduler only has to hand
+ * over what it observed — which writes landed, and with which revision — and is told nothing back.
+ */
+export interface SchedulerMutationIngress {
+  /** Records writes that landed, with the revision each left in R2. Never changes a cycle's outcome. */
+  report(changes: readonly RemoteChange[]): Promise<void>;
+}
+
 export interface SchedulerDependencies {
   captureCycle(): CycleDependencies;
   visible(): boolean;
   remoteChange?: SchedulerRemoteChange;
+  /** The journal that owns the truth about writes this device performed. */
+  mutationIngress?: SchedulerMutationIngress;
   /**
    * Observes the conflicts a plan produced, after the cycle has executed. It is deliberately a
    * post-cycle hook rather than something the planner calls: a cycle's plan is never rewritten while

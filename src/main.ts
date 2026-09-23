@@ -19,6 +19,7 @@ import { localChanged } from "./sync/fingerprint";
 import { SyncScheduler } from "./scheduler/scheduler";
 import { changedLocalKeys } from "./scheduler/mobile-local-drift";
 import { GatewayClient, type GatewayClientDiagnostics } from "./gateway/client";
+import { createMutationIngressReporter, mutationIngressConfig, type MutationIngressReporter } from "./gateway/mutation-ingress";
 import { RequestUrlGatewayTransport } from "./gateway/transport";
 import { IndexedDbGatewayCursorStore } from "./gateway/cursor-store";
 import { resolveGatewayConfig } from "./gateway/config";
@@ -98,6 +99,18 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private lastConflictCount = 0;
   /** Retention is a once-per-session pass, held back until a reconciliation has finished. */
   private tombstoneCleanup: "waiting" | "ready" | "done" = "waiting";
+  /**
+   * The mutation journal, as this device writes to it.
+   *
+   * It is configured once and reads the live settings on every report, so toggling it or fixing a token
+   * takes effect on the next cycle without rebuilding the scheduler.
+   */
+  private readonly mutationIngress: MutationIngressReporter = createMutationIngressReporter({
+    settings: () => mutationIngressConfig(this.settings),
+    transport: new RequestUrlGatewayTransport(),
+    now: () => Date.now(),
+    debug: (message) => this.debug(message),
+  });
   /** The derived channel for the current settings, refreshed once per cycle. */
   private resolvedChannel?: string;
   private lastIntegrityRequestedAt = 0;
@@ -174,6 +187,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
       onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
       debug: (message) => this.debug(message),
       onConflicts: (conflicts) => this.handleConflicts(conflicts),
+      // A second control-plane port, for the service that owns the *facts* rather than the wake-up. It is
+      // handed only what this device observed a write to leave in R2, and its answer is never read: the
+      // write is durable before this runs, so a report can only defer, never fail or reclassify.
+      mutationIngress: { report: (changes) => this.mutationIngress.report(changes) },
       onResolutionApplied: (conflictId, path) => this.clearResolution(conflictId, path),
       remoteChange: {
         hasPending: () => this.gateway?.hasPending() ?? false,
@@ -232,6 +249,20 @@ export default class R2PersonalSyncPlugin extends Plugin {
   /** Read-only Gateway diagnostics for the connection command and the settings tab. */
   gatewayDiagnostics(): { config: GatewayConfigState; connection?: GatewayClientDiagnostics } {
     return { config: this.gatewayConfig, connection: this.gateway?.diagnostics() };
+  }
+
+  /**
+   * Read-only mutation-journal diagnostics.
+   *
+   * The number of deferred reports is the only interesting fact here, and it is the one a silent
+   * best-effort path would otherwise hide: a healthy ingress drains to zero within a cycle, while a
+   * count that keeps growing means reports are being accepted by nobody.
+   */
+  mutationIngressStatusText(): string {
+    if (!this.settings.mutationIngressEnabled) return "Disabled. Landed writes are announced to the Gateway only.";
+    if (!this.settings.mutationIngressEndpoint.trim() || !this.settings.mutationIngressToken.trim()) return "Misconfigured. Both the endpoint and the token are required; syncing is unaffected.";
+    const pending = this.mutationIngress.pendingCount();
+    return `Configured. ${pending === 0 ? "No deferred reports." : `${pending} deferred report${pending === 1 ? "" : "s"} awaiting a retry.`}`;
   }
 
   gatewayStatusText(): string {

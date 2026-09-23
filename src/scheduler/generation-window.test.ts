@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SyncScheduler } from "./scheduler";
 import type { CycleDependencies, SchedulerRemoteChange, SchedulerTimers } from "./types";
+import type { OperationResult } from "../sync/executor";
 import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "../sync/types";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
 
@@ -46,7 +47,7 @@ const NOTE_REMOTE: RemoteEntry = { key: "note.md", size: 5, etag: "ETAG-2", last
 const NOTE_PREVIOUS: PreviousEntry = { key: "note.md", local: { size: 5, mtime: 10 }, remote: { size: 5, etag: "ETAG-1" }, syncedAt: 1 };
 const DOWNLOAD: SyncOperation = { type: "download", key: "note.md", reason: "remote changed", expectedLocal: NOTE_LOCAL, expectedRemote: NOTE_REMOTE };
 
-function harness(execute: CycleDependencies["execute"]) {
+function harness(execute: CycleDependencies["execute"], ingest?: { reported: unknown[][] }) {
   const timers = new FakeTimers();
   const { remote, confirmed, announce } = fakeRemote();
   const observedLocally: string[][] = [];
@@ -71,7 +72,10 @@ function harness(execute: CycleDependencies["execute"]) {
     buildPlan: () => ({ operations: plan.operations }),
     execute,
   });
-  const scheduler = new SyncScheduler({ captureCycle: cycle, visible: () => true, timers, remoteChange: remote });
+  const scheduler = new SyncScheduler({
+    captureCycle: cycle, visible: () => true, timers, remoteChange: remote,
+    ...(ingest ? { mutationIngress: { report: async (changes) => { ingest.reported.push([...changes]); } } } : {}),
+  });
   return { scheduler, timers, confirmed, announce, observedLocally, observedIncrementally, plan, fullRemoteScans: () => fullRemoteScans };
 }
 
@@ -227,8 +231,7 @@ describe("a remote delete is generation-protected", () => {
     expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(0);
   });
 
-  it("never applies a deletion incrementally from a generation that is not the next one", async () => {
-    const env = harness(async (operation) => ({ status: "applied", key: operation.key }));
+  it("never applies a deletion incrementally from a generation that is not the next one", async () => {    const env = harness(async (operation) => ({ status: "applied", key: operation.key }));
     await establishTrustedWindow(env);
 
     // The client already drops repeated or older generations, so this is the scheduler's own backstop: a
@@ -259,5 +262,79 @@ describe("a remote delete is generation-protected", () => {
     expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(1);
     // The shortfall is retried immediately rather than waiting for an unrelated event.
     expect(env.timers.delays()).toEqual([0]);
+  });
+});
+
+/**
+ * Reporting a landed write to the mutation journal.
+ *
+ * The report is driven by the *result*, not the operation: only a write whose revision this device
+ * actually received can be reported, because the ingress checks it against R2. It also must not be tied
+ * to the generation handshake — a delta cycle that reconciles and writes while doing so has landed a fact
+ * just as much as a full cycle, and other devices (and the index) need it either way.
+ */
+describe("landed mutations are reported with their revision", () => {
+  const landed = (etag: string, size: number): OperationResult => ({ status: "applied", key: "note.md", remote: { size, etag } });
+  const UPLOAD: SyncOperation = { type: "upload", key: "note.md", reason: "local changed", expectedLocal: NOTE_LOCAL, expectedRemote: { kind: "etag", value: "ETAG-1" } };
+
+  it("reports the exact revision the PUT returned, on a delta cycle too", async () => {
+    const ingest = { reported: [] as unknown[][] };
+    const env = harness(async () => landed("ETAG-2", 5), ingest);
+    await establishTrustedWindow(env);
+    env.plan.operations = [UPLOAD];
+
+    // A remote-change cycle that resolves a conflict by writing: the delta path confirms its generation
+    // without going through the closing handshake, and the write must still reach the journal.
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [{ op: "put", path: "note.md" }]);
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.observedIncrementally).toHaveLength(1);
+    expect(ingest.reported).toEqual([[{ op: "put", path: "note.md", etag: "ETAG-2", size: 5 }]]);
+  });
+
+  it("reports a write whose local half did not finish, because the bytes are already visible", async () => {
+    const ingest = { reported: [] as unknown[][] };
+    const env = harness(async () => ({ status: "partial", key: "note.md", reason: "remote-applied-local-changed", remote: { size: 5, etag: "ETAG-2" } }), ingest);
+    await establishTrustedWindow(env);
+    env.plan.operations = [UPLOAD];
+
+    env.scheduler.requestReconcile("manual");
+    env.timers.fire(0);
+    await flush();
+
+    expect(ingest.reported).toEqual([[{ op: "put", path: "note.md", etag: "ETAG-2", size: 5 }]]);
+  });
+
+  it("reports nothing for a write whose outcome is unknown, and nothing for a download", async () => {
+    const ingest = { reported: [] as unknown[][] };
+    const env = harness(async (operation) => operation.type === "upload"
+      ? { status: "unresolved", key: operation.key, reason: "ambiguous-put" }
+      : { status: "applied", key: operation.key }, ingest);
+    await establishTrustedWindow(env);
+    env.plan.operations = [UPLOAD, DOWNLOAD];
+
+    env.scheduler.requestReconcile("manual");
+    env.timers.fire(0);
+    await flush();
+
+    // An ambiguous PUT has no revision to name, and a download wrote nothing remotely at all.
+    expect(ingest.reported).toEqual([]);
+  });
+
+  it("reports a deletion as a deletion, with no revision to claim", async () => {
+    const ingest = { reported: [] as unknown[][] };
+    const env = harness(async () => ({ status: "applied", key: "note.md" }), ingest);
+    await establishTrustedWindow(env);
+    env.plan.operations = [{ type: "delete-remote", key: "note.md", reason: "local deletion", expectedRemoteETag: "ETAG-1" }];
+
+    env.scheduler.requestReconcile("manual");
+    env.timers.fire(0);
+    await flush();
+
+    // It reaches the port as a delete; whether a `delete` can be *journaled* is the ingress's contract,
+    // and the plugin does not pretend a revision exists for a write it never performed.
+    expect(ingest.reported).toEqual([[{ op: "delete", path: "note.md" }]]);
   });
 });

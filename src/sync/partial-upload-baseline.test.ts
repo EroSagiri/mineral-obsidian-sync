@@ -116,7 +116,7 @@ describe("upload: a landed PUT always leaves a floor baseline", () => {
     const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(upload());
 
     // The catch-up could not establish a stable local version, so the transfer is not converged ...
-    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-applied-local-changed" });
+    expect(result).toMatchObject({ status: "partial", key: "note.md", reason: "remote-applied-local-changed", remote: { etag: "ETAG-A" } });
     expect(puts).toBe(1);
     // ... but the PUT that did land is recorded as exactly the pair it proved.
     expect(saved.entries).toHaveLength(1);
@@ -152,7 +152,7 @@ describe("upload: a landed PUT always leaves a floor baseline", () => {
 
     const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(upload());
 
-    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-applied-local-changed" });
+    expect(result).toMatchObject({ status: "partial", key: "note.md", reason: "remote-applied-local-changed", remote: { etag: "ETAG-B" } });
     expect(bodies).toEqual(["base\n", "base\nB\n"]);
     // Both landed transfers are recorded, newest last: the catch-up's pair must not be lost.
     expect(saved.entries).toHaveLength(2);
@@ -194,7 +194,7 @@ describe("upload: a landed PUT always leaves a floor baseline", () => {
 
     const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]", undefined, base.recorder).execute(upload());
 
-    expect(result).toEqual({ status: "applied", key: "note.md" });
+    expect(result).toMatchObject({ status: "applied", key: "note.md", remote: { etag: "ETAG-B" } });
     expect(bodies).toEqual(["base\n", "base\nB\n"]);
     // The baseline must end on the newer pair, not stay behind on the floor.
     expect(saved.entries).toHaveLength(2);

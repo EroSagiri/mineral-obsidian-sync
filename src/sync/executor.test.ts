@@ -54,7 +54,7 @@ describe("SafeExecutor", () => {
   it("uses conditional create and commits exactly the successful key", async () => {
     const local = vault({ "a.bin": [1, 2, 3] }), saved = state(); let condition: unknown;
     const result = await new SafeExecutor(local as never, remote({ putObject: async (key, _body, options) => { condition = options; return { key, size: 3, etag: "new", lastModified: 22 }; } }), saved, identity, "[]").execute(upload());
-    expect(result).toEqual({ status: "applied", key: "a.bin" }); expect(condition).toEqual({ ifNoneMatch: "*" }); expect(saved.entries).toHaveLength(1);
+    expect(result).toMatchObject({ status: "applied", key: "a.bin", remote: { size: 3, etag: "new" } }); expect(condition).toEqual({ ifNoneMatch: "*" }); expect(saved.entries).toHaveLength(1);
   });
   it("preserves state when a conditional update is stale", async () => {
     const op = { ...upload(), expectedRemote: { kind: "etag" as const, value: "old" } }, saved = state();
@@ -74,7 +74,8 @@ describe("SafeExecutor", () => {
       return { size: 4, etag: "latest" };
     } });
 
-    await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "applied", key: "a.bin" });
+    // The reported revision is the catch-up's, because that is what R2 holds once this returns.
+    await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toMatchObject({ status: "applied", key: "a.bin", remote: { size: 4, etag: "latest" } });
     expect(writes).toEqual([{ body: [1, 2, 3], options: { ifNoneMatch: "*" } }, { body: [4, 5, 6, 7], options: { ifMatch: "first" } }]);
     // Two true facts, in order: the first PUT's own pair, then the catch-up's upgrade of it.
     expect(saved.entries).toMatchObject([
@@ -89,7 +90,10 @@ describe("SafeExecutor", () => {
       if (calls === 1) { local.files.set("a.bin", { bytes: bytes([4, 5, 6, 7]), mtime: 20 }); return { size: 3, etag: "first" }; }
       throw new RemoteObjectChangedError();
     } });
-    await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toEqual({ status: "partial", key: "a.bin", reason: "remote-applied-local-changed" });
+    // The refused catch-up changes nothing about the transfer that did land: its floor baseline is kept,
+    // which is what stops the next plan from reading this device's own PUT as a remote concurrent edit.
+    // The revision reported is the first PUT's, because the second one provably never landed.
+    await expect(new SafeExecutor(local as never, client, saved, identity, "[]").execute(upload())).resolves.toMatchObject({ status: "partial", key: "a.bin", reason: "remote-applied-local-changed", remote: { etag: "first" } });
     // The refused catch-up changes nothing about the transfer that did land: its floor baseline is kept,
     // which is what stops the next plan from reading this device's own PUT as a remote concurrent edit.
     expect(saved.entries).toMatchObject([{ local: { size: 3, mtime: 10 }, remote: { etag: "first" } }]);
@@ -105,7 +109,9 @@ describe("SafeExecutor", () => {
     expect(new Uint8Array(local.files.get("a.bin")!.bytes)).toEqual(new Uint8Array([7, 8])); expect(saved.entries).toHaveLength(1);
   });
   it("reports a successful transfer with failed state persistence as unresolved", async () => {
-    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, remote(), state(true), identity, "[]").execute(upload())).resolves.toEqual({ status: "unresolved", key: "a.bin", reason: "state-commit-failed" });
+    // The PUT is a fact even though this device could not record its baseline, so the revision it left is
+    // still carried: whatever records remote mutations can report it, and the next cycle repairs the state.
+    await expect(new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, remote(), state(true), identity, "[]").execute(upload())).resolves.toMatchObject({ status: "unresolved", key: "a.bin", reason: "state-commit-failed", remote: { etag: "new" } });
   });
   it("classifies a received auth failure as failed instead of an ambiguous write", async () => {
     const saved = state();
@@ -128,7 +134,7 @@ describe("SafeExecutor", () => {
   it("commits only what the write response established, without inventing a server timestamp", async () => {
     const saved = state();
     const result = await new SafeExecutor(vault({ "a.bin": [1, 2, 3] }) as never, remote(), saved, identity, "[]").execute(upload());
-    expect(result).toEqual({ status: "applied", key: "a.bin" });
+    expect(result).toMatchObject({ status: "applied", key: "a.bin", remote: { size: 3, etag: "new" } });
     expect(saved.entries[0]!.remote).toEqual({ size: 3, etag: "new" });
     expect(saved.entries[0]!.remote!.lastModified).toBeUndefined();
   });
