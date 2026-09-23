@@ -29,6 +29,7 @@ import { IndexedDbConflictStores } from "./conflict/stores";
 import { createMergeBaseRecorder, recordMergeBaseBatch, type MergeBaseInput } from "./conflict/merge-base";
 import { ConflictCoordinator } from "./conflict/coordinator";
 import { ConflictResolverModal } from "./ui/conflict-resolver-modal";
+import { CONFLICT_RESOLVER_CSS } from "./ui/conflict-styles";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
@@ -113,9 +114,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
         setStatus: (text) => this.showBusyStatus(text),
       });
     }
-    // Theme-variable CSS for the status glyph, injected rather than shipped as a second file, so the
-    // deployment surface stays exactly `main.js` + `manifest.json`.
-    const statusStyle = document.head.createEl("style", { text: SYNC_STATUS_CSS });
+    // Theme-variable CSS for the status glyph and the resolver, injected rather than shipped as a
+    // second file, so the deployment surface stays exactly `main.js` + `manifest.json`.
+    const statusStyle = document.head.createEl("style", { text: `${SYNC_STATUS_CSS}\n${CONFLICT_RESOLVER_CSS}` });
     this.register(() => statusStyle.remove());
     this.statusBar = this.addStatusBarItem();
     // Attached once, to the item itself, because its inner content is rebuilt on every state change.

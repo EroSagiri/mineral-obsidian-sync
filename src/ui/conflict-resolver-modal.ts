@@ -1,20 +1,30 @@
 import { Modal, Notice, type App } from "obsidian";
 import { mergedContentOf, shortConflictId } from "../conflict/identity";
 import { CONFLICT_PROTOCOL_VERSION, type ConflictRecord, type ResolutionIntent } from "../conflict/types";
-import { presentConflict, type ConflictActionView, type ConflictView } from "./conflict-presentation";
+import {
+  presentConflict,
+  type ConflictPresentation,
+  type DifferenceView,
+  type TechnicalEntry,
+} from "./conflict-presentation";
 
 /**
  * The manual conflict resolver.
  *
- * The one rule this file must never break: **the UI does not write data.** It reads snapshots, renders
- * a view, and persists a `ResolutionIntent`. Every actual file or R2 change is performed later by
- * `SafeExecutor` through the planner, so there is no code path here that could overwrite a note or an
- * object.
+ * The user is not here to perform a merge. Mineral either has a result prepared, in which case the job
+ * is to review it and accept it, or it does not, in which case the job is to write one. The screens
+ * follow that order:
  *
- * Beyond that it is deliberately not a diff tool. The default screen shows the disagreeing region, the
- * two sides named by role, and the decisions a person would actually make; the common ancestor, the
- * ETags, the conflict identity and the raw marker draft exist, but only inside a collapsed
- * "Technical details" block. Reading a Git conflict is not a prerequisite for resolving one.
+ * - **the result page** asks one question ("is this the result you want?") and offers exactly one
+ *   primary action plus two quiet alternatives;
+ * - **the differences page** is the only place two sides are shown side by side, and the only place the
+ *   overwrite-the-other-side actions live, so a destructive choice is never next to the recommended one;
+ * - **the edit page** works on the final text, never on conflict markers;
+ * - **Technical details** is collapsed and is never needed to finish.
+ *
+ * The rule this file must never break is unchanged: **the UI does not write data.** It renders a view
+ * and persists a `ResolutionIntent`; every file and R2 change is performed later by `SafeExecutor`
+ * through the planner.
  */
 export interface ConflictResolverDependencies {
   list(): Promise<ConflictRecord[]>;
@@ -25,11 +35,16 @@ export interface ConflictResolverDependencies {
 }
 
 type Draft = { path: string; text: string };
+type Page = "result" | "differences" | "edit";
 
 export class ConflictResolverModal extends Modal {
   private records: ConflictRecord[] = [];
   private index = 0;
+  private page: Page = "result";
   private draft?: Draft;
+  /** The queue size when the resolver opened, so progress stays readable while it shrinks. */
+  private total = 0;
+  private resolved = 0;
 
   constructor(app: App, private readonly dependencies: ConflictResolverDependencies) { super(app); }
 
@@ -40,56 +55,137 @@ export class ConflictResolverModal extends Modal {
     try { this.records = await this.dependencies.list(); }
     catch { this.records = []; }
     loading.remove();
+    this.total = this.records.length;
+    this.resolved = 0;
     this.render();
   }
 
   onClose(): void { this.contentEl.empty(); }
 
+  private get record(): ConflictRecord | undefined { return this.records[this.index]; }
+
   private render(): void {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Mineral Sync" });
-    const record = this.records[this.index];
-    if (!record) { contentEl.createEl("p", { text: "No conflicts — everything is in sync." }); return; }
+    const record = this.record;
+    if (!record) {
+      contentEl.createEl("p", { text: "All conflicts resolved", cls: "mineral-sync-conflicts__headline" });
+      const actions = contentEl.createDiv({ cls: "mineral-sync-conflicts__actions" });
+      this.button(actions, "Done", () => this.close(), true);
+      return;
+    }
 
     const view = presentConflict(record);
     contentEl.createEl("h3", { text: view.path, cls: "mineral-sync-conflicts__path" });
-    contentEl.createEl("p", { text: view.headline, cls: "mineral-sync-conflicts__headline" });
-    if (this.records.length > 1) this.renderPager(contentEl);
-    if (view.notice) contentEl.createEl("p", { text: view.notice, cls: "mineral-sync-conflicts__notice" });
-
-    for (const hunk of view.hunks) {
-      const section = contentEl.createDiv({ cls: "mineral-sync-conflicts__hunk" });
-      section.createEl("p", { text: hunk.title, cls: "mineral-sync-conflicts__hunk-title" });
-      if (hunk.contextBefore) section.createEl("pre", { text: hunk.contextBefore, cls: "mineral-sync-conflicts__context" });
-      const columns = section.createDiv({ cls: "mineral-sync-conflicts__columns" });
-      this.side(columns, hunk.currentHeading, hunk.current, "current");
-      this.side(columns, hunk.otherHeading, hunk.other, "other");
-      if (hunk.contextAfter) section.createEl("pre", { text: hunk.contextAfter, cls: "mineral-sync-conflicts__context" });
+    if (this.total > 1) {
+      const pager = contentEl.createDiv({ cls: "mineral-sync-conflicts__pager" });
+      pager.createSpan({ text: `${this.total} conflicts need attention`, cls: "mineral-sync-conflicts__count" });
+      // Progress through the queue, so resolving one reads as "next", not as a fresh problem.
+      pager.createSpan({ text: `${this.resolved + this.index + 1} of ${this.total}`, cls: "mineral-sync-conflicts__count" });
+      this.button(pager, "Previous", () => this.step(-1));
+      this.button(pager, "Next", () => this.step(1));
     }
 
-    // Only shown when keeping both is a real answer, which is the case this UI exists to make obvious.
-    if (view.keepBothText !== undefined) {
-      const preview = contentEl.createDiv({ cls: "mineral-sync-conflicts__preview" });
-      preview.createEl("p", { text: "Result if you keep both:", cls: "mineral-sync-conflicts__hunk-title" });
-      preview.createEl("pre", { text: view.keepBothText, cls: "mineral-sync-conflicts__result" });
-    }
-
-    const actions = contentEl.createDiv({ cls: "mineral-sync-conflicts__actions" });
-    for (const action of view.actions) this.action(actions, action, view);
-    this.technical(contentEl, view);
+    if (view.kind === "delete-vs-modify") { this.renderDeleteVersusModify(contentEl, view); return; }
+    if (this.page === "differences") { this.renderDifferences(contentEl, view); return; }
+    if (this.page === "edit") { this.renderEdit(contentEl, record, view); return; }
+    this.renderResult(contentEl, view);
   }
 
-  private renderPager(parent: HTMLElement): void {
-    const nav = parent.createDiv({ cls: "mineral-sync-conflicts__pager" });
-    nav.createSpan({ text: `Conflict ${this.index + 1} of ${this.records.length}`, cls: "mineral-sync-conflicts__count" });
-    const step = (delta: number): void => {
-      this.index = (this.index + delta + this.records.length) % this.records.length;
-      this.draft = undefined;
-      this.render();
-    };
-    this.button(nav, "Previous conflict", () => step(-1));
-    this.button(nav, "Next conflict", () => step(1));
+  private step(delta: number): void {
+    this.index = (this.index + delta + this.records.length) % this.records.length;
+    this.draft = undefined;
+    this.page = "result";
+    this.render();
+  }
+
+  /** Page A and B: the suggested result, or the admission that there is none. */
+  private renderResult(parent: HTMLElement, view: Extract<ConflictPresentation, { kind: "suggested" | "manual" }>): void {
+    parent.createEl("p", { text: view.summary, cls: "mineral-sync-conflicts__headline" });
+    if (view.kind === "manual") {
+      parent.createEl("p", { text: "This change could not be merged automatically.", cls: "mineral-sync-conflicts__headline" });
+      if (view.notice) parent.createEl("p", { text: view.notice, cls: "mineral-sync-conflicts__notice" });
+    } else {
+      const block = parent.createDiv({ cls: "mineral-sync-conflicts__preview" });
+      block.createEl("p", { text: view.label, cls: "mineral-sync-conflicts__hunk-title" });
+      block.createEl("pre", { text: view.suggestedText, cls: "mineral-sync-conflicts__result" });
+    }
+
+    const actions = parent.createDiv({ cls: "mineral-sync-conflicts__actions" });
+    if (view.kind === "suggested") {
+      this.button(actions, "Use suggested result", () => { this.draft = { path: view.path, text: view.suggestedText }; void this.apply("merged"); }, true);
+      this.button(actions, "View differences", () => { this.page = "differences"; this.render(); });
+      this.button(actions, "Edit manually", () => { this.page = "edit"; this.render(); });
+    } else {
+      // With nothing trustworthy prepared, writing the result is the primary path, not a fallback.
+      this.button(actions, "Edit manually", () => { this.page = "edit"; this.render(); }, true);
+      this.button(actions, "View differences", () => { this.page = "differences"; this.render(); });
+    }
+    this.technical(parent, view.technical);
+  }
+
+  /**
+   * Page C: a deletion against an edit is not a merge, so it gets its own words and its own two
+   * decisions. "Keep note" is primary because it is the recoverable one.
+   */
+  private renderDeleteVersusModify(parent: HTMLElement, view: Extract<ConflictPresentation, { kind: "delete-vs-modify" }>): void {
+    parent.createEl("p", { text: view.explanation, cls: "mineral-sync-conflicts__headline" });
+    const block = parent.createDiv({ cls: "mineral-sync-conflicts__preview" });
+    block.createEl("p", { text: "Modified version", cls: "mineral-sync-conflicts__hunk-title" });
+    block.createEl("pre", { text: view.modifiedText, cls: "mineral-sync-conflicts__result" });
+    const actions = parent.createDiv({ cls: "mineral-sync-conflicts__actions" });
+    const keep = view.deletedSide === "other"
+      ? { type: "keep-local" as const, label: "Keep note" }
+      : { type: "keep-remote" as const, label: "Keep note" };
+    const remove = view.deletedSide === "other"
+      ? { type: "accept-remote-delete" as const, label: "Delete note" }
+      : { type: "accept-local-delete" as const, label: "Delete note" };
+    this.button(actions, keep.label, () => void this.apply(keep.type), true);
+    this.button(actions, remove.label, () => void this.apply(remove.type));
+    this.technical(parent, view.technical);
+  }
+
+  /**
+   * The second layer: the only screen that asks the user to compare anything, and the only one where
+   * overwriting a side is offered. Base is deliberately absent — it belongs to technical details.
+   */
+  private renderDifferences(parent: HTMLElement, view: Extract<ConflictPresentation, { kind: "suggested" | "manual" }>): void {
+    parent.createEl("p", { text: "Differences", cls: "mineral-sync-conflicts__headline" });
+    if (!view.differences.length) {
+      parent.createEl("p", { text: "The two versions have no line-level difference.", cls: "mineral-sync-conflicts__notice" });
+    } else if (view.differencesAreNoise) {
+      parent.createEl("p", { text: "The two versions differ only in formatting — line endings, trailing spaces or the final newline.", cls: "mineral-sync-conflicts__notice" });
+    }
+    for (const difference of view.differences) {
+      if (difference.kind === "formatting-only") continue;
+      this.difference(parent, difference);
+    }
+
+    const actions = parent.createDiv({ cls: "mineral-sync-conflicts__actions" });
+    this.button(actions, "Use current version", () => void this.apply("keep-local"));
+    this.button(actions, "Use other version", () => void this.apply("keep-remote"));
+    this.button(actions, "Edit manually", () => { this.page = "edit"; this.render(); });
+    this.button(actions, view.kind === "suggested" ? "Back to suggested result" : "Back", () => { this.page = "result"; this.render(); });
+    this.technical(parent, view.technical);
+  }
+
+  private difference(parent: HTMLElement, difference: DifferenceView): void {
+    const section = parent.createDiv({ cls: `mineral-sync-conflicts__hunk mineral-sync-conflicts__hunk--${difference.kind}` });
+    section.createEl("p", { text: difference.title, cls: "mineral-sync-conflicts__hunk-title" });
+    if (difference.contextBefore) section.createEl("pre", { text: difference.contextBefore, cls: "mineral-sync-conflicts__context" });
+    if (difference.kind === "current-only" || difference.kind === "other-only") {
+      const only = difference.kind === "current-only";
+      const column = section.createDiv({ cls: "mineral-sync-conflicts__side mineral-sync-conflicts__side--changed" });
+      column.createEl("p", { text: only ? difference.currentHeading : difference.otherHeading, cls: "mineral-sync-conflicts__side-heading" });
+      column.createEl("pre", { text: only ? difference.current : difference.other, cls: "mineral-sync-conflicts__side-body" });
+    } else {
+      const columns = section.createDiv({ cls: "mineral-sync-conflicts__columns" });
+      this.side(columns, difference.currentHeading, difference.current, "current");
+      this.side(columns, difference.otherHeading, difference.other, "other");
+    }
+    if (difference.note) section.createEl("p", { text: difference.note, cls: "mineral-sync-conflicts__notice" });
+    if (difference.contextAfter) section.createEl("pre", { text: difference.contextAfter, cls: "mineral-sync-conflicts__context" });
   }
 
   private side(parent: HTMLElement, heading: string, text: string, kind: "current" | "other"): void {
@@ -98,22 +194,29 @@ export class ConflictResolverModal extends Modal {
     column.createEl("pre", { text, cls: "mineral-sync-conflicts__side-body" });
   }
 
-  private action(parent: HTMLElement, action: ConflictActionView, view: ConflictView): void {
-    const record = this.records[this.index];
-    if (!record) return;
-    this.button(parent, action.label, () => {
-      if (action.id === "edit") { this.editResult(record, view); return; }
-      // "Keep both" is the merge the preview showed; it is proposed as an explicit merged result so the
-      // executor never has to invent it.
-      if (action.intent === "merged" && view.keepBothText !== undefined) { this.draft = { path: record.path, text: view.keepBothText }; }
-      if (action.intent) void this.apply(action.intent);
-    }, action.primary);
+  /** The third layer: the final text, with no markers anywhere near it. */
+  private renderEdit(parent: HTMLElement, record: ConflictRecord, view: Extract<ConflictPresentation, { kind: "suggested" | "manual" }>): void {
+    if (!this.draft) {
+      const fallback = view.kind === "suggested" ? view.suggestedText : view.draftText;
+      this.draft = { path: record.path, text: fallback };
+    }
+    parent.createEl("p", { text: "Edit final result", cls: "mineral-sync-conflicts__headline" });
+    parent.createEl("p", { text: "Nothing is written until you apply it.", cls: "mineral-sync-conflicts__notice" });
+    const editor = parent.createEl("textarea", { cls: "mineral-sync-conflicts__editor" });
+    editor.value = this.draft.text;
+    editor.rows = 18;
+    editor.addEventListener("input", () => { this.draft = { path: record.path, text: editor.value }; });
+    const actions = parent.createDiv({ cls: "mineral-sync-conflicts__actions" });
+    this.button(actions, "Apply resolved version", () => { this.draft = { path: record.path, text: editor.value }; void this.apply("merged"); }, true);
+    this.button(actions, "Cancel", () => { this.page = "result"; this.render(); });
+    this.button(actions, "View differences", () => { this.page = "differences"; this.render(); });
+    this.technical(parent, view.technical);
   }
 
-  private technical(parent: HTMLElement, view: ConflictView): void {
+  private technical(parent: HTMLElement, entries: TechnicalEntry[]): void {
     const details = parent.createEl("details", { cls: "mineral-sync-conflicts__technical" });
     details.createEl("summary", { text: "Technical details" });
-    for (const entry of view.technical) {
+    for (const entry of entries) {
       const row = details.createDiv({ cls: "mineral-sync-conflicts__technical-row" });
       row.createEl("strong", { text: entry.label });
       row.createEl("pre", { text: entry.value });
@@ -125,30 +228,8 @@ export class ConflictResolverModal extends Modal {
     element.addEventListener("click", onClick);
   }
 
-  /**
-   * The manual editor works on the *result*, not on a diff. It opens with both sides already present,
-   * so the user removes what they do not want instead of resolving markers, and it is only reachable by
-   * asking for it.
-   */
-  private editResult(record: ConflictRecord, view: ConflictView): void {
-    if (!this.draft) this.draft = { path: record.path, text: view.resultText };
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl("h2", { text: "Mineral Sync" });
-    contentEl.createEl("h3", { text: record.path, cls: "mineral-sync-conflicts__path" });
-    contentEl.createEl("p", { text: "Edit the result you want. Nothing is written until you apply it.", cls: "mineral-sync-conflicts__headline" });
-    const editor = contentEl.createEl("textarea", { cls: "mineral-sync-conflicts__editor" });
-    editor.value = this.draft.text;
-    editor.rows = 18;
-    editor.addEventListener("input", () => { this.draft = { path: record.path, text: editor.value }; });
-    const actions = contentEl.createDiv({ cls: "mineral-sync-conflicts__actions" });
-    this.button(actions, "Cancel", () => this.render());
-    this.button(actions, "Apply resolved version", () => { this.draft = { path: record.path, text: editor.value }; void this.apply("merged"); }, true);
-    this.technical(contentEl, presentConflict(record));
-  }
-
   private async apply(type: ResolutionIntent["type"]): Promise<void> {
-    const record = this.records[this.index];
+    const record = this.record;
     if (!record) return;
     // No content is written here. Only an intent, bound to the exact versions on screen.
     const intent: ResolutionIntent = {
@@ -169,9 +250,12 @@ export class ConflictResolverModal extends Modal {
     catch { new Notice("Mineral Sync: the resolution could not be recorded."); return; }
     this.dependencies.debug?.(`conflict resolution requested type=${type} path-hash=${shortConflictId(record.conflictId)}`);
     new Notice("Mineral Sync: resolution recorded. It will be applied on the next reconciliation.");
+    // The next conflict is shown immediately, from its own result page: no trip back to a list.
     this.draft = undefined;
+    this.page = "result";
     this.records = this.records.filter((candidate) => candidate.conflictId !== record.conflictId);
-    if (this.records.length) { this.index = Math.min(this.index, this.records.length - 1); this.render(); }
-    else { this.contentEl.empty(); this.contentEl.createEl("h2", { text: "Mineral Sync" }); this.contentEl.createEl("p", { text: "No conflicts — everything is in sync." }); }
+    this.resolved += 1;
+    if (this.index >= this.records.length) this.index = 0;
+    this.render();
   }
 }
