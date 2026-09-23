@@ -1,5 +1,5 @@
 import { RemoteHttpError, RemoteTransportError } from "../remote/errors";
-import { canonicalKey } from "../sync/path";
+import { canonicalKey, pathDigest } from "../sync/path";
 import type { OperationResult } from "../sync/executor";
 import type { LocalEntry, SyncOperation } from "../sync/types";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
@@ -290,7 +290,14 @@ export class SyncScheduler {
   }
   private async apply(operation: SyncOperation, cycle: ReturnType<SchedulerDependencies["captureCycle"]>): Promise<OperationResult | { status: "noop" | "conflict" }> {
     if (operation.type === "noop") return { status: "noop" };
-    if (operation.type === "conflict") return { status: "conflict" };
+    if (operation.type === "conflict") {
+      // A deletion that meets a concurrent edit is the one conflict shape with no text to merge, so it is
+      // named for what it is instead of being left to the generic conflict line. Nothing is decided
+      // here: the planner already refused to act, and the resolver is the only thing that can.
+      if (operation.conflict === "local-modified-remote-deleted") this.dependencies.debug?.(`remote delete conflict path-digest=${pathDigest(operation.key)} reason=local-modified-after-base`);
+      else if (operation.conflict === "local-deleted-remote-modified") this.dependencies.debug?.(`local delete conflict path-digest=${pathDigest(operation.key)} reason=remote-modified-after-base`);
+      return { status: "conflict" };
+    }
     return cycle.execute(operation);
   }  private shouldStop(generation: number): boolean { return this.stopped || !this.dependencies.visible() || this.configGeneration !== generation; }
 

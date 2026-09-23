@@ -113,6 +113,20 @@ describe("gateway client lifecycle and cursors", () => {
     expect(client.hasPending()).toBe(false);
   });
 
+  it("ignores a repeated or older generation, so a stale delete can never be queued", async () => {
+    // A delta is only ever handed to the scheduler for a generation that *advances* what this client has
+    // already been told about. Without that, a duplicated or replayed announcement would carry a `delete`
+    // for a path a later generation had already recreated, and the scheduler would have no way to tell.
+    const { client, sockets, announced } = setup();
+    await client.start("A".repeat(43));
+    sockets.last.open();
+    sockets.last.emit({ type: "remote-dirty", generation: "11" });
+    sockets.last.emit({ type: "remote-dirty", generation: "11" });
+    sockets.last.emit({ type: "remote-dirty", generation: "9" });
+    expect(announced).toEqual(["11"]);
+    expect(client.highestAnnounced()).toBe("11");
+  });
+
   it("persists the confirmed cursor per channel and never lets a channel inherit another's", async () => {
     const cursor = createMemoryGatewayCursorStore();
     const first = setup(cursor);

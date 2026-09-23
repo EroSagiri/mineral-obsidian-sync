@@ -78,6 +78,24 @@ describe("resolve-keep-local", () => {
     expect(saved.entries).toHaveLength(0);
   });
 
+  it("revives a deleted note as a conditional create, never as an unguarded write", async () => {
+    // "Keep note" after the other device deleted it: the remote is absent, so the note is recreated —
+    // and the create is conditional on that absence, because a file another device put there meanwhile is
+    // not the version the user decided about.
+    const local = vault({ "a.md": [1, 2, 3] });
+    let condition: unknown;
+    const result = await new SafeExecutor(local as never, remote({ putObject: async (_key, _body, options) => { condition = options; return { size: 3, etag: "NEW" }; } }), state(), identity, "[]").execute(keepLocal({ expectedRemoteETag: undefined, expectedRemoteAbsent: true }));
+
+    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(condition).toEqual({ ifNoneMatch: "*" });
+  });
+
+  it("blocks a revive that names neither a version nor an absence", async () => {
+    // Without either, the write would be unconditional, which no decision may authorise.
+    const result = await new SafeExecutor(vault({ "a.md": [1, 2, 3] }) as never, remote(), state(), identity, "[]").execute(keepLocal({ expectedRemoteETag: undefined }));
+    expect(result).toEqual({ status: "blocked", key: "a.md", reason: "missing-remote-etag" });
+  });
+
   it("keeps an ambiguous PUT unresolved and commits no baseline", async () => {
     const local = vault({ "a.md": [1, 2, 3] });
     const saved = state();
@@ -294,5 +312,94 @@ describe("delete stays out of scope", () => {
     const result = await new SafeExecutor(local as never, remote(), state(), identity, "[]", remover).execute({ type: "delete-local", key: "a.md", reason: "test", expectedLocal: { key: "a.md", size: 3, mtime: 10 } });
     expect(result).toEqual({ status: "applied", key: "a.md" });
     expect(trashed).toEqual(["a.md"]);
+  });
+});
+
+/**
+ * The two decisions a deletion-versus-edit conflict can end in.
+ *
+ * Both are destructive in one direction and both are bounded by what the user was actually shown, which
+ * is what these tests pin: accepting a remote deletion removes the local note and nothing else, and
+ * accepting a local deletion writes the tombstone for exactly the version on screen.
+ */
+describe("delete conflict resolutions", () => {
+  const deletion = (overrides: Partial<Extract<SyncOperation, { type: "resolve-accept-remote-delete" }>["expectedDeletion"]> = {}) =>
+    ({ path: "a.md", deletedRemoteETag: "R", objectPresent: true, ...overrides });
+  const acceptRemoteDelete = (overrides: Partial<Extract<SyncOperation, { type: "resolve-accept-remote-delete" }>> = {}): Extract<SyncOperation, { type: "resolve-accept-remote-delete" }> =>
+    ({ type: "resolve-accept-remote-delete", key: "a.md", reason: "test", conflictId: "cid", expectedLocal: { key: "a.md", size: 3, mtime: 10 }, expectedDeletion: deletion(), ...overrides });
+  const acceptLocalDelete: Extract<SyncOperation, { type: "resolve-accept-local-delete" }> =
+    { type: "resolve-accept-local-delete", key: "a.md", reason: "test", conflictId: "cid", expectedRemoteETag: "R" };
+
+  function trashable(initial: Record<string, number[]>) {
+    const local = vault(initial);
+    const trashed: string[] = [];
+    const remover: VaultFileRemover = { trash: async (file) => { trashed.push(file.path); local.files.delete(file.path); } };
+    return { local, trashed, remover };
+  }
+
+  it("accepts a remote deletion by removing the note and leaving the remote exactly as it was", async () => {
+    const { local, trashed, remover } = trashable({ "a.md": [1, 2, 3] });
+    const written: string[] = [];
+    const client = remote({ headObject: async () => ({ key: "a.md", size: 3, etag: "R", lastModified: 1 }), putObject: async (key) => { written.push(key); return { size: 0, etag: "x" }; }, putTombstone: async (record) => { written.push(record.path); return { tombstone: record }; } });
+    const saved = state();
+
+    const result = await new SafeExecutor(local as never, client, saved, identity, "[]", remover).execute(acceptRemoteDelete());
+
+    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(trashed).toEqual(["a.md"]);
+    // The deletion is already the remote's state: nothing is uploaded, and no second tombstone is written.
+    expect(written).toEqual([]);
+    // The baseline is retired, so the path converges to absent on both sides instead of staying pending.
+    expect(saved.entries).toEqual([]);
+  });
+
+  it("skips the version re-check when the deletion named no object to re-check", async () => {
+    const { local, trashed, remover } = trashable({ "a.md": [1, 2, 3] });
+    let heads = 0;
+    const client = remote({ headObject: async () => { heads++; return { key: "a.md", size: 3, etag: "R", lastModified: 1 }; } });
+
+    const result = await new SafeExecutor(local as never, client, state(), identity, "[]", remover).execute(acceptRemoteDelete({ expectedDeletion: deletion({ deletedRemoteETag: "", objectPresent: false }) }));
+
+    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(heads).toBe(0);
+    expect(trashed).toEqual(["a.md"]);
+  });
+
+  it("refuses to delete the note when the remote moved past the version it was shown", async () => {
+    const { local, trashed, remover } = trashable({ "a.md": [1, 2, 3] });
+    // A later object survives an older tombstone, and the user's decision was about the older one.
+    const client = remote({ headObject: async () => { throw new RemoteObjectChangedError(); } });
+
+    const result = await new SafeExecutor(local as never, client, state(), identity, "[]", remover).execute(acceptRemoteDelete());
+
+    expect(result).toEqual({ status: "stale", key: "a.md", reason: "conflict-superseded" });
+    expect(trashed).toEqual([]);
+    expect(local.files.has("a.md")).toBe(true);
+  });
+
+  it("accepts a local deletion by tombstoning exactly the remote version on screen", async () => {
+    const created: Array<{ path: string; deletedRemoteETag: string }> = [];
+    const deleted: string[] = [];
+    const saved: StateStore & { entries: PreviousEntry[] } = { ...state(), delete: async (key) => { deleted.push(key); } };
+    const client = remote({
+      headObject: async (_key, options) => ({ key: "a.md", size: 3, etag: options?.ifMatch ?? "", lastModified: 1 }),
+      putTombstone: async (record) => { created.push({ path: record.path, deletedRemoteETag: record.deletedRemoteETag }); return { tombstone: record }; },
+    });
+
+    const result = await new SafeExecutor(vault({}) as never, client, saved, identity, "[]").execute(acceptLocalDelete);
+
+    expect(result).toEqual({ status: "applied", key: "a.md" });
+    expect(created).toEqual([{ path: "a.md", deletedRemoteETag: "R" }]);
+    expect(deleted).toEqual(["a.md"]);
+  });
+
+  it("refuses to tombstone a remote version the user never saw", async () => {
+    const created: string[] = [];
+    const client = remote({ headObject: async () => { throw new RemoteObjectChangedError(); }, putTombstone: async (record) => { created.push(record.path); return { tombstone: record }; } });
+
+    const result = await new SafeExecutor(vault({}) as never, client, state(), identity, "[]").execute(acceptLocalDelete);
+
+    expect(result).toEqual({ status: "stale", key: "a.md", reason: "remote-changed" });
+    expect(created).toEqual([]);
   });
 });

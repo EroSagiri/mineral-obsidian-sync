@@ -21,9 +21,9 @@ const base = (operations: SyncOperation[], execute: CycleDependencies["execute"]
   scanLocal: () => new Map(), scanRemote: async () => new Map(), loadPrevious: async () => new Map(), filterPrevious: (entries) => entries,
   buildPlan: () => ({ operations }), execute,
 });
-function setup(capture: () => CycleDependencies) {
+function setup(capture: () => CycleDependencies, debug?: (message: string) => void) {
   const timers = new FakeTimers(); let visible = true;
-  const scheduler = new SyncScheduler({ captureCycle: capture, visible: () => visible, timers });
+  const scheduler = new SyncScheduler({ captureCycle: capture, visible: () => visible, timers, debug });
   return { scheduler, timers, hide: () => { visible = false; scheduler.visibilityChanged(false); }, show: () => { visible = true; scheduler.visibilityChanged(true); } };
 }
 
@@ -168,6 +168,25 @@ describe("SyncScheduler", () => {
   it("surfaces blocked deletes and conflicts without preventing unrelated operations", async () => {
     const executed: string[] = []; const { scheduler, timers } = setup(() => base([{ type: "conflict", key: "a", conflict: "both-modified", reason: "test" }, { type: "delete-remote", key: "b", reason: "test" }, upload("c")], async (operation) => { executed.push(operation.key); return operation.type === "delete-remote" ? { status: "blocked", key: operation.key, reason: "deletion-not-supported-in-phase-2a" } : { status: "applied", key: operation.key }; }));
     scheduler.requestReconcile("startup"); timers.fire(); await flush(); expect(executed).toEqual(["b", "c"]); expect(scheduler.diagnostics().lastResultCounts).toMatchObject({ conflict: 1, blocked: 1, applied: 1 }); expect(timers.delays()).toEqual([]);
+  });
+
+  it("names a deletion conflict for what it is, without naming the path", async () => {
+    const logs: string[] = [];
+    const { scheduler, timers } = setup(() => base([
+      { type: "conflict", key: "deleted.md", conflict: "local-modified-remote-deleted", reason: "test" },
+      { type: "conflict", key: "gone.md", conflict: "local-deleted-remote-modified", reason: "test" },
+      { type: "conflict", key: "both.md", conflict: "both-modified", reason: "test" },
+    ]), (message) => logs.push(message));
+
+    scheduler.requestReconcile("startup"); timers.fire(); await flush();
+
+    // The shape is named, so the two directions are distinguishable in a log without reading the UI.
+    expect(logs.some((line) => /^remote delete conflict path-digest=[0-9a-f]{8} reason=local-modified-after-base$/.test(line))).toBe(true);
+    expect(logs.some((line) => /^local delete conflict path-digest=[0-9a-f]{8} reason=remote-modified-after-base$/.test(line))).toBe(true);
+    // An ordinary content conflict keeps its own line and is not labelled a deletion.
+    expect(logs.filter((line) => line.includes("delete conflict"))).toHaveLength(2);
+    expect(logs.join("\n")).not.toContain("deleted.md");
+    expect(logs.join("\n")).not.toContain("gone.md");
   });
 
   it("hands the exact planning observations to conflict handling and converged-base backfill", async () => {

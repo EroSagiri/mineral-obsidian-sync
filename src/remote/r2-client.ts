@@ -18,6 +18,8 @@ export interface R2Client {
   putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion>;
   /** Immutable conditional create. A duplicate of the same path/version is an equivalent success. */
   putTombstone?(record: RemoteTombstone): Promise<RemoteDeletion>;
+  /** Removes one tombstone record. Only retention calls this; it never touches a user object. */
+  deleteObject?(record: RemoteTombstone): Promise<void>;
 }
 export { RemoteHttpError, RemoteObjectChangedError } from "./errors";
 
@@ -99,14 +101,24 @@ export class SignedR2ListClient implements R2Client {
     const prefix = `${normalizePrefix(this.config.remotePrefix)}${TOMBSTONE_NAMESPACE}`;
     // These immutable metadata reads are independent. Keep their original listing order in the
     // returned array, but do not make one slow R2 GET delay every other tombstone verification.
-    return Promise.all((await this.listRaw(prefix)).map(async (entry) => {
+    const resolved = await Promise.all((await this.listRaw(prefix)).map(async (entry): Promise<RemoteDeletion | undefined> => {
       const key = vaultKeyFromRemote(this.config.remotePrefix, entry.key);
       if (!key || !isInternalRemoteKey(key) || !entry.etag) throw new Error("Tombstone metadata key is invalid");
-      const record = parseTombstone(await this.getObject(key, { ifMatch: entry.etag }));
+      let body: ArrayBuffer;
+      try { body = await this.getObject(key, { ifMatch: entry.etag }); }
+      catch (error) {
+        // Retention can remove a record between this listing and this read. A record that is already
+        // gone has nothing left to say, and its absence is still visible in the object listing, so the
+        // scan reports what remains instead of failing over a tombstone that no longer exists.
+        if (error instanceof RemoteHttpError && error.status === 404) return undefined;
+        throw error;
+      }
+      const record = parseTombstone(body);
       const expectedKey = await tombstoneKey(record.path, record.deletedRemoteETag);
       if (key !== expectedKey) throw new Error("Tombstone metadata key does not match its record");
       return { tombstone: record, metadataETag: entry.etag };
     }));
+    return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
   async getObject(key: string, options: { ifMatch?: string } = {}): Promise<ArrayBuffer> { const response = await this.send("GetObject", "GET", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("GetObject", response.status); return response.arrayBuffer; }
@@ -145,5 +157,19 @@ export class SignedR2ListClient implements R2Client {
       if (existing.path !== record.path || existing.deletedRemoteETag !== record.deletedRemoteETag) throw new Error("Existing tombstone does not match its immutable identity");
       return { tombstone: existing };
     }
+  }
+  /**
+   * Deletes one tombstone record, for retention.
+   *
+   * No precondition is needed and none is sent: a tombstone's key is a digest of the path *and* the
+   * exact deleted version, so the record at that key can only ever be this one. There is no newer
+   * record at the same key to protect, and therefore nothing a conditional request could add.
+   */
+  async deleteObject(record: RemoteTombstone): Promise<void> {
+    const key = await tombstoneKey(record.path, record.deletedRemoteETag);
+    const response = await this.send("DeleteObject", "DELETE", this.objectUrl(key));
+    // A record that is already gone is the state this call exists to produce.
+    if (response.status === 404) return;
+    if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("DeleteObject", response.status);
   }
 }

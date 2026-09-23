@@ -51,7 +51,15 @@ export type PartialReason =
   /** A completed local write was superseded by an editor save before its content could be verified. */
   | "remote-write-raced-with-local-edit"
   /** A local write was attempted and whether it landed cannot be established. */
-  | "remote-write-landing-unknown";
+  | "remote-write-landing-unknown"
+  /**
+   * A local removal was attempted, it raised, and the file is no longer where it was.
+   *
+   * The deletion evidently happened, but a call that failed cannot be described as having produced the
+   * clean outcome the plan asked for — and a `failed` result is a promise that nothing needs recovering.
+   * This is the one case a removal has to be reported as possibly-unfinished rather than as done.
+   */
+  | "local-delete-landing-unknown";
 
 export type OperationResult =
   | { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry }
@@ -158,8 +166,16 @@ export class SafeExecutor {
     if (!file) return this.pruneResult(operation.key);
     if (!this.files) return { status: "failed", key: operation.key, error: "no Vault file remover is configured", reason: "file-manager-unavailable" };
     try { await this.files.trash(file); }
-    catch (error) { return { status: "failed", key: operation.key, error: message(error), reason: "trash-unavailable" }; }
+    catch (error) {
+      // A throwing removal says nothing on its own about whether the file survived it, so the file is
+      // what decides: still there means provably nothing happened, gone means a side effect exists that
+      // no baseline accounts for and the cycle must not claim it converged.
+      if (this.vault.getFileByPath(operation.key) !== null) return { status: "failed", key: operation.key, error: message(error), reason: "trash-unavailable" };
+      this.log(`local delete landing unknown path-digest=${pathDigest(operation.key)} result=partial`);
+      return { status: "partial", key: operation.key, reason: "local-delete-landing-unknown", error: message(error) };
+    }
     if (this.vault.getFileByPath(operation.key) !== null) return { status: "failed", key: operation.key, error: "the file is still present after the trash operation", reason: "trash-unavailable" };
+    this.log(`remote delete applied path-digest=${pathDigest(operation.key)}`);
     return this.pruneResult(operation.key);
   }
 
@@ -186,6 +202,11 @@ export class SafeExecutor {
     const record: RemoteTombstone = { protocol: TOMBSTONE_PROTOCOL, path: operation.key, deletedRemoteETag: etag, createdAt: new Date().toISOString() };
     try {
       await this.r2.putTombstone(record);
+      // The tombstone is the durable half of this deletion: the object deliberately stays where it is,
+      // and this immutable record is what makes every later reader see "deleted" rather than "never
+      // existed". Logged as soon as the PUT landed, because that is the R2 fact; the baseline pruning
+      // below decides whether the operation as a whole may be reported as applied.
+      this.log(`local delete landed path-digest=${pathDigest(operation.key)} tombstone=written`);
     } catch (error) {
       // A received 4xx means no record was accepted; a transport failure or 5xx remains ambiguous.
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };

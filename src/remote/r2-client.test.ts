@@ -86,4 +86,63 @@ describe("SignedR2ListClient.listTombstones", () => {
     releaseReads?.();
     await expect(pending).resolves.toMatchObject([{ tombstone: first }, { tombstone: second }]);
   });
+
+  it("skips a record that retention removed between the listing and the read", async () => {
+    const record = { protocol: 1, path: "gone.md", deletedRemoteETag: "etag", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    const key = await tombstoneKey(record.path, record.deletedRemoteETag);
+    const subject = client() as unknown as {
+      listRaw(prefix: string): Promise<Array<{ key: string; size: number; etag?: string; lastModified: number }>>;
+      getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
+      listTombstones(): ReturnType<SignedR2ListClient["listTombstones"]>;
+    };
+    subject.listRaw = async () => [{ key: `sync/${key}`, size: 1, etag: "meta", lastModified: 0 }];
+    subject.getObject = async () => { throw new RemoteHttpError("GetObject", 404); };
+
+    // A record that is already gone has nothing left to say, and its absence is still visible in the
+    // object listing — so a concurrent cleanup must not turn a scan into a failure.
+    await expect(subject.listTombstones()).resolves.toEqual([]);
+  });
+
+  it("still fails on a record it can see but cannot read", async () => {
+    const record = { protocol: 1, path: "held.md", deletedRemoteETag: "etag", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    const key = await tombstoneKey(record.path, record.deletedRemoteETag);
+    const subject = client() as unknown as {
+      listRaw(prefix: string): Promise<Array<{ key: string; size: number; etag?: string; lastModified: number }>>;
+      getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
+      listTombstones(): ReturnType<SignedR2ListClient["listTombstones"]>;
+    };
+    subject.listRaw = async () => [{ key: `sync/${key}`, size: 1, etag: "meta", lastModified: 0 }];
+    subject.getObject = async () => { throw new RemoteHttpError("GetObject", 403); };
+
+    // "We are not allowed to read it" is not "it is gone": a permission problem must stay visible.
+    await expect(subject.listTombstones()).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("SignedR2ListClient.deleteObject", () => {
+  it("deletes the record's own content-addressed key, unconditionally", async () => {
+    const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    let request: { url: string; method?: string; headers?: Record<string, string> } | undefined;
+    setRequestUrlHandler(async (value) => { request = value; return { status: 204, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }; });
+
+    await expect(client().deleteObject(record)).resolves.toBeUndefined();
+
+    expect(request?.method).toBe("DELETE");
+    expect(request?.url).toContain(`/bucket/sync/${await tombstoneKey(record.path, record.deletedRemoteETag)}`);
+    // The key is a digest of the path *and* the deleted version, so there is no newer record at the same
+    // key that a precondition could protect; the request carries none.
+    expect(request?.headers?.["if-match"]).toBeUndefined();
+  });
+
+  it("treats an already-absent record as the state it wanted to produce", async () => {
+    const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    setRequestUrlHandler(async () => ({ status: 404, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }));
+    await expect(client().deleteObject(record)).resolves.toBeUndefined();
+  });
+
+  it("keeps a refused delete typed", async () => {
+    const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+    setRequestUrlHandler(async () => ({ status: 403, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }));
+    await expect(client().deleteObject(record)).rejects.toMatchObject({ operation: "DeleteObject", status: 403 });
+  });
 });

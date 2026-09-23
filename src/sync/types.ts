@@ -2,8 +2,16 @@ export interface LocalEntry { key: string; size: number; mtime: number; }
 
 /** A remote object **as observed on the wire**: every field is a fact the server supplied. */
 export interface RemoteEntry { key: string; size: number; etag?: string; lastModified: number; deleted?: RemoteDeletionIdentity; }
-/** An effective deletion is metadata, not a user object; it never has bytes to download. */
-export interface RemoteDeletionIdentity { path: string; deletedRemoteETag: string; createdAt: string; metadataETag?: string; objectPresent: boolean; }
+/**
+ * An effective deletion is metadata, not a user object; it never has bytes to download.
+ *
+ * `createdAt` is optional because the two ways a deletion can be observed do not know the same facts.
+ * A full scan reads the tombstone itself and has its creation time; a Gateway `delete` event names only
+ * the path, and the exact-path HEAD that replaces a LIST can report the object's own metadata but not
+ * when someone else deleted it. Nothing decides anything from this field, so an unobservable value is
+ * left out rather than invented.
+ */
+export interface RemoteDeletionIdentity { path: string; deletedRemoteETag: string; createdAt?: string; metadataETag?: string; objectPresent: boolean; }
 export interface RemoteDeletedEntry extends RemoteEntry { deleted: RemoteDeletionIdentity; }
 export function isRemoteDeleted(entry: RemoteEntry | undefined): entry is RemoteDeletedEntry { return Boolean(entry && "deleted" in entry); }
 

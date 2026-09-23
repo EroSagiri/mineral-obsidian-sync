@@ -3,8 +3,8 @@ import { scanLocal, scanLocalAdapterMetadata } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { flushAction, isOwnWrite, writeChangedFile, type FileStamp } from "./local/android-editor-save";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
-import { RemoteHttpError } from "./remote/errors";
 import { scanRemote } from "./remote/scan-remote";
+import { pruneExpiredTombstones, protectedFromCleanup } from "./remote/tombstone-retention";
 import { DEFAULT_SETTINGS, R2SyncSettingTab, type R2SyncSettings } from "./settings";
 import { IndexedDbStateStore } from "./state/state-store";
 import { buildBootstrapResult } from "./bootstrap/bootstrap";
@@ -14,6 +14,7 @@ import { registerDevelopmentSelfTests } from "./dev/self-test-command";
 import { SafeExecutor, type VaultFileRemover } from "./sync/executor";
 import { pathDigest } from "./sync/path";
 import { buildSyncPlan } from "./sync/planner";
+import { observeLocalDelta, observeRemoteDelta } from "./sync/remote-delta";
 import { localChanged } from "./sync/fingerprint";
 import { SyncScheduler } from "./scheduler/scheduler";
 import { changedLocalKeys } from "./scheduler/mobile-local-drift";
@@ -25,7 +26,6 @@ import type { GatewayConfigState } from "./gateway/types";
 import { gatewayConnectionConfig } from "./gateway/types";
 import { deriveRemoteChangeChannel } from "@mineral/sync-core/channel";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
-import { canonicalKey } from "./sync/path";
 import { IndexedDbConflictStores } from "./conflict/stores";
 import { createMergeBaseRecorder, recordMergeBaseBatch, type MergeBaseInput } from "./conflict/merge-base";
 import { ConflictCoordinator } from "./conflict/coordinator";
@@ -96,6 +96,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   private readonly history: SyncHistoryStore = new IndexedDbSyncHistoryStore();
   private lastConflictCount = 0;
+  /** Retention is a once-per-session pass, held back until a reconciliation has finished. */
+  private tombstoneCleanup: "waiting" | "ready" | "done" = "waiting";
   /** The derived channel for the current settings, refreshed once per cycle. */
   private resolvedChannel?: string;
   private lastIntegrityRequestedAt = 0;
@@ -309,6 +311,62 @@ export default class R2PersonalSyncPlugin extends Plugin {
       conflictCount: this.lastConflictCount,
       lastFailureClass: this.scheduler?.diagnostics?.().lastFailureClass,
     }));
+    this.maybePruneTombstones(state);
+  }
+
+  /**
+   * Tombstone retention runs once per session, and only once a reconciliation has finished.
+   *
+   * Deliberately not at load time. Reading the tombstone namespace is the same work a full reconcile
+   * already does, so doing it while a cycle is in flight would double that work and could interleave a
+   * removal with the scan reading the same records. Waiting for the first cycle costs nothing: the
+   * retention window is measured in weeks, so a few seconds either way cannot matter.
+   */
+  private maybePruneTombstones(state: SchedulerState): void {
+    if (this.tombstoneCleanup === "done") return;
+    if (state === "running") { this.tombstoneCleanup = "ready"; return; }
+    if (this.tombstoneCleanup !== "ready") return;
+    this.tombstoneCleanup = "done";
+    void this.pruneTombstones();
+  }
+
+  /**
+   * Removes tombstones that are old *and* that this device provably no longer needs.
+   *
+   * There is no cluster-wide acknowledgement that every device has seen a deletion, so age alone is
+   * never sufficient. The protections below are the concrete evidence this device has: an unresolved
+   * conflict (which is where a pending decision lives, since a decision can only be authored against a
+   * detected conflict), a baseline that still describes the path, or a local file that is still here.
+   * All three mean "this deletion has not finished happening on this device", and until it has, the
+   * record that names the deleted version is still load-bearing.
+   *
+   * Best effort and silent: this is metadata housekeeping on a path that has nothing to do with the
+   * sync decision, so a failure is a debug line and nothing else.
+   */
+  private async pruneTombstones(): Promise<void> {
+    if (!this.settings.endpoint.trim() || !this.settings.bucket.trim()) return;
+    try {
+      const channel = await this.resolveChannel();
+      if (!channel) return;
+      this.coordinator?.setChannel(channel);
+      const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
+      const filter = createVaultPathFilter(settings);
+      const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
+      const [baselines, records] = await Promise.all([this.stateStore.loadAll(), this.coordinator?.list() ?? Promise.resolve([])]);
+      const protections = {
+        conflicted: new Set(records.map((record) => record.path)),
+        baselines: new Set(baselines.keys()),
+        ignored: (key: string) => filter.ignores(key),
+        localFilePresent: (key: string) => this.app.vault.getFileByPath(key) !== null,
+      };
+      await pruneExpiredTombstones(client, {
+        now: Date.now(),
+        protect: (path) => protectedFromCleanup(protections, path),
+        debug: (message) => this.debug(message),
+      });
+    } catch (error) {
+      this.debug(`tombstone cleanup skipped class=${error instanceof Error ? error.name : "unknown"}`);
+    }
   }
 
   /** Busy and error status for the paths that are not a reconcile cycle (inspection, self-tests). */
@@ -611,6 +669,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
     const channel = this.currentChannel();
     const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message));
+    // One definition of a usable baseline, shared by every observation path in the cycle: a baseline from
+    // another namespace, or one invalidated by an ignore-policy change, must never decide anything.
+    const acceptsBaseline = (key: string, entry: PreviousEntry): boolean =>
+      !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix;
     // Scanned once per cycle and shared by planning and conflict observation, so both see exactly the
     // same observations and no second scan can disagree with the planner's inputs.
     return {
@@ -618,58 +680,23 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
       scanRemote: () => scanRemote(client, filter, (message) => this.debug(message)),
-      incrementalObservations: async (changes: RemoteChange[]) => {
-        const keys = new Set<string>();
-        const remote = new Map<string, RemoteEntry>();
-        for (const change of changes) {
-          if (change.op === "rename") { keys.add(canonicalKey(change.from)); keys.add(canonicalKey(change.to)); }
-          else keys.add(canonicalKey(change.path));
-        }
-        for (const change of changes) {
-          if (change.op === "delete") { remote.delete(canonicalKey(change.path)); continue; }
-          if (change.op === "rename") {
-            remote.delete(canonicalKey(change.from));
-            const key = canonicalKey(change.to);
-            if (!filter.ignores(key)) remote.set(key, await client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
-            continue;
-          }
-          const key = canonicalKey(change.path);
-          if (filter.ignores(key)) continue;
-          // A complete put fact avoids another request. Any omitted field is intentionally filled by
-          // one exact HEAD rather than guessed from wall-clock time or a stale local baseline.
-          const modified = change.modified ? Date.parse(change.modified) : NaN;
-          if (change.etag && typeof change.size === "number" && Number.isFinite(modified)) remote.set(key, { key, etag: change.etag, size: change.size, lastModified: modified });
-          else remote.set(key, await client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
-        }
-        const local = new Map<string, LocalEntry>();
-        for (const key of keys) {
-          if (filter.ignores(key)) continue;
-          const stat = await this.app.vault.adapter.stat(key);
-          if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
-        }
-        const all = await this.stateStore.loadAll();
-        const previous = new Map([...all].filter(([key, entry]) => keys.has(key) && !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
-        return { local, remote, previous };
-      },
-      localIncrementalObservations: async (keys: string[]) => {
-        const local = new Map<string, LocalEntry>();
-        const remote = new Map<string, RemoteEntry>();
-        for (const key of keys) {
-          const stat = await this.app.vault.adapter.stat(key);
-          if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
-          try {
-            // An exact HEAD is sufficient for create/modify/delete planning. A logically deleted
-            // predecessor remains physically readable at the same ETag, which deliberately makes
-            // a repeated local delete idempotent and a later local modification a conditional revive.
-            remote.set(key, await client.headObject(key));
-          } catch (error) {
-            if (!(error instanceof RemoteHttpError && error.status === 404)) throw error;
-          }
-        }
-        const all = await this.stateStore.loadAll();
-        const previous = new Map([...all].filter(([key, entry]) => keys.includes(key) && !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
-        return { local, remote, previous };
-      },
+      // A Gateway delta is answered path by path: what the event omits is filled in by one exact
+      // request, never by a listing. The rules live in `sync/remote-delta` so that they can be tested
+      // against the request pattern they are supposed to have.
+      incrementalObservations: (changes: RemoteChange[]) => observeRemoteDelta(changes, {
+        client,
+        ignores: (key) => filter.ignores(key),
+        loadPrevious: () => this.stateStore.loadAll(),
+        statLocal: (key) => this.app.vault.adapter.stat(key),
+        acceptsBaseline,
+      }),
+      localIncrementalObservations: (keys: string[]) => observeLocalDelta(keys, {
+        client,
+        ignores: (key) => filter.ignores(key),
+        loadPrevious: () => this.stateStore.loadAll(),
+        statLocal: (key) => this.app.vault.adapter.stat(key),
+        acceptsBaseline,
+      }),
       loadPrevious: () => this.stateStore.loadAll(),
       filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
       buildPlan: (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => buildSyncPlan(local, remote, previous, this.coordinator?.resolutions()),

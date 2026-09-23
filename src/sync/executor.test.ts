@@ -155,6 +155,16 @@ describe("SafeExecutor", () => {
     await expect(new SafeExecutor(vault({}) as never, client, saved, identity, "[]").execute({ type: "delete-remote", key: "a", reason: "test", expectedRemoteETag: "A" })).resolves.toEqual({ status: "unresolved", key: "a", reason: "ambiguous-put" });
     expect(deleted).toEqual([]);
   });
+  it("logs the local deletion at the moment its tombstone landed", async () => {
+    const logs: string[] = [];
+    const client = remote({ headObject: async () => ({ key: "a", size: 3, etag: "A", lastModified: 1 }), putTombstone: async (record) => ({ tombstone: record }) });
+    await new SafeExecutor(vault({}) as never, client, state(), identity, "[]", undefined, undefined, (message) => logs.push(message)).execute({ type: "delete-remote", key: "a", reason: "test", expectedRemoteETag: "A" });
+
+    // Two facts, in the order they became true: the tombstone landed (the R2 half), and only then was the
+    // baseline retired. Only the digest of the path is ever named.
+    expect(logs.some((line) => /^local delete landed path-digest=[0-9a-f]{8} tombstone=written$/.test(line))).toBe(true);
+    expect(logs.join("\n")).not.toContain("a ");
+  });
 
   describe("delete-local (recovery-first)", () => {
     /** A Vault whose removal is observable, so the test can assert what was actually removed. */
@@ -207,6 +217,29 @@ describe("SafeExecutor", () => {
       // The file survives: there is no permanent-unlink fallback.
       expect(local.files.has("a.bin")).toBe(true);
       expect(saved.entries).toHaveLength(0);
+    });
+
+    it("reports a removal that raised and still took the file as partial, not as failed", async () => {
+      // A call that throws cannot be described as a clean removal, and `failed` promises that nothing
+      // needs recovering. The file is what decides: it is gone, so a side effect exists that no baseline
+      // accounts for, and the cycle must not retire a remote generation on the strength of this result.
+      const local = vault({ "a.bin": [1, 2, 3] });
+      const remover = { trash: async (file: { path: string }) => { local.files.delete(file.path); throw new Error("trash reported a failure after removing the file"); } };
+      const saved: StateStore = { ...state(), delete: async () => { throw new Error("store unavailable"); } };
+
+      const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]", remover).execute(deleteLocal("a.bin", 3, 10));
+
+      expect(result).toMatchObject({ status: "partial", reason: "local-delete-landing-unknown" });
+      expect(local.files.has("a.bin")).toBe(false);
+    });
+
+    it("logs a landed remote deletion by digest only", async () => {
+      const logs: string[] = [];
+      const { local, remover } = trashable({ "a.bin": [1, 2, 3] });
+      await new SafeExecutor(local as never, remote(), state(), identity, "[]", remover, undefined, (message) => logs.push(message)).execute(deleteLocal("a.bin", 3, 10));
+
+      expect(logs.some((line) => /^remote delete applied path-digest=[0-9a-f]{8}$/.test(line))).toBe(true);
+      expect(logs.join("\n")).not.toContain("a.bin");
     });
 
     it("fails rather than unlinking when no remover is configured at all", async () => {

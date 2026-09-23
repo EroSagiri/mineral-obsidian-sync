@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MarkdownView, Menu, Notice, Platform } from "obsidian";
-import { FakeElement } from "../test/dom";
+import { FakeElement, flush } from "../test/dom";
 import R2PersonalSyncPlugin from "./main";
 import { DEFAULT_SETTINGS } from "./settings";
 import { ignorePolicyFingerprint } from "./sync/ignore";
 import { remoteIdentity } from "./remote/r2-client";
 import { CONFLICT_PROTOCOL_VERSION, type AutoMergeStatus, type ConflictRecord, type ResolutionIntent } from "./conflict/types";
+import { presentConflict } from "./ui/conflict-presentation";
+import { observeRemoteDelta } from "./sync/remote-delta";
 import type { SyncHistoryEntry } from "./history/types";
 import type { R2SyncSettings } from "./settings";
 import type { FailureClass, ResultCounts, SchedulerState } from "./scheduler/types";
-import type { LocalEntry, PreviousEntry } from "./sync/types";
+import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "./sync/types";
 
 /**
  * The Android editor-save path, driven directly.
@@ -411,6 +413,10 @@ interface HistoryInternals extends Internals {
   restoreFromHistory(input: { path: string; content: string; sourceHistoryId: string }): Promise<void>;
   openSyncHistory(): Promise<void>;
   openStatusMenu(event: MouseEvent): void;
+  tombstoneCleanup: "waiting" | "ready" | "done";
+  maybePruneTombstones(state: SchedulerState): void;
+  pruneTombstones(): Promise<void>;
+  conflictObservations(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): Array<Record<string, unknown>>;
 }
 
 const conflictRecord = (conflictId: string, status: AutoMergeStatus, extra: Partial<ConflictRecord> = {}): ConflictRecord => ({
@@ -536,6 +542,49 @@ describe("history records what a resolution actually did", () => {
     expect(env.cleared).toEqual(["manual-1"]);
   });
 
+  it("records a deletion the user accepted together with the content it removed", async () => {
+    const env = historyEnv();
+    env.records.push(conflictRecord("manual-delete", "manual-required", {
+      reason: "remote logical deletion conflicts with a local modification",
+      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", objectPresent: true },
+      // The other device deleted it, so there is no remote content to record — only the local edit that
+      // is about to be given up.
+      snapshot: { local: "edited while away\n", base: "base\n", baseAvailable: true },
+    }));
+    env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "manual-delete", channel: "channel-1", path: "note.md", type: "accept-remote-delete", createdAt: 2, origin: "manual" });
+
+    await env.plugin.clearResolution("manual-delete", "note.md");
+
+    const entry = env.history.entries[0]!;
+    expect(entry.type).toBe("manual-conflict-resolved");
+    expect(entry.metadata.resolutionType).toBe("accept-remote-delete");
+    // Accepting a deletion ends in no content at all, and that is recorded as such rather than papered
+    // over. What makes the decision recoverable is the snapshot of what it removed.
+    expect(entry.result.content).toBe("");
+    expect(entry.localBefore?.content).toBe("edited while away\n");
+    expect(entry.remoteBefore).toBeUndefined();
+    // The direction is legible from the entry alone: the note was deleted remotely, not locally.
+    expect(entry.base?.content).toBe("base\n");
+  });
+
+  it("records the note the user kept when a deletion was refused", async () => {
+    const env = historyEnv();
+    env.records.push(conflictRecord("manual-revive", "manual-required", {
+      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", objectPresent: true },
+      snapshot: { local: "kept\n", baseAvailable: true },
+    }));
+    env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "manual-revive", channel: "channel-1", path: "note.md", type: "keep-local", createdAt: 2, origin: "manual" });
+
+    await env.plugin.clearResolution("manual-revive", "note.md");
+
+    const entry = env.history.entries[0]!;
+    // The revived text is the result, and the version it replaced is kept as the starting point: a
+    // restore can put either side back.
+    expect(entry.result.content).toBe("kept\n");
+    expect(entry.localBefore?.content).toBe("kept\n");
+    expect(entry.metadata.resolutionType).toBe("keep-local");
+  });
+
   it("records an automatic handoff merge as a merge event, with the evidence behind it", async () => {
     const env = historyEnv();
     env.records.push(conflictRecord("auto-handoff", "handoff", {
@@ -561,6 +610,87 @@ describe("history records what a resolution actually did", () => {
     // A stale intent is not evidence of anything that happened, so no entry claims it did.
     expect(env.history.entries).toEqual([]);
     expect(env.cleared).toEqual(["gone"]);
+  });
+});
+
+/**
+ * The seam where a Gateway delta becomes something the resolver can act on.
+ *
+ * A remote deletion has to arrive at the conflict record as a *deletion* — with the identity of the version
+ * that was removed — because that is what selects the two decisions the resolver offers. Observed as a
+ * plain absence instead, the same disagreement would be presented as a text problem with no buttons for it,
+ * which is what this pins.
+ */
+describe("a Gateway delete reaches the resolver as a deletion", () => {
+  it("carries the deleted version's identity into the conflict observation", async () => {
+    const env = historyEnv();
+    const client = {
+      listObjects: async () => { throw new Error("a delta must never list objects"); },
+      listTombstones: async () => { throw new Error("a delta must never list tombstones"); },
+      headObject: async (key: string) => ({ key, size: 3, etag: "E", lastModified: 1_000 }),
+      getObject: async () => { throw new Error("unused"); },
+      putObject: async () => { throw new Error("a delta does not write"); },
+    };
+    const previousEntry: PreviousEntry = { key: "note.md", local: { size: 3, mtime: 10 }, remote: { size: 3, etag: "E" }, syncedAt: 1 };
+    const observed = await observeRemoteDelta([{ op: "delete", path: "note.md" }], {
+      client, ignores: () => false,
+      loadPrevious: async () => new Map([["note.md", previousEntry]]),
+      statLocal: async () => ({ size: 9, mtime: 42 }),
+      acceptsBaseline: () => true,
+    });
+
+    const conflicts = env.plugin.conflictObservations(
+      [{ type: "conflict", key: "note.md", conflict: "local-modified-remote-deleted", reason: "test" }],
+      observed.local, observed.remote, observed.previous,
+    );
+
+    expect(conflicts).toEqual([{
+      key: "note.md",
+      previous: previousEntry,
+      observedLocal: { key: "note.md", size: 9, mtime: 42 },
+      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", objectPresent: true },
+    }]);
+    // Which is what makes the resolver offer "Keep note" and "Delete note" rather than a text editor.
+    const record = { ...conflictRecord("manual-1", "manual-required"), ...conflicts[0]!, snapshot: { local: "kept\n", baseAvailable: true } } as ConflictRecord;
+    expect(presentConflict(record).kind).toBe("delete-vs-modify");
+  });
+});
+
+describe("tombstone retention is a once-per-session pass", () => {  /** The pass resolves a channel (a digest) and then talks to R2, so microtasks alone do not settle it. */
+  const settle = async (): Promise<void> => { for (let index = 0; index < 8; index++) await new Promise((resolve) => setTimeout(resolve, 0)); await flush(); };
+
+  it("waits for a reconciliation to finish, then runs exactly once", async () => {
+    const env = historyEnv();
+    const skipped = () => env.logs.filter((line) => line.startsWith("tombstone cleanup")).length;
+
+    // A cycle that has not finished is not a moment to read (and possibly remove) remote metadata.
+    env.plugin.maybePruneTombstones("debouncing");
+    expect(env.plugin.tombstoneCleanup).toBe("waiting");
+    env.plugin.maybePruneTombstones("running");
+    expect(env.plugin.tombstoneCleanup).toBe("ready");
+    expect(skipped()).toBe(0);
+
+    env.plugin.maybePruneTombstones("idle");
+    await settle();
+    expect(env.plugin.tombstoneCleanup).toBe("done");
+    // The pass runs, and a failure inside it stays a debug line: retention is housekeeping, not sync.
+    expect(skipped()).toBe(1);
+
+    // Every later cycle is ignored, because the window is measured in weeks.
+    env.plugin.maybePruneTombstones("running");
+    env.plugin.maybePruneTombstones("idle");
+    await settle();
+    expect(env.plugin.tombstoneCleanup).toBe("done");
+    expect(skipped()).toBe(1);
+  });
+
+  it("does not reach the network without a configured namespace", async () => {
+    const env = historyEnv();
+    env.plugin.settings = { ...env.settings, endpoint: "", bucket: "" };
+
+    await env.plugin.pruneTombstones();
+
+    expect(env.logs.filter((line) => line.startsWith("tombstone cleanup"))).toEqual([]);
   });
 });
 

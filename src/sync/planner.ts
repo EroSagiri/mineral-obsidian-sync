@@ -1,5 +1,5 @@
 import { localChanged, remoteChanged } from "./fingerprint";
-import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type SyncOperation, type SyncPlan } from "./types";
+import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteDeletionIdentity, type RemoteEntry, type SyncOperation, type SyncPlan } from "./types";
 
 /**
  * The planner's view of a pending resolution.
@@ -39,7 +39,7 @@ function resolutionOperation(candidate: ResolutionProposal | undefined, key: str
   return { type: "resolve-merged", ...base, merged: candidate.intent.merged };
 }
 
-function deletedRemoteResolution(candidate: ResolutionProposal | undefined, key: string, here: LocalEntry, deletion: import("./types").RemoteDeletionIdentity): SyncOperation | undefined {
+function deletedRemoteResolution(candidate: ResolutionProposal | undefined, key: string, here: LocalEntry, deletion: RemoteDeletionIdentity): SyncOperation | undefined {
   if (!candidate) return undefined;
   const base = { key, conflictId: candidate.intent.conflictId, reason: `user resolution (${candidate.intent.type}) for the observed deletion conflict` };
   if (candidate.intent.type === "keep-local") return deletion.objectPresent
@@ -96,7 +96,15 @@ export function buildSyncPlan(
       if (remoteChanged(there, before)) operations.push(deletedLocalResolution(resolutions?.get(key), key, there) ?? operation("conflict", key, "local deleted while remote changed", "local-deleted-remote-modified"));
       else operations.push({ type: "delete-remote", key, reason: "local deletion since previous successful sync", expectedRemoteETag: there.etag });
     } else if (here && !there) {
-      if (localChanged(here, before)) operations.push(operation("conflict", key, "remote deleted while local changed", "local-modified-remote-deleted"));
+      if (localChanged(here, before)) {
+        // The remote is gone, observed as an absent key rather than as a named deletion — a rename's old
+        // side, or bytes removed by something other than this plugin. It is the same disagreement, so the
+        // user is offered the same two decisions; the identity they carry simply names no version, which
+        // is why the operations they produce are the absence variants: a conditional create for keeping
+        // the note, and a local removal with nothing remote left to re-check for accepting the deletion.
+        const deletion: RemoteDeletionIdentity = { path: key, deletedRemoteETag: "", objectPresent: false };
+        operations.push(deletedRemoteResolution(resolutions?.get(key), key, here, deletion) ?? operation("conflict", key, "remote deleted while local changed", "local-modified-remote-deleted"));
+      }
       // The remote is gone and the local file still provably matches the recorded baseline, so the
       // deletion is propagating a remote removal rather than discarding an unsynced local edit.
       else operations.push({ type: "delete-local", key, reason: "remote deletion since previous successful sync", expectedLocal: here });

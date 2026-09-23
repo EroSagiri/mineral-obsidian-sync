@@ -182,3 +182,82 @@ describe("remote delta scheduling", () => {
     expect(env.timers.delays()).toEqual([5000]);
   });
 });
+
+/**
+ * A deletion is subject to generation ordering exactly like a write.
+ *
+ * The fast path exists so a remote deletion can be applied without listing the bucket, and that is only
+ * sound while the client knows it has seen every generation up to this one. A gap means it does not, so
+ * the deletion must wait for a full reconciliation instead of being applied on its own.
+ */
+describe("a remote delete is generation-protected", () => {
+  const DELETE: RemoteChange = { op: "delete", path: "note.md" };
+
+  it("applies an exact-next-generation deletion without listing anything", async () => {
+    const env = harness(async (operation) => ({ status: "applied", key: operation.key }));
+    await establishTrustedWindow(env);
+    env.plan.operations = [{ type: "delete-local", key: "note.md", reason: "remote deletion", expectedLocal: NOTE_LOCAL }];
+    const scansBefore = env.fullRemoteScans();
+
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [DELETE]);
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.observedIncrementally).toEqual([[DELETE]]);
+    expect(env.confirmed).toEqual(["81", "82"]);
+    // No full reconcile: the delta answered for its own path.
+    expect(env.fullRemoteScans()).toBe(scansBefore);
+  });
+
+  it("falls back to a full reconciliation when the generations in between were never seen", async () => {    const env = harness(async (operation) => ({ status: "applied", key: operation.key }));
+    await establishTrustedWindow(env);
+    env.plan.operations = [{ type: "delete-local", key: "note.md", reason: "remote deletion", expectedLocal: NOTE_LOCAL }];
+
+    // 84 arrives while 82 and 83 were never observed: the deletion cannot be applied on its own, because
+    // a write in one of those generations may have recreated the path after it.
+    env.announce("84");
+    env.scheduler.requestRemoteChange("84", [DELETE]);
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.observedIncrementally).toEqual([]);
+    expect(env.fullRemoteScans()).toBe(2);
+    expect(env.confirmed).toEqual(["81", "84"]);
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(0);
+  });
+
+  it("never applies a deletion incrementally from a generation that is not the next one", async () => {
+    const env = harness(async (operation) => ({ status: "applied", key: operation.key }));
+    await establishTrustedWindow(env);
+
+    // The client already drops repeated or older generations, so this is the scheduler's own backstop: a
+    // queued delta that is not the exact next generation is never consumed as an exact-path observation,
+    // and an already-covered generation never moves the cursor backwards.
+    env.scheduler.requestRemoteChange("81", [DELETE]);
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.observedIncrementally).toEqual([]);
+    expect(env.confirmed).toEqual(["81", "81"]);
+  });
+
+  it("keeps the generation open when a local deletion's landing is unknown", async () => {
+    // A removal that raised and left the file gone is not a failure: a side effect exists that no baseline
+    // accounts for, so the window may not be called complete and the delta must stay queued.
+    const env = harness(async (operation) => ({ status: "partial", key: operation.key, reason: "local-delete-landing-unknown" }));
+    await establishTrustedWindow(env);
+    env.plan.operations = [{ type: "delete-local", key: "note.md", reason: "remote deletion", expectedLocal: NOTE_LOCAL }];
+
+    env.announce("82");
+    env.scheduler.requestRemoteChange("82", [DELETE]);
+    env.timers.fire(0);
+    await flush();
+
+    expect(env.confirmed).toEqual(["81"]);
+    expect(env.scheduler.diagnostics().lastConfirmation).toBe("observation-incomplete");
+    expect(env.scheduler.diagnostics().pendingRemoteDeltaCount).toBe(1);
+    // The shortfall is retried immediately rather than waiting for an unrelated event.
+    expect(env.timers.delays()).toEqual([0]);
+  });
+});

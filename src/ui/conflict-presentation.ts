@@ -275,7 +275,9 @@ function technicalDetails(record: ConflictRecord): TechnicalEntry[] {
     { label: "Auto merge", value: record.autoMergeStatus },
   ];
   if (record.reason) entries.push({ label: "Reason", value: record.reason });
-  if (record.observedRemoteDeletion) entries.push({ label: "Remote state", value: `logically deleted (${shortConflictId(record.observedRemoteDeletion.deletedRemoteETag)})` });
+  // A deletion observed through a Gateway event names the path but not the tombstone's creation time, and
+  // a HEAD that reports no ETag names no version at all; neither is filled in with a guess here.
+  if (record.observedRemoteDeletion) entries.push({ label: "Remote state", value: record.observedRemoteDeletion.deletedRemoteETag ? `logically deleted (${shortConflictId(record.observedRemoteDeletion.deletedRemoteETag)})` : "logically deleted" });
   entries.push({ label: "Base", value: record.snapshot.baseAvailable ? (record.snapshot.base ?? "") : "not recorded" });
   entries.push({ label: "Raw current device", value: record.snapshot.local ?? "" });
   entries.push({ label: "Raw other version", value: record.snapshot.remote ?? "" });

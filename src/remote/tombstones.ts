@@ -4,6 +4,18 @@ import { canonicalKey } from "../sync/path";
 export const TOMBSTONE_NAMESPACE = ".mineral-sync/tombstones/";
 export const TOMBSTONE_PROTOCOL = 1;
 
+/**
+ * How long a tombstone is kept before it may be cleaned up.
+ *
+ * The number is a device-offline budget, not a cache lifetime: a client that was away longer than this
+ * may come back to a path whose object is gone and whose tombstone has been removed. That is survivable
+ * *only* because the tombstone is not the last line of defence — the local baseline also makes the
+ * deletion legible ("remote gone, local unchanged" plans a deletion; "remote gone, local modified"
+ * plans a conflict), so a missing tombstone costs a device the deletion's *version identity*, never the
+ * fact that it happened. Thirty days is chosen from that trade, deliberately on the generous side.
+ */
+export const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 export interface RemoteTombstone {
   protocol: typeof TOMBSTONE_PROTOCOL;
   path: string;
