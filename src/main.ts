@@ -19,7 +19,7 @@ import { localChanged } from "./sync/fingerprint";
 import { SyncScheduler } from "./scheduler/scheduler";
 import { changedLocalKeys } from "./scheduler/mobile-local-drift";
 import { GatewayClient, type GatewayClientDiagnostics } from "./gateway/client";
-import { createMutationIngressReporter, mutationIngressConfig, type MutationIngressReporter } from "./gateway/mutation-ingress";
+import { createMutationIngressReporter, type MutationIngressReporter } from "./gateway/mutation-ingress";
 import { RequestUrlGatewayTransport } from "./gateway/transport";
 import { IndexedDbGatewayCursorStore } from "./gateway/cursor-store";
 import { resolveGatewayConfig } from "./gateway/config";
@@ -106,7 +106,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * takes effect on the next cycle without rebuilding the scheduler.
    */
   private readonly mutationIngress: MutationIngressReporter = createMutationIngressReporter({
-    settings: () => mutationIngressConfig(this.settings),
+    settings: () => ({
+      // The report is sent to the Gateway, over the channel this device derived for its own R2
+      // namespace. There is no Vault address and no ingress secret to configure.
+      enabled: Boolean(this.settings.mutationIngressEnabled),
+      gatewayEndpoint: this.settings.gatewayEndpoint,
+      gatewayToken: this.settings.gatewayToken,
+      channel: this.currentChannel(),
+    }),
     transport: new RequestUrlGatewayTransport(),
     now: () => Date.now(),
     debug: (message) => this.debug(message),
@@ -265,9 +272,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   mutationIngressStatusText(): string {
     if (!this.settings.mutationIngressEnabled) return "Disabled. Landed writes are announced to the Gateway only.";
-    if (!this.settings.mutationIngressEndpoint.trim() || !this.settings.mutationIngressToken.trim()) return "Misconfigured. Both the endpoint and the token are required; syncing is unaffected.";
+    if (!this.settings.gatewayEndpoint.trim() || !this.settings.gatewayToken.trim()) return "Misconfigured. Reporting uses the Gateway endpoint and token above; set both, or turn reporting off. Syncing is unaffected.";
+    if (!this.currentChannel()) return "Waiting for the R2 identity: the channel is derived from the endpoint, bucket, and prefix.";
     const pending = this.mutationIngress.pendingCount();
-    return `Configured. ${pending === 0 ? "No deferred reports." : `${pending} deferred report${pending === 1 ? "" : "s"} awaiting a retry.`}`;
+    return `Reported through the Gateway. ${pending === 0 ? "No deferred reports." : `${pending} deferred report${pending === 1 ? "" : "s"} awaiting a retry.`}`;
   }
 
   gatewayStatusText(): string {

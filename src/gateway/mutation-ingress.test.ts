@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_PENDING_MUTATIONS, classifyIngressStatus, createMutationIngressReporter, mutationIngressConfig, type MutationIngressSettings } from "./mutation-ingress";
+import { DEFAULT_MUTATION_INGRESS_SETTINGS, MAX_PENDING_MUTATIONS, classifyIngressStatus, createMutationIngressReporter, mutationIngressPath, type MutationIngressSettings } from "./mutation-ingress";
 import type { GatewayHttpRequest, GatewayTransport } from "./transport";
 
 /**
@@ -9,9 +9,13 @@ import type { GatewayHttpRequest, GatewayTransport } from "./transport";
  * durable when this runs. A report never changes a sync outcome, and a report that cannot be delivered is
  * retried with the *same* idempotency key, because the only thing a lost response leaves unknown is
  * whether the ingress already recorded it.
+ *
+ * A third property is architectural: the report goes to the **Gateway**, over the same channel the socket
+ * subscribes to. Nothing here knows where the Vault is, or holds a credential for it.
  */
 
-const settings = (overrides: Partial<MutationIngressSettings> = {}): MutationIngressSettings => ({ enabled: true, endpoint: "https://vault.example", token: "secret", ...overrides });
+const CHANNEL = "A".repeat(43);
+const settings = (overrides: Partial<MutationIngressSettings> = {}): MutationIngressSettings => ({ enabled: true, gatewayEndpoint: "https://gateway.example", gatewayToken: "secret", channel: CHANNEL, ...overrides });
 
 function transport(responses: Array<number | "throw">) {
   const sent: GatewayHttpRequest[] = [];
@@ -44,7 +48,7 @@ const reporter = (responses: Array<number | "throw">, overrides: { settings?: Mu
 const put = (path = "notes/a.md", etag = "ETAG-1", size = 12) => ({ op: "put" as const, path, etag, size });
 
 describe("what is reported", () => {
-  it("reports a landed put with the exact revision, to the ingress path, with the bearer token", async () => {
+  it("reports a landed put to the Gateway's channel route, with the Gateway's bearer token", async () => {
     const { instance, sent } = reporter([202]);
 
     await instance.report([put()]);
@@ -52,7 +56,10 @@ describe("what is reported", () => {
     expect(sent).toHaveLength(1);
     const request = sent[0]!;
     expect(request.method).toBe("POST");
-    expect(request.url).toBe("https://vault.example/internal/mutations");
+    // The channel in the URL is the one this device derived for its own R2 namespace, so a report cannot
+    // be routed to a namespace the plugin is not syncing with.
+    expect(request.url).toBe(`https://gateway.example${mutationIngressPath(CHANNEL)}`);
+    expect(request.url).toContain(CHANNEL);
     expect(request.token).toBe("secret");
     expect(JSON.parse(request.body!)).toEqual({ id: expect.stringMatching(/^obsidian-[0-9a-z]+-\d+$/), source: "obsidian", committedAt: 1_700_000_000_000, op: "put", path: "notes/a.md", etag: "ETAG-1", size: 12 });
   });
@@ -70,10 +77,10 @@ describe("what is reported", () => {
     expect(new Set(ids).size).toBe(2);
   });
 
-  it("normalizes a trailing slash on the endpoint", async () => {
-    const { instance, sent } = reporter([202], { settings: settings({ endpoint: "https://vault.example/" }) });
+  it("normalizes a trailing slash on the gateway endpoint", async () => {
+    const { instance, sent } = reporter([202], { settings: settings({ gatewayEndpoint: "https://gateway.example/" }) });
     await instance.report([put()]);
-    expect(sent[0]!.url).toBe("https://vault.example/internal/mutations");
+    expect(sent[0]!.url).toBe(`https://gateway.example${mutationIngressPath(CHANNEL)}`);
   });
 
   it("reports a logical deletion with the revision it retired", async () => {
@@ -98,11 +105,42 @@ describe("what is reported", () => {
   });
 
   it("does nothing at all when it is not configured", async () => {
-    for (const config of [settings({ enabled: false }), settings({ endpoint: "  " }), settings({ token: "" })]) {
+    // `channel` is in the list because a report is addressed by channel: without one there is no route,
+    // and waiting for the next cycle is better than sending it somewhere guessed.
+    for (const config of [settings({ enabled: false }), settings({ gatewayEndpoint: "  " }), settings({ gatewayToken: "" }), settings({ channel: undefined })]) {
       const { instance, sent } = reporter([202], { settings: config });
       await instance.report([put()]);
       expect(sent).toEqual([]);
+      expect(instance.announcesLandedWrites()).toBe(false);
     }
+  });
+
+  it("holds a report until the channel is known, then sends the same fact", async () => {
+    // The channel is derived once, early, and a report can arrive before it. The fact is kept with its
+    // id rather than dropped, so the eventual report is the same fact and not a second one.
+    const { subject, sent } = transport([202]);
+    let channel: string | undefined;
+    let id = 0;
+    const instance = createMutationIngressReporter({
+      settings: () => settings({ channel }),
+      transport: subject,
+      now: () => 1_700_000_000_000,
+      newId: (now) => `obsidian-${now.toString(36)}-${(id += 1)}`,
+    });
+
+    await instance.report([put()]);
+    expect(sent).toEqual([]);
+    expect(instance.pendingCount()).toBe(1);
+    expect(instance.announcesLandedWrites()).toBe(false);
+
+    channel = CHANNEL;
+    expect(instance.announcesLandedWrites()).toBe(true);
+    await instance.report([]);
+
+    expect(sent).toHaveLength(1);
+    expect(instance.pendingCount()).toBe(0);
+    // The same id the held fact was minted with: a later report is a retry, not a second fact.
+    expect(JSON.parse(sent[0]!.body!).id).toBe(`obsidian-${(1_700_000_000_000).toString(36)}-1`);
   });
 });
 
@@ -184,7 +222,14 @@ describe("retry and rejection", () => {
 });
 
 describe("settings mapping", () => {
-  it("reads the stored, prefixed fields", () => {
-    expect(mutationIngressConfig({ mutationIngressEnabled: true, mutationIngressEndpoint: "https://vault.example", mutationIngressToken: "secret" })).toEqual({ enabled: true, endpoint: "https://vault.example", token: "secret" });
+  it("keeps the report route on the same channel the socket subscribes to", () => {
+    // One derivation, one route family: `/v1/channels/<channel>/{dirty,subscribe,mutations}`.
+    expect(mutationIngressPath(CHANNEL)).toBe(`/v1/channels/${CHANNEL}/mutations`);
+  });
+
+  it("configures nothing beyond a toggle: the endpoint, credential, and channel come from the Gateway", () => {
+    // The prefixed endpoint/token fields of the direct-to-Vault design are gone; a data.json still
+    // holding them simply stops being read.
+    expect(DEFAULT_MUTATION_INGRESS_SETTINGS).toEqual({ mutationIngressEnabled: false });
   });
 });

@@ -47,32 +47,39 @@ export interface WriterMutation {
   size?: number;
 }
 
+/**
+ * Where a report is sent, as this plugin sees it.
+ *
+ * The report travels through the **Sync Gateway** — the one client-facing control plane — and not to
+ * the Vault, which is why there is no Vault address or ingress secret here. The channel is the same
+ * derived value the socket subscribes to, so a report cannot be routed to a namespace the plugin is
+ * not actually syncing with.
+ */
 export interface MutationIngressSettings {
   enabled: boolean;
-  endpoint: string;
-  token: string;
+  gatewayEndpoint: string;
+  gatewayToken: string;
+  channel: string | undefined;
 }
 
 /**
- * The same three facts as they are stored.
+ * The settings fields this reporter reads.
  *
- * Settings are flat and prefixed so they cannot collide with the R2 fields (`endpoint`, `token` are
- * already taken), while the reporter works with one self-contained config value captured per report.
- * The mapping lives here so the two spellings cannot drift apart in the settings tab.
+ * `mutationIngressEnabled` is the only knob it owns: the endpoint and credential are the Gateway's,
+ * which the plugin already has, and the channel is derived rather than configured. The prefixed
+ * endpoint/token fields from the direct-to-Vault design are gone — a stale `data.json` still holding
+ * them simply stops being read.
  */
 export interface MutationIngressSettingsFields {
-  mutationIngressEnabled: boolean;
-  mutationIngressEndpoint: string;
-  mutationIngressToken: string;
+  mutationIngressEnabled?: boolean;
 }
 
-export const DEFAULT_MUTATION_INGRESS_SETTINGS: MutationIngressSettingsFields = { mutationIngressEnabled: false, mutationIngressEndpoint: "", mutationIngressToken: "" };
+export const DEFAULT_MUTATION_INGRESS_SETTINGS: MutationIngressSettingsFields = { mutationIngressEnabled: false };
 
-export function mutationIngressConfig(settings: MutationIngressSettingsFields): MutationIngressSettings {
-  return { enabled: settings.mutationIngressEnabled, endpoint: settings.mutationIngressEndpoint, token: settings.mutationIngressToken };
+/** The report route, beside `/dirty` and `/subscribe` on the same channel. */
+export function mutationIngressPath(channel: string): string {
+  return `/v1/channels/${channel}/mutations`;
 }
-
-export const MUTATION_INGRESS_PATH = "/internal/mutations";
 
 /**
  * Deferred reports are bounded: an outage must not turn into an unbounded queue in plugin memory, and
@@ -166,13 +173,16 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
   const pending = new Map<string, WriterMutation>();
 
   const send = async (mutation: WriterMutation, settings: MutationIngressSettings): Promise<IngressVerdict> => {
+    // No channel means no route: the R2 identity has not been resolved yet, and the next cycle tries
+    // again. Reporting to a guessed path would be worse than being late.
+    if (!settings.channel) return "retryable";
     try {
       const response = await dependencies.transport.send({
-        url: `${settings.endpoint.replace(/\/+$/, "")}${MUTATION_INGRESS_PATH}`,
+        url: `${settings.gatewayEndpoint.replace(/\/+$/, "")}${mutationIngressPath(settings.channel)}`,
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(mutation),
-        token: settings.token,
+        token: settings.gatewayToken,
         timeoutMs: 15_000,
       });
       return classifyIngressStatus(response.status);
@@ -183,15 +193,20 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
     }
   };
 
+  /** Configured well enough to send: the Gateway's own endpoint and credential, plus a channel. */
+  const configured = (settings: MutationIngressSettings): boolean =>
+    settings.enabled
+    && settings.gatewayEndpoint.trim().length > 0
+    && settings.gatewayToken.trim().length > 0
+    && Boolean(settings.channel);
+
   return {
     pendingCount: () => pending.size,
-    announcesLandedWrites: () => {
-      const settings = dependencies.settings();
-      return settings.enabled && settings.endpoint.trim().length > 0 && settings.token.trim().length > 0;
-    },
+    announcesLandedWrites: () => configured(dependencies.settings()),
     async report(writes: readonly LandedWrite[]): Promise<void> {
       const settings = dependencies.settings();
-      if (!settings.enabled || !settings.endpoint.trim() || !settings.token.trim()) return;
+      // Reporting is off, or the Gateway is not configured at all: nothing to do, and nothing to keep.
+      if (!settings.enabled || !settings.gatewayEndpoint.trim() || !settings.gatewayToken.trim()) return;
 
       const now = dependencies.now();
       let unreportable = 0;
@@ -200,6 +215,13 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
         if (!mutation) { unreportable += 1; continue; }
         // A write to the same path in a later cycle is a new fact; only a retry reuses an id.
         pending.set(mutation.id, mutation);
+      }
+
+      // A fact outlives a missing channel: the R2 identity is resolved once, early, and a report that
+      // arrived before that is kept — with its id — for the next cycle rather than dropped.
+      if (!settings.channel) {
+        if (unreportable > 0) dependencies.debug?.(`mutation ingress skipped reason=no-verified-revision count=${unreportable}`);
+        return;
       }
 
       // Retries first: an older fact is the one a consumer has been missing for longer.
