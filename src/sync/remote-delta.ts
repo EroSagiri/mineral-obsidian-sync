@@ -47,6 +47,12 @@ export interface RemoteDeltaObservations {
  * directly once the object's own ETag is known — no listing, no guessing at which version the deletion
  * named. A record that names something else is a hard metadata error rather than evidence: it would mean
  * the key and its content disagree, which is not a state any decision may be based on.
+ *
+ * This answers "does a record name this version", which is the question the caller has. The stricter
+ * reading — a record does not apply to content R2 accepted a *later* write for, so a note re-created with
+ * identical text is not still deleted — needs the record's server timestamp, which only a listing
+ * provides. A full scan therefore makes that distinction, and this path errs towards leaving the file
+ * alone until one runs; it never errs towards resurrecting something.
  */
 export async function findLogicallyDeleted(client: R2Client, key: string, etag: string): Promise<RemoteDeletionIdentity | undefined> {
   let body: ArrayBuffer;

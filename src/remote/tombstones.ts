@@ -27,6 +27,15 @@ export interface RemoteDeletion {
   tombstone: RemoteTombstone;
   /** The opaque R2 metadata-object identity, used only for diagnostics. */
   metadataETag?: string;
+  /**
+   * When R2 accepted the tombstone, on **R2's** clock.
+   *
+   * Retention needs this to tell the bytes the deletion named from the same bytes uploaded again later —
+   * an ETag cannot, because it is a digest of the content. The record's own `createdAt` cannot either: it
+   * is the deleting device's clock, and comparing two devices' clocks is exactly the mistake this project
+   * keeps out of its decisions. Absent when the record was not read from a listing.
+   */
+  metadataLastModified?: number;
 }
 
 export function isInternalRemoteKey(key: string): boolean {

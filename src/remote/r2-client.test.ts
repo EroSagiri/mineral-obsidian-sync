@@ -119,13 +119,14 @@ describe("SignedR2ListClient.listTombstones", () => {
   });
 });
 
-describe("SignedR2ListClient.deleteObject", () => {
-  it("deletes the record's own content-addressed key, unconditionally", async () => {
-    const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+describe("SignedR2ListClient.deleteTombstone / deleteObject", () => {
+  const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+
+  it("deletes a tombstone at its own content-addressed key, unconditionally", async () => {
     let request: { url: string; method?: string; headers?: Record<string, string> } | undefined;
     setRequestUrlHandler(async (value) => { request = value; return { status: 204, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }; });
 
-    await expect(client().deleteObject(record)).resolves.toBeUndefined();
+    await expect(client().deleteTombstone(record)).resolves.toBeUndefined();
 
     expect(request?.method).toBe("DELETE");
     expect(request?.url).toContain(`/bucket/sync/${await tombstoneKey(record.path, record.deletedRemoteETag)}`);
@@ -134,15 +135,27 @@ describe("SignedR2ListClient.deleteObject", () => {
     expect(request?.headers?.["if-match"]).toBeUndefined();
   });
 
-  it("treats an already-absent record as the state it wanted to produce", async () => {
-    const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
-    setRequestUrlHandler(async () => ({ status: 404, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }));
-    await expect(client().deleteObject(record)).resolves.toBeUndefined();
+  it("deletes a user object at its own key, which is the path itself", async () => {
+    // The one call in this client that removes user content. It is addressed by path like every other
+    // object operation, so nothing about the tombstone namespace leaks into it.
+    let request: { url: string; method?: string } | undefined;
+    setRequestUrlHandler(async (value) => { request = value; return { status: 204, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }; });
+
+    await expect(client().deleteObject("notes/a.md")).resolves.toBeUndefined();
+
+    expect(request?.method).toBe("DELETE");
+    expect(request?.url).toContain("/bucket/sync/notes/a.md");
   });
 
-  it("keeps a refused delete typed", async () => {
-    const record = { protocol: 1, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
+  it("treats an already-absent object as the state it wanted to produce", async () => {
+    setRequestUrlHandler(async () => ({ status: 404, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }));
+    await expect(client().deleteObject("notes/a.md")).resolves.toBeUndefined();
+    await expect(client().deleteTombstone(record)).resolves.toBeUndefined();
+  });
+
+  it("keeps a refused delete typed, and names which deletion it was", async () => {
     setRequestUrlHandler(async () => ({ status: 403, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0), json: {} }));
-    await expect(client().deleteObject(record)).rejects.toMatchObject({ operation: "DeleteObject", status: 403 });
+    await expect(client().deleteTombstone(record)).rejects.toMatchObject({ operation: "DeleteTombstone", status: 403 });
+    await expect(client().deleteObject("notes/a.md")).rejects.toMatchObject({ operation: "DeleteObject", status: 403 });
   });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { scanRemote } from "./scan-remote";
 import type { R2Client } from "./r2-client";
+import type { RemoteDeletion } from "./tombstones";
 import type { VaultPathFilter } from "../sync/ignore";
 import { isRemoteDeleted } from "../sync/types";
 import { buildSyncPlan } from "../sync/planner";
@@ -16,7 +17,10 @@ import type { LocalEntry, PreviousEntry } from "../sync/types";
  */
 
 const filter: VaultPathFilter = { ignores: () => false } as VaultPathFilter;
-const tombstone = (path: string, deletedRemoteETag: string, createdAt = "2026-09-22T00:00:00.000Z") => ({ tombstone: { protocol: 1 as const, path, deletedRemoteETag, createdAt }, metadataETag: `meta-${path}` });
+/** R2's clock. The record was accepted a day after the object it names was written. */
+const OBJECT_WRITTEN_AT = 1_000;
+const RECORD_ACCEPTED_AT = 2_000;
+const tombstone = (path: string, deletedRemoteETag: string, createdAt = "2026-09-22T00:00:00.000Z", metadataLastModified: number | undefined = RECORD_ACCEPTED_AT): RemoteDeletion => ({ tombstone: { protocol: 1, path, deletedRemoteETag, createdAt }, metadataETag: `meta-${path}`, metadataLastModified });
 
 function client(options: { objects?: Array<{ key: string; size: number; etag?: string; lastModified: number }>; tombstones?: ReturnType<typeof tombstone>[] }): { client: R2Client; calls: string[] } {
   const calls: string[] = [];
@@ -34,7 +38,7 @@ function client(options: { objects?: Array<{ key: string; size: number; etag?: s
 
 describe("a tombstone makes a deletion legible to a full scan", () => {
   it("reports the path as deleted, bound to the exact version it names", async () => {
-    const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: 1_000 }], tombstones: [tombstone("note.md", "E")] });
+    const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: OBJECT_WRITTEN_AT }], tombstones: [tombstone("note.md", "E")] });
 
     const remote = await scanRemote(subject.client, filter);
 
@@ -60,11 +64,56 @@ describe("a tombstone makes a deletion legible to a full scan", () => {
     expect(isRemoteDeleted(remote.get("note.md"))).toBe(false);
   });
 
+  it("stop hiding the named version once the same text has been written again", async () => {
+    // An ETag is a digest of the content, so a note deleted and then re-created with identical text has the
+    // same one. Without the timestamp, the re-created note would stay invisible to every device, and the
+    // device that re-created it would read its own file as a remote deletion and remove it.
+    const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: RECORD_ACCEPTED_AT + 60_000 }], tombstones: [tombstone("note.md", "E")] });
+    const remote = await scanRemote(subject.client, filter);
+
+    expect(remote.get("note.md")).toMatchObject({ etag: "E" });
+    expect(isRemoteDeleted(remote.get("note.md"))).toBe(false);
+  });
+
+  it("keeps hiding a version written in the same instant the deletion was recorded", async () => {
+    // Deleting immediately after uploading must still delete: only a strictly later write is a revival.
+    const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: RECORD_ACCEPTED_AT }], tombstones: [tombstone("note.md", "E")] });
+    const remote = await scanRemote(subject.client, filter);
+
+    expect(isRemoteDeleted(remote.get("note.md"))).toBe(true);
+  });
+
+  it("keeps a tombstone's full authority when the record carries no server timestamp", async () => {
+    // "We cannot prove it was revived" must not be read as "it was revived".
+    const record = { tombstone: { protocol: 1 as const, path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" }, metadataETag: "meta", metadataLastModified: undefined };
+    const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: RECORD_ACCEPTED_AT + 60_000 }], tombstones: [record] });
+    const remote = await scanRemote(subject.client, filter);
+
+    expect(isRemoteDeleted(remote.get("note.md"))).toBe(true);
+  });
+
   it("leaves an excluded path out of the view entirely", async () => {
-    const subject = client({ objects: [{ key: "secret.md", size: 5, etag: "E", lastModified: 1_000 }], tombstones: [tombstone("secret.md", "E")] });
+    const subject = client({ objects: [{ key: "secret.md", size: 5, etag: "E", lastModified: OBJECT_WRITTEN_AT }], tombstones: [tombstone("secret.md", "E")] });
     const remote = await scanRemote(subject.client, { ignores: (key: string) => key.startsWith("secret") } as VaultPathFilter);
 
     expect(remote.size).toBe(0);
+  });
+});
+
+/**
+ * What a revived path means for the plan.
+ *
+ * Once a tombstone stops applying to a re-written object, the path is an ordinary one again: the local file
+ * is uploaded, not deleted. This is the outcome the revival rule exists to produce.
+ */
+describe("a note re-created after its deletion", () => {
+  const previous: PreviousEntry = { key: "note.md", local: { size: 5, mtime: 10 }, remote: { size: 5, etag: "E" }, syncedAt: 1 };
+
+  it("is uploaded rather than being read as the deletion it replaced", () => {
+    const revived: LocalEntry = { key: "note.md", size: 9, mtime: 900 };
+    const plan = buildSyncPlan(new Map([["note.md", revived]]), new Map([["note.md", { key: "note.md", size: 5, etag: "E", lastModified: RECORD_ACCEPTED_AT + 60_000 }]]), new Map([["note.md", previous]]));
+
+    expect(plan.operations).toEqual([expect.objectContaining({ type: "upload", key: "note.md", expectedRemote: { kind: "etag", value: "E" } })]);
   });
 });
 

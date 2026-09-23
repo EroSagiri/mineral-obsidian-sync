@@ -17,6 +17,13 @@ async function measure<T>(phase: string, work: () => Promise<T>, count: (value: 
 /**
  * Builds the effective remote view. Tombstones are fetched separately and never materialize as Vault
  * files; an old tombstone only hides the exact object ETag it names.
+ *
+ * "The exact ETag it names" needs one qualification, because an ETag is a digest of the content: a note
+ * deleted and then written again with identical text produces the same ETag, and would stay hidden
+ * forever — the re-created note would be invisible to every device, and the device that re-created it
+ * would see its own file as a remote deletion and remove it. So a tombstone also stops applying to an
+ * object that R2 accepted a write for *after* it accepted the tombstone. Both timestamps come from R2, so
+ * no device's clock is involved, and a genuine deletion never has a later write to compare against.
  */
 export async function scanRemote(client: R2Client, filter: VaultPathFilter, debug?: RemoteScanDebugLogger): Promise<Map<string, RemoteEntry>> {
   const [objects, tombstones] = await Promise.all([
@@ -30,6 +37,9 @@ export async function scanRemote(client: R2Client, filter: VaultPathFilter, debu
     const object = output.get(path);
     // A tombstone never hides a later object; it is bound to the exact deleted ETag.
     if (object && object.etag !== deletion.tombstone.deletedRemoteETag) continue;
+    // Nor content that was written after the deletion was recorded. An unknown record timestamp keeps the
+    // tombstone's full authority, which is the conservative reading of "we cannot prove it was revived".
+    if (object && deletion.metadataLastModified !== undefined && object.lastModified > deletion.metadataLastModified) continue;
     output.set(path, {
       key: path,
       size: 0,

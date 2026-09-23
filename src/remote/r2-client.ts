@@ -19,7 +19,9 @@ export interface R2Client {
   /** Immutable conditional create. A duplicate of the same path/version is an equivalent success. */
   putTombstone?(record: RemoteTombstone): Promise<RemoteDeletion>;
   /** Removes one tombstone record. Only retention calls this; it never touches a user object. */
-  deleteObject?(record: RemoteTombstone): Promise<void>;
+  deleteTombstone?(record: RemoteTombstone): Promise<void>;
+  /** Physically removes one user object. Only retention calls this, and only for content already deleted. */
+  deleteObject?(key: string): Promise<void>;
 }
 export { RemoteHttpError, RemoteObjectChangedError } from "./errors";
 
@@ -116,7 +118,8 @@ export class SignedR2ListClient implements R2Client {
       const record = parseTombstone(body);
       const expectedKey = await tombstoneKey(record.path, record.deletedRemoteETag);
       if (key !== expectedKey) throw new Error("Tombstone metadata key does not match its record");
-      return { tombstone: record, metadataETag: entry.etag };
+      // The listing's own timestamp is R2's clock, which is what retention compares against the object's.
+      return { tombstone: record, metadataETag: entry.etag, metadataLastModified: entry.lastModified };
     }));
     return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
   }
@@ -165,11 +168,27 @@ export class SignedR2ListClient implements R2Client {
    * exact deleted version, so the record at that key can only ever be this one. There is no newer
    * record at the same key to protect, and therefore nothing a conditional request could add.
    */
-  async deleteObject(record: RemoteTombstone): Promise<void> {
+  async deleteTombstone(record: RemoteTombstone): Promise<void> {
     const key = await tombstoneKey(record.path, record.deletedRemoteETag);
-    const response = await this.send("DeleteObject", "DELETE", this.objectUrl(key));
-    // A record that is already gone is the state this call exists to produce.
+    await this.delete(key, "DeleteTombstone");
+  }
+
+  /**
+   * Physically removes one user object.
+   *
+   * Reserved for retention: the caller has already proved that the bytes are a version every device has
+   * been told is deleted, and that nothing has written them again since. An ordinary deletion never comes
+   * here — it writes a tombstone and leaves the object where it is, which is what makes deletion
+   * recoverable in the first place.
+   */
+  async deleteObject(key: string): Promise<void> {
+    await this.delete(key, "DeleteObject");
+  }
+
+  private async delete(key: string, operation: string): Promise<void> {
+    const response = await this.send(operation, "DELETE", this.objectUrl(key));
+    // An object that is already gone is the state this call exists to produce.
     if (response.status === 404) return;
-    if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("DeleteObject", response.status);
+    if (response.status < 200 || response.status >= 300) throw new RemoteHttpError(operation, response.status);
   }
 }
