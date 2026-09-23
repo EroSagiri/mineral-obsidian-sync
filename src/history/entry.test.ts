@@ -79,7 +79,7 @@ describe("mergeHistoryEntry", () => {
     remoteBefore: await snapshotOf("windows\nsf\noppo\n", { etag: "ETAG-REMOTE" }),
     result: "windows\nsf\nfrom windows\noppo\n",
     resultETag: "ETAG-RESULT",
-    metadata: { localDeltaBytes: 84, hunkCount: 1, mergeReason: "one region", order: "local-first" },
+    metadata: { localDeltaBytes: 84, hunkCount: 1, mergeReason: "one region", order: "stable-content" },
   });
 
   it("records the event, the snapshots and the landed result", async () => {
@@ -99,7 +99,7 @@ describe("mergeHistoryEntry", () => {
     expect(entry.result.sha256).toHaveLength(64);
     expect(entry.result.size).toBe(Buffer.byteLength(entry.result.content, "utf8"));
     expect(entry.result.etag).toBe("ETAG-RESULT");
-    expect(entry.metadata).toEqual({ localDeltaBytes: 84, hunkCount: 1, mergeReason: "one region", order: "local-first" });
+    expect(entry.metadata).toEqual({ localDeltaBytes: 84, hunkCount: 1, mergeReason: "one region", order: "stable-content" });
   });
 
   it("carries the handoff type and its evidence unchanged", async () => {
@@ -188,7 +188,7 @@ describe("describeHistoryEvidence", () => {
 
   it("renders only the facts that were recorded", async () => {
     expect(await evidenceFor({})).toBeUndefined();
-    expect(await evidenceFor({ mergeReason: "one region", order: "local-first" })).toBeUndefined();
+    expect(await evidenceFor({ mergeReason: "one region", order: "stable-content" })).toBeUndefined();
     expect(await evidenceFor({ localDeltaBytes: 84 })).toBe("84 B added");
     expect(await evidenceFor({ localDeltaBytes: 40, remoteDeltaBytes: 44 })).toBe("84 B added");
     expect(await evidenceFor({ localDeltaBytes: -12 })).toBe("12 B removed");
@@ -214,6 +214,6 @@ describe("describeHistoryEvidence", () => {
   });
 
   it("never repeats a policy reason as if it were evidence of size", async () => {
-    expect(await evidenceFor({ mergeReason: "the two versions differ only in formatting", order: "deterministic" })).toBeUndefined();
+    expect(await evidenceFor({ mergeReason: "the two versions differ only in formatting", order: "stable-content" })).toBeUndefined();
   });
 });

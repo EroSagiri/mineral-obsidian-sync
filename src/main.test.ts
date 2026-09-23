@@ -540,7 +540,7 @@ describe("history records what a resolution actually did", () => {
     const env = historyEnv();
     env.records.push(conflictRecord("auto-handoff", "handoff", {
       reason: "short device handoff",
-      handoff: { reason: "short device handoff", branchSeparationMs: 3500, branchAgeMs: 900, localDeltaBytes: 13, remoteDeltaBytes: 5, hunkCount: 1, order: "local-first" },
+      handoff: { reason: "short device handoff", branchSeparationMs: 3500, branchAgeMs: 900, localDeltaBytes: 13, remoteDeltaBytes: 5, hunkCount: 1, order: "stable-content" },
       snapshot: { local: "a\nlocal\n", remote: "a\nremote\n", base: "a\n", baseAvailable: true },
     }));
     env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "auto-handoff", channel: "channel-1", path: "note.md", type: "merged", createdAt: 2, origin: "auto", merged: { content: "merged\n", sha256: "x", encoding: { bom: false, eol: "lf", trailingNewline: true } } });
@@ -551,7 +551,7 @@ describe("history records what a resolution actually did", () => {
     expect(entry.type).toBe("handoff-auto-merge");
     // The merged bytes are the result, not either side: both additions were kept.
     expect(entry.result.content).toBe("merged\n");
-    expect(entry.metadata).toMatchObject({ mergeReason: "short device handoff", branchSeparationMs: 3500, branchAgeMs: 900, localDeltaBytes: 13, remoteDeltaBytes: 5, hunkCount: 1, order: "local-first" });
+    expect(entry.metadata).toMatchObject({ mergeReason: "short device handoff", branchSeparationMs: 3500, branchAgeMs: 900, localDeltaBytes: 13, remoteDeltaBytes: 5, hunkCount: 1, order: "stable-content" });
   });
 
   it("records nothing for a resolution that does not correspond to a record", async () => {

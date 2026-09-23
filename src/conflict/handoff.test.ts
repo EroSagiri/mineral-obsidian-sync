@@ -69,24 +69,43 @@ describe("level 1: handoff", () => {
     }));
     expect(decision.class).toBe("handoff");
     expect(decision.mergedText).toBe("note\npc line\nphone line\n");
-    expect(decision.order).toBe("local-first");
+    expect(decision.order).toBe("stable-content");
   });
 
-  it("keeps both sides even when the order cannot be decided", () => {
+  /**
+   * The property the whole level rests on: a divergence has exactly one merged text, whoever is looking.
+   *
+   * The role a branch plays — local or remote — is an accident of the observer, so a merge that took it
+   * into account would have both devices upload a different `base + A + B` and re-diverge over a handoff
+   * they had each just settled. These two cases are the ones an observer-dependent order got wrong: the
+   * first because ordering by time would put a different branch first for each device, the second
+   * because the times are too close together for any time-based rule to separate them at all.
+   */
+  it("builds the same text from either device, even when the times are far enough apart to look decisive", () => {
+    const fromLaptop = classifyDivergence(input({ local: "windows\nsf\nfrom windows\n", remote: "windows\nsf\noppo\n", localChangedAt: T0, remoteChangedAt: T0 + 20_000 }));
+    const fromPhone = classifyDivergence(input({ local: "windows\nsf\noppo\n", remote: "windows\nsf\nfrom windows\n", localChangedAt: T0 + 20_000, remoteChangedAt: T0 }));
+
+    expect(fromLaptop.class).toBe("handoff");
+    expect(fromPhone.class).toBe("handoff");
+    expect(fromLaptop.mergedText).toBe("windows\nsf\nfrom windows\noppo\n");
+    expect(fromPhone.mergedText).toBe(fromLaptop.mergedText);
+    expect(fromPhone.order).toBe(fromLaptop.order);
+  });
+
+  it("builds the same text from either device when the two additions are indistinguishable in time", () => {
+    const fromPc = classifyDivergence(input({ local: "windows\nsf\npc\n", remote: "windows\nsf\nphone\n", localChangedAt: T0, remoteChangedAt: T0 + 120 }));
+    const fromPhone = classifyDivergence(input({ local: "windows\nsf\nphone\n", remote: "windows\nsf\npc\n", localChangedAt: T0 + 120, remoteChangedAt: T0 }));
+
+    expect(fromPc.class).toBe("handoff");
+    expect(fromPc.mergedText).toBe("windows\nsf\npc\nphone\n");
+    expect(fromPhone.mergedText).toBe(fromPc.mergedText);
+  });
+
+  it("keeps both sides whichever way round they are written", () => {
     const decision = classifyDivergence(input({ localChangedAt: T0, remoteChangedAt: T0 + 120 }));
     expect(decision.class).toBe("handoff");
-    expect(decision.order).toBe("deterministic");
-    expect(decision.reason).toContain("too close");
-    // Both additions survive, whichever way round they are written.
     expect(decision.mergedText).toContain("from windows");
     expect(decision.mergedText).toContain("oppo");
-  });
-
-  it("puts the earlier branch first when the times can be told apart", () => {
-    const earlier = classifyDivergence(input({ localChangedAt: T0 + 7_000, remoteChangedAt: T0 }));
-    expect(earlier.class).toBe("handoff");
-    expect(earlier.order).toBe("remote-first");
-    expect(earlier.mergedText).toBe("windows\nsf\noppo\nfrom windows\n");
   });
 
   it("reports the age of the branch without gating on it", () => {

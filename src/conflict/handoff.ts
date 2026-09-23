@@ -21,6 +21,12 @@ import { byteLength, significantText, type DecodedText } from "../sync/text";
  * best effort: this policy is allowed to miss a mergeable case, never to merge a change it cannot
  * account for.
  *
+ * **Every value in the decision must be the same on both devices.** Two devices that disagree about the
+ * same divergence emit two different merged texts and then re-diverge over a handoff they had both just
+ * settled, so nothing here may depend on which side is "local". Time is the trap: it is still used to
+ * *classify* (are these two branches close enough in time to be a handoff), but never to *order*, for
+ * the reason spelled out at `orderExtras`.
+ *
  * Thresholds live here, together, because they are policy rather than mechanism.
  */
 
@@ -30,8 +36,6 @@ export const HANDOFF_MAX_SEPARATION_MS = 30_000;
 export const HANDOFF_MAX_DELTA_BYTES = 2_048;
 /** One disagreeing region is a handoff; more than one is a branch that drifted. */
 export const HANDOFF_MAX_HUNKS = 1;
-/** Below this, two timestamps are too close to claim which side was written first. */
-export const HANDOFF_ORDER_TOLERANCE_MS = 1_000;
 
 export interface ChangeStats {
   insertedBytes: number;
@@ -55,6 +59,13 @@ export interface DivergenceInput {
 
 export type DivergenceClass = "clean" | "handoff" | "manual";
 
+/**
+ * How the two added regions were ordered. Recorded as evidence, so a history entry says which rule
+ * produced its text rather than leaving the reader to guess. There is one value today; a common time
+ * axis (server time, say) would add another, and nothing else may.
+ */
+export type BranchOrder = "stable-content";
+
 export interface DivergenceDecision {
   class: DivergenceClass;
   /** Human-readable evidence, recorded in history and never shown as raw text to the user. */
@@ -66,7 +77,7 @@ export interface DivergenceDecision {
   deltas?: { local: number; remote: number };
   branchSeparationMs?: number;
   branchAgeMs?: number;
-  order?: "local-first" | "remote-first" | "deterministic";
+  order?: BranchOrder;
 }
 
 /** A reconstruction of the file around the disagreeing region. */
@@ -139,18 +150,34 @@ function usableTimes(input: DivergenceInput): { localChangedAt: number; remoteCh
   return { localChangedAt: localChangedAt!, remoteChangedAt: remoteChangedAt!, separationMs: Math.abs(localChangedAt! - remoteChangedAt!), ageMs };
 }
 
-/** Both additions are always emitted; only their order depends on the evidence. */
-function orderExtras(times: { localChangedAt: number; remoteChangedAt: number }, split: RegionSplit): { order: NonNullable<DivergenceDecision["order"]>; first: string; second: string } {
-  if (Math.abs(times.localChangedAt - times.remoteChangedAt) <= HANDOFF_ORDER_TOLERANCE_MS) {
-    // Too close to order honestly: keep a stable order and say so in the reason.
-    return { order: "deterministic", first: split.localExtra, second: split.remoteExtra };
-  }
-  return times.localChangedAt < times.remoteChangedAt
-    ? { order: "local-first", first: split.localExtra, second: split.remoteExtra }
-    : { order: "remote-first", first: split.remoteExtra, second: split.localExtra };
-}
-
 const manual = (reason: string): DivergenceDecision => ({ class: "manual", reason });
+
+/**
+ * Orders the two added regions with a key that is identical on every device.
+ *
+ * The role a branch plays here — `local` or `remote` — is an accident of which device is looking, so it
+ * can never take part in the order. Two devices holding the same divergence would then build two
+ * different merged texts (`base + A + B` on one, `base + B + A` on the other), both would upload, and a
+ * handoff they had each just settled would immediately re-diverge.
+ *
+ * The timestamps are deliberately *not* used here, even when they are far enough apart to look decisive.
+ * Each device compares a different pair of events: its own file's mtime is its own wall clock, while the
+ * other side's `lastModified` is the object's server-side upload time. So one device weighs
+ * (my edit, your upload) and the other weighs (your edit, my upload), and any upload delay or clock skew
+ * can order the same handoff in opposite ways. They stay evidence — `branchSeparationMs` and
+ * `branchAgeMs`, and the gate that a handoff has to be close in time at all — never a decision.
+ *
+ * That leaves the added text itself, which both devices hold as the same two values in swapped roles.
+ * Comparing it by code unit is therefore a total order on the branch contents with no collisions and no
+ * environment in it. `localeCompare` would not do: it depends on the device's locale and could order the
+ * same pair differently, which is exactly the failure this function exists to prevent.
+ */
+function orderExtras(split: RegionSplit): { order: BranchOrder; first: string; second: string } {
+  // Equal additions need no order at all: concatenating them is the same text either way round.
+  return split.remoteExtra < split.localExtra
+    ? { order: "stable-content", first: split.remoteExtra, second: split.localExtra }
+    : { order: "stable-content", first: split.localExtra, second: split.remoteExtra };
+}
 
 /** Classifies one divergence. Pure: the same inputs always produce the same decision. */
 export function classifyDivergence(input: DivergenceInput): DivergenceDecision {
@@ -187,12 +214,10 @@ export function classifyDivergence(input: DivergenceInput): DivergenceDecision {
   if (times.separationMs > HANDOFF_MAX_SEPARATION_MS) return manual(`the two sides were written ${Math.round(times.separationMs / 1000)}s apart, longer than a handoff`);
   if (stats.insertedBytes > HANDOFF_MAX_DELTA_BYTES) return manual(`the two sides added ${stats.insertedBytes} bytes, more than a handoff`);
 
-  const ordered = orderExtras(times, split);
+  const ordered = orderExtras(split);
   return {
     class: "handoff",
-    reason: ordered.order === "deterministic"
-      ? "both versions added text within moments of each other, and they are too close in time to order"
-      : "both versions added text within moments of each other",
+    reason: "both versions added text within moments of each other",
     mergedText: split.prefix + hunk.base + ordered.first + ordered.second + split.suffix,
     stats,
     deltas,

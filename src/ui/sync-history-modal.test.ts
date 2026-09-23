@@ -44,7 +44,7 @@ const autoMerge = async (path = "notes/a.md", timestamp = at(9, 5)): Promise<Syn
   remoteBefore: await snapshotOf(TEXT.remote, { etag: "ETAG-REMOTE", modified: timestamp - 3000 }),
   result: TEXT.result,
   resultETag: "ETAG-RESULT",
-  metadata: { localDeltaBytes: 84, branchSeparationMs: 6200, hunkCount: 1, mergeReason: "one region", order: "local-first" },
+  metadata: { localDeltaBytes: 84, branchSeparationMs: 6200, hunkCount: 1, mergeReason: "one region", order: "stable-content" },
 });
 
 const manual = async (path = "notes/b.md", timestamp = at(11, 30)): Promise<SyncHistoryEntry> => manualHistoryEntry({

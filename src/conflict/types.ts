@@ -1,4 +1,5 @@
 import type { LocalEntry, RemoteDeletionIdentity } from "../sync/types";
+import type { BranchOrder } from "./handoff";
 
 /**
  * Conflict resolution state: the merge-base snapshot, the active conflict records, and the
@@ -53,7 +54,7 @@ export interface HandoffEvidence {
   localDeltaBytes: number;
   remoteDeltaBytes: number;
   hunkCount: number;
-  order?: "local-first" | "remote-first" | "deterministic";
+  order?: BranchOrder;
 }
 
 export interface ConflictRecord {

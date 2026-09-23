@@ -170,7 +170,9 @@ describe("divergence policy through the coordinator", () => {
     const ancestor = "windows\nsf\n";
     const mine = "windows\nsf\nfrom windows\n";
     const theirs = "windows\nsf\noppo\n";
-    // This device wrote first and the other side picked it up 3.5s later.
+    // This device wrote first and the other side picked it up 3.5s later: close enough in time to be a
+    // handoff. The order of the two additions comes from their content, not from who wrote first — a
+    // time-based order would give each device a different merged text.
     env.vault.files.set("note.md", { bytes: new TextEncoder().encode(mine), mtime: 1_500 });
     remoteBodies.set("note.md", theirs);
     const baseline = previous("note.md", sizeOf(ancestor), 1_000, "A");
@@ -191,7 +193,7 @@ describe("divergence policy through the coordinator", () => {
     const records = await env.stores.listConflicts(CHANNEL);
     expect(records).toHaveLength(1);
     expect(records[0]!.autoMergeStatus).toBe("handoff");
-    expect(records[0]!.handoff).toMatchObject({ branchSeparationMs: 3_500, hunkCount: 1, localDeltaBytes: 13, remoteDeltaBytes: 5, order: "local-first" });
+    expect(records[0]!.handoff).toMatchObject({ branchSeparationMs: 3_500, hunkCount: 1, localDeltaBytes: 13, remoteDeltaBytes: 5, order: "stable-content" });
     expect(records[0]!.snapshot).toMatchObject({ base: ancestor, local: mine, remote: theirs, draft: "windows\nsf\nfrom windows\noppo\n" });
     // ... and a follow-up cycle is scheduled to apply it.
     expect(reconcileReasons).toContain("conflict-auto-merge");
