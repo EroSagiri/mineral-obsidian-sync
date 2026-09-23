@@ -158,6 +158,11 @@ describe("retry and rejection", () => {
     expect(instance.pendingCount()).toBe(0);
     expect(debug.some((line) => line.startsWith("mutation ingress rejected reason=state-mismatch path-digest="))).toBe(true);
     expect(debug.some((line) => line.startsWith("mutation ingress rejected reason=not-accepted path-digest="))).toBe(true);
+    // A rejection empties the queue just like an acceptance, so the summary must not call it recorded:
+    // this is the one line an operator reads, and it is where a stale report would otherwise look fine.
+    // The count is per report call, because each call summarises what it did.
+    expect(debug.filter((line) => line === "mutation ingress rejected count=1")).toHaveLength(2);
+    expect(debug.some((line) => line.startsWith("mutation ingress recorded"))).toBe(false);
     // Neither log names the path.
     expect(debug.join("\n")).not.toContain("notes/");
     expect(sent).toHaveLength(2);

@@ -204,12 +204,13 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
 
       // Retries first: an older fact is the one a consumer has been missing for longer.
       let deferred = 0;
+      let rejected = 0;
       for (const mutation of [...pending.values()]) {
         const verdict = await send(mutation, settings);
         if (verdict === "retryable") { deferred += 1; continue; }
         pending.delete(mutation.id);
-        if (verdict === "state-mismatch") dependencies.debug?.(`mutation ingress rejected reason=state-mismatch path-digest=${pathDigest(mutation.path)}`);
-        else if (verdict === "permanent") dependencies.debug?.(`mutation ingress rejected reason=not-accepted path-digest=${pathDigest(mutation.path)}`);
+        if (verdict === "state-mismatch") { rejected += 1; dependencies.debug?.(`mutation ingress rejected reason=state-mismatch path-digest=${pathDigest(mutation.path)}`); }
+        else if (verdict === "permanent") { rejected += 1; dependencies.debug?.(`mutation ingress rejected reason=not-accepted path-digest=${pathDigest(mutation.path)}`); }
       }
 
       while (pending.size > MAX_PENDING_MUTATIONS) {
@@ -220,7 +221,11 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
 
       if (deferred > 0) dependencies.debug?.(`mutation ingress deferred pending=${pending.size}`);
       if (unreportable > 0) dependencies.debug?.(`mutation ingress skipped reason=no-verified-revision count=${unreportable}`);
-      if (pending.size === 0 && deferred === 0 && unreportable === 0) dependencies.debug?.(`mutation ingress recorded count=${writes.length}`);
+      // A rejection empties the queue exactly like an acceptance does, so the summary may only claim a
+      // recorded fact when none was refused — otherwise a stale or misconfigured report would read as
+      // success in the one line an operator is most likely to look at.
+      if (rejected > 0) dependencies.debug?.(`mutation ingress rejected count=${rejected}`);
+      else if (pending.size === 0 && deferred === 0 && unreportable === 0) dependencies.debug?.(`mutation ingress recorded count=${writes.length}`);
     },
   };
 }
