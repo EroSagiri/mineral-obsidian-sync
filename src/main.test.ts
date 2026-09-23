@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MarkdownView, Platform } from "obsidian";
+import { MarkdownView, Notice, Platform } from "obsidian";
+import { FakeElement } from "../test/dom";
 import R2PersonalSyncPlugin from "./main";
 import { DEFAULT_SETTINGS } from "./settings";
 import { ignorePolicyFingerprint } from "./sync/ignore";
 import { remoteIdentity } from "./remote/r2-client";
 import type { R2SyncSettings } from "./settings";
+import type { FailureClass, ResultCounts, SchedulerState } from "./scheduler/types";
 import type { LocalEntry, PreviousEntry } from "./sync/types";
 
 /**
@@ -30,8 +32,14 @@ interface Internals {
     workspace: { getLeavesOfType(): Array<{ view: StubView }> };
   };
   settings: R2SyncSettings;
-  scheduler: { markLocalPaths(paths: string[], ignores: (key: string) => boolean, reason?: string): boolean };
+  scheduler: {
+    markLocalPaths(paths: string[], ignores: (key: string) => boolean, reason?: string): boolean;
+    diagnostics?(): { lastFailureClass?: FailureClass; currentState?: string; lastCycleReason?: string; pendingDirtyCount?: number; pendingRemoteDeltaCount?: number };
+    requestReconcile?(reason: string): void;
+  };
   stateStore: { loadAll(): Promise<Map<string, PreviousEntry>> };
+  statusBar?: FakeElement;
+  lastConflictCount: number;
   androidPendingEditorSaves: Set<string>;
   androidEditorWriteStamps: Map<string, Stamp>;
   scheduleAndroidEditorSave(path: string): void;
@@ -41,6 +49,10 @@ interface Internals {
   unsyncedLocalDrift(current: Map<string, LocalEntry>, changed: string[]): Promise<string[]>;
   markUnlessOwnEditorWrite(path: string): Promise<void>;
   registerVaultListeners(): void;
+  setSchedulerStatus(state: SchedulerState, counts: ResultCounts): void;
+  onStatusClick(): void;
+  reportStatusDetails(): void;
+  openConflictResolver(): Promise<void>;
 }
 
 function harness(options: { buffer?: string; before?: Stamp | null; after?: Stamp | null } = {}) {
@@ -285,5 +297,91 @@ describe("android editor save lifecycle", () => {
     env.plugin.stateStore = { loadAll: async () => { throw new Error("indexeddb unavailable"); } };
 
     expect(await env.plugin.unsyncedLocalDrift(new Map([["note.md", { key: "note.md", size: 9, mtime: 200 }]]), ["note.md"])).toEqual(["note.md"]);
+  });
+});
+
+describe("status bar wiring", () => {
+  const counts = (overrides: Partial<ResultCounts> = {}): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, ...overrides });
+
+  /** The status bar item is Obsidian's element; the shim stands in for it. */
+  function statusHarness(failure?: FailureClass) {
+    const env = harness();
+    env.plugin.statusBar = new FakeElement("div");
+    let manual = 0;
+    let opened = 0;
+    env.plugin.scheduler.diagnostics = () => ({ lastFailureClass: failure });
+    env.plugin.scheduler.requestReconcile = () => { manual += 1; };
+    env.plugin.openConflictResolver = async () => { opened += 1; };
+    return { env, host: env.plugin.statusBar, manual: () => manual, opened: () => opened };
+  }
+
+  it("shows a still, muted icon with no text while everything is in sync", () => {
+    const { env, host } = statusHarness();
+    env.plugin.setSchedulerStatus("idle", counts());
+    expect(host.find((element) => element.classes.has("mineral-sync-status--idle"))).toBeDefined();
+    expect(host.allText).toBe("");
+    expect(host.find((element) => element.classes.has("is-spinning"))).toBeUndefined();
+  });
+
+  it("marks a running cycle with the spinning class and stops it afterwards", () => {
+    const { env, host } = statusHarness();
+    env.plugin.setSchedulerStatus("running", counts());
+    expect(host.find((element) => element.classes.has("is-spinning"))).toBeDefined();
+
+    env.plugin.setSchedulerStatus("idle", counts());
+    expect(host.find((element) => element.classes.has("is-spinning"))).toBeUndefined();
+  });
+
+  it("advertises conflicts with a badge and the colour that means attention", () => {
+    const { env, host } = statusHarness();
+    env.plugin.lastConflictCount = 2;
+    env.plugin.setSchedulerStatus("running", counts());
+    expect(host.find((element) => element.classes.has("mineral-sync-status--conflict"))).toBeDefined();
+    expect(host.allText).toBe("2");
+    // Conflict outranks the running cycle, so the icon must not spin.
+    expect(host.find((element) => element.classes.has("is-spinning"))).toBeUndefined();
+  });
+
+  it("opens the resolver on the first click when the status shows conflicts", () => {
+    const { env, opened, manual } = statusHarness();
+    env.plugin.lastConflictCount = 1;
+    env.plugin.setSchedulerStatus("idle", counts());
+    env.plugin.onStatusClick();
+    expect(opened()).toBe(1);
+    expect(manual()).toBe(0);
+  });
+
+  it("asks for a reconcile instead on every other status", () => {
+    const { env, opened, manual } = statusHarness();
+    env.plugin.setSchedulerStatus("debouncing", counts());
+    env.plugin.onStatusClick();
+    expect(manual()).toBe(1);
+    expect(opened()).toBe(0);
+  });
+
+  it("reports an offline transport in red rather than as a conflict", () => {
+    const { env, host } = statusHarness("retryable");
+    env.plugin.setSchedulerStatus("idle", counts({ unresolved: 1 }));
+    const root = host.find((element) => element.classes.has("mineral-sync-status--offline"));
+    expect(root).toBeDefined();
+    expect(root!.getAttribute("aria-label")).toContain("Offline");
+    // Nothing readable in the bar itself: the state is carried by the colour.
+    expect(host.visibleText).toBe("");
+  });
+
+  it("keeps the detail in the tooltip, and reachable from a right-click", () => {
+    const { env, host } = statusHarness();
+    env.plugin.lastConflictCount = 4;
+    env.plugin.setSchedulerStatus("debouncing", counts());
+    const root = host.find((element) => element.classes.has("mineral-sync-status"))!;
+    expect(root.getAttribute("aria-label")).toContain("4 conflicts need attention");
+    // The bar itself carries no sentence; the facts are one right-click away.
+    expect(host.visibleText).toBe("4");
+
+    // The stub records what was shown; `Notice` has no such static in the real types.
+    const notices = Notice as unknown as { shown: string[] };
+    notices.shown.length = 0;
+    env.plugin.reportStatusDetails();
+    expect(notices.shown.join("\n")).toContain("conflicts 4");
   });
 });

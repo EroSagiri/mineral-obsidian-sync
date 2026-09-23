@@ -29,6 +29,7 @@ import { IndexedDbConflictStores } from "./conflict/stores";
 import { createMergeBaseRecorder, recordMergeBaseBatch, type MergeBaseInput } from "./conflict/merge-base";
 import { ConflictCoordinator } from "./conflict/coordinator";
 import { ConflictResolverModal } from "./ui/conflict-resolver-modal";
+import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
 
@@ -44,6 +45,8 @@ const INTEGRITY_RECONCILE_TICK_MS = 60_000;
 const ANDROID_DRIFT_BASELINE_LIMIT = 25;
 /** A markdown note this large is not an editing surface worth re-reading on every drift tick. */
 const ANDROID_BUFFER_COMPARISON_MAX_BYTES = 2_000_000;
+/** The all-zero result counts a scheduler reports before its first cycle. */
+const NO_RESULTS: ResultCounts = { applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0 };
 
 export default class R2PersonalSyncPlugin extends Plugin {
   settings: R2SyncSettings = { ...DEFAULT_SETTINGS };
@@ -52,6 +55,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly conflictStores = new IndexedDbConflictStores();
   private activeAnalysis?: AbortController;
   private statusBar?: HTMLElement;
+  /** The last presentation applied, so a click can act on exactly what the user is looking at. */
+  private statusPresentation?: SyncStatusPresentation;
   private scheduler?: SyncScheduler;
   private gateway?: GatewayClient;
   private coordinator?: ConflictCoordinator;
@@ -105,11 +110,19 @@ export default class R2PersonalSyncPlugin extends Plugin {
         settings: this.settings,
         pluginDir: this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
         addCommand: (command) => this.addCommand(command),
-        setStatus: (text) => this.setStatus(text),
+        setStatus: (text) => this.showBusyStatus(text),
       });
     }
+    // Theme-variable CSS for the status glyph, injected rather than shipped as a second file, so the
+    // deployment surface stays exactly `main.js` + `manifest.json`.
+    const statusStyle = document.head.createEl("style", { text: SYNC_STATUS_CSS });
+    this.register(() => statusStyle.remove());
     this.statusBar = this.addStatusBarItem();
-    this.setStatus("✓ idle");
+    // Attached once, to the item itself, because its inner content is rebuilt on every state change.
+    // A conflict click goes straight to the resolver: never a menu the user has to click through.
+    this.registerDomEvent(this.statusBar, "click", () => this.onStatusClick());
+    this.registerDomEvent(this.statusBar, "contextmenu", (event) => { event.preventDefault(); this.reportStatusDetails(); });
+    this.renderStatus(presentSyncStatus({ state: "idle", counts: NO_RESULTS, conflictCount: 0 }));
     this.gateway = new GatewayClient(
       () => gatewayConnectionConfig(this.settings),
       new RequestUrlGatewayTransport(),
@@ -257,18 +270,63 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private client(): SignedR2ListClient { return new SignedR2ListClient(this.settings); }
   /** Debug-only operational telemetry: intentionally no paths, content, credentials, or signed headers. */
   private debug(message: string): void { if (this.settings.debugLogging) console.log(`[Mineral Obsidian Sync] ${message}`); }
-  private setStatus(text: string): void { this.statusBar?.setText(`Mineral Sync ${text}`); }
+
+  /**
+   * Applies a status presentation to the status bar.
+   *
+   * The presentation itself is computed by a pure function, so what each state *looks like* is pinned by
+   * tests rather than by this method's branches.
+   */
+  private renderStatus(presentation: SyncStatusPresentation): void {
+    this.statusPresentation = presentation;
+    if (this.statusBar) renderSyncStatus(this.statusBar, presentation);
+  }
+
   private setSchedulerStatus(state: SchedulerState, counts: ResultCounts): void {
-    if (state === "running") return this.setStatus("… syncing");
-    if (state === "debouncing" || state === "rerun-pending") return this.setStatus("… pending");
-    if (state === "blocked-by-auth") return this.setStatus("○ auth blocked");
-    // A plan-level conflict is only a detection. The Resolve command can act only on the durable
-    // record that the coordinator established from it, so the status bar must never advertise a
-    // number the resolver cannot actually display.
-    if (this.lastConflictCount) return this.setStatus(`! conflicts (${this.lastConflictCount})`);
-    if (counts.conflict) return this.setStatus("○ conflict state unavailable");
-    if (counts.unresolved || counts.failed) return this.setStatus("○ offline/error");
-    this.setStatus("✓ idle");
+    // A plan-level conflict is only a detection: the resolver can act only on the durable record the
+    // coordinator established from it, so the count advertised here is that record count, never the
+    // plan's. Everything else comes from the scheduler's own diagnostics, so no new state is invented.
+    this.renderStatus(presentSyncStatus({
+      state,
+      counts,
+      conflictCount: this.lastConflictCount,
+      lastFailureClass: this.scheduler?.diagnostics?.().lastFailureClass,
+    }));
+  }
+
+  /** Busy and error status for the paths that are not a reconcile cycle (inspection, self-tests). */
+  private showBusyStatus(message: string): void {
+    this.renderStatus({ tone: "syncing", icon: SYNC_STATUS_ICON, spinning: true, tooltip: `Mineral Sync\n${message}`, action: "sync-now" });
+  }
+  private showErrorStatus(message: string): void {
+    this.renderStatus({ tone: "error", icon: SYNC_STATUS_ICON, spinning: false, badge: "!", tooltip: `Mineral Sync\n${message}`, action: "sync-now" });
+  }
+
+  /**
+   * A conflict needs a decision, so its click lands on the resolver directly; every other state asks for
+   * a reconcile instead. The action comes from the last presentation, so the two can never disagree.
+   */
+  private onStatusClick(): void {
+    if ((this.statusPresentation?.action ?? "sync-now") === "resolve-conflicts") { void this.openConflictResolver(); return; }
+    this.scheduler?.requestReconcile("manual");
+  }
+
+  /**
+   * Right-click is the details surface. There is no popover framework here and this does not need one:
+   * the point is that the facts stay reachable without occupying the status bar.
+   */
+  private reportStatusDetails(): void {
+    const diagnostics = this.scheduler?.diagnostics?.();
+    const lines = [
+      `state ${diagnostics?.currentState ?? "unknown"}`,
+      `last cycle ${diagnostics?.lastCycleReason ?? "n/a"}`,
+      `conflicts ${this.lastConflictCount}`,
+    ];
+    if (diagnostics?.lastFailureClass) lines.push(`last failure ${diagnostics.lastFailureClass}`);
+    if (diagnostics?.pendingDirtyCount) lines.push(`pending local paths ${diagnostics.pendingDirtyCount}`);
+    if (diagnostics?.pendingRemoteDeltaCount) lines.push(`pending remote deltas ${diagnostics.pendingRemoteDeltaCount}`);
+    this.debug(`status details ${lines.join(" · ")}`);
+    new Notice(`Mineral Sync — ${lines.join("\n")}`);
   }
   private registerVaultListeners(): void {
     const mark = (path: string) => this.scheduler?.markLocalPaths([path], (key) => createVaultPathFilter(this.settings).ignores(key));
@@ -721,7 +779,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   async inspectSyncState(): Promise<void> {
     this.activeAnalysis?.abort();
     const controller = new AbortController(); this.activeAnalysis = controller;
-    this.setStatus("… analyzing");
+    this.showBusyStatus("Analyzing sync state…");
     try {
       const filter = createVaultPathFilter(this.settings);
       const ignorePolicy = ignorePolicyFingerprint(this.settings);
@@ -740,10 +798,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
       const totals = Object.fromEntries(result.plan.operations.map((entry) => [entry.type, result.plan.operations.filter((candidate) => candidate.type === entry.type).length]));
       this.debug(`local=${local.size} remote=${remote.size} previous=${previous.size} plan=${JSON.stringify(totals)} bootstrap=${JSON.stringify(result.diagnostics)}`);
       new DryRunModal(this.app, result.plan, { local: local.size, remote: remote.size, previous: previous.size, ...result.diagnostics }).open();
-      this.setStatus(result.plan.operations.some((entry) => entry.type === "conflict") ? "! conflicts" : "✓ inspected");
+      // The status bar goes back to the scheduler's own state in the `finally` below; the inspector's
+      // own conclusion is a dry run, and a dry run does not change what is synced.
     } catch (error) {
       console.error("[Mineral Obsidian Sync] sync inspection failed", error instanceof Error ? error.message : "unknown error");
-      this.setStatus("○ offline/error");
+      this.showErrorStatus("Sync inspection failed");
       new Notice("Sync inspection failed. Check settings, network, and R2 access.");
     } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; this.scheduler?.refreshStatus(); }
   }
