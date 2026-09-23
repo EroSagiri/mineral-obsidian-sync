@@ -17,6 +17,7 @@
  * R2 object is touched, and the token never reaches the output.
  */
 import { readFileSync } from "node:fs";
+import https from "node:https";
 import { deriveRemoteChangeChannel } from "@mineral/sync-core/channel";
 
 const argv = process.argv.slice(2);
@@ -46,10 +47,30 @@ if (!gateway || !token || !endpoint || !bucket) {
 
 const channel = await deriveRemoteChangeChannel({ endpoint, bucket, remotePrefix: prefix });
 const fingerprint = `${channel.slice(0, 6)}…(${channel.length})`;
+
+/**
+ * One authenticated GET, over `node:https` rather than global `fetch`.
+ *
+ * This machine's transparent proxy resets undici's TLS handshake to some Cloudflare hosts while plain
+ * HTTP/1.1 over TLS is fine, and a check that fails intermittently is worse than no check.
+ */
+const get = (url, headers) => new Promise((resolve, reject) => {
+  const target = new URL(url);
+  const request = https.request({ host: target.hostname, port: 443, path: `${target.pathname}${target.search}`, method: "GET", headers, timeout: 15_000 }, (response) => {
+    const chunks = [];
+    response.on("data", (chunk) => chunks.push(chunk));
+    response.on("end", () => resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
+  });
+  request.on("error", reject);
+  request.on("timeout", () => request.destroy(new Error("gateway read timed out")));
+  request.end();
+});
+
 const generation = async () => {
-  const response = await fetch(`${gateway.replace(/\/+$/, "")}/v1/channels/${channel}`, { headers: { authorization: `Bearer ${token}` } });
-  if (!response.ok) throw new Error(`gateway read failed: HTTP ${response.status}`);
-  const body = await response.json();
+  const response = await get(`${gateway.replace(/\/+$/, "")}/v1/channels/${channel}`, { authorization: `Bearer ${token}` });
+  if (response.status < 200 || response.status >= 300) throw new Error(`gateway read failed: HTTP ${response.status}`);
+  let body;
+  try { body = JSON.parse(response.text); } catch { throw new Error("gateway read returned no JSON"); }
   if (typeof body?.generation !== "string") throw new Error("gateway read returned no generation");
   return body.generation;
 };
