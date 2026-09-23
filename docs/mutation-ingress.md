@@ -126,7 +126,48 @@ retry 这些额外状态。
 - `committedAt` 用本机 `Date.now()`，符合"vault-record time，不是分布式时钟断言"。
 - 插件**不**发 `X-Mineral-Mutation-Origin: remote-apply`（只上报自己写 R2 的操作；下载不上报）。
 
-## 4. 顺带发现的一个既有缺口（不在本轮范围）
+### R7（实测发现）ingress 上报不会触发 publisher 排空
+
+`entrypoint.fetch()` 只做 `handleMutationIngressRequest(...)`；`drainConsumers()` 只在 MCP 写入路径
+（`afterWrite`）、`recordCommittedMutation` 与 **cron**（`0 */2 * * *`）里调用。因此经 ingress 上报的
+事实虽然立刻返回 202，它的 **broadcast 与 index 工作要等下一次 cron tick**，最长 2 小时。
+
+这正是插件走的那条路径，于是 Gateway 的"低延迟唤醒"在 ingress 模式下被降级成"最多两小时"。
+建议：ingress 记录成功后同样 `this.ctx.waitUntil(this.drainConsumers(event.id))`（与 MCP 路径一致）。
+
+实测证据（2026-09-23 23:38 本地，线上 `mineral-vault`，`wrangler tail`）：
+
+```text
+mutation ingress accepted id=obsidian-mue9ps3i-04kvc4ek seq=7 source=obsidian op=put    pathDigest=10yQ5xjBAPM
+mutation ingress accepted id=obsidian-mue9psoj-h6ktp4ag seq=8 source=obsidian op=delete pathDigest=10yQ5xjBAPM
+mutation ingress rejected id=obsidian-mue9psty-g5ugvrw1 source=obsidian op=put          pathDigest=10yQ5xjBAPM
+```
+
+—— 两条被接受，一条（故意用错 revision 的）被 409 拒绝；同一时间段内**没有任何 `mutation broadcast …` 行**，
+该 channel 的 generation 也没有变化。
+
+## 4. 怎么验证（已就绪）
+
+```powershell
+# 1) 客户端代码 ↔ 线上 ingress：真实 R2 写入 + 真实上报，不需要打开 Obsidian
+npx esbuild scripts/verify-mutation-ingress-client.ts --bundle --platform=node --format=esm `
+  --alias:obsidian=./test/obsidian.ts --outfile=$env:TEMP\ingress-client-probe.mjs
+node $env:TEMP\ingress-client-probe.mjs "<vault>\.obsidian\plugins\mineral-obsidian-sync\data.json"
+
+# 2) 端到端：观察该 channel 的 generation 是否被一次真实写入推动
+npm run verify:ingress -- --from-settings "<vault>\.obsidian\plugins\mineral-obsidian-sync\data.json" --watch 120
+
+# 3) 服务端自己的判决
+npx wrangler tail mineral-vault
+```
+
+`--from-settings` 让 token 不出现在命令行。两个脚本都只读；唯一写入是脚本 1 在
+`.mineral-sync-test/` 下建一个探针对象并在结束时物理删除。
+
+脚本 1 在 Node 下需要两个环境垫片，原因写在文件头：这台机器的透明代理会重置 undici 到 R2 的 TLS
+（改用 `node:https`），而插件 transport 的超时走 `window.setTimeout`（垫 `globalThis.window`）。
+
+## 5. 顺带发现的一个既有缺口（不在本轮范围）
 
 `finishGenerationHandshake` 只在**非增量**分支里调 `notifyRemoteDirty`。因此一个
 `remote-change`（增量）cycle 里如果写回了 R2（例如自动合并、或用户决议中的 keep-local），
