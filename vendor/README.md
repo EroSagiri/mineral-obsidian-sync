@@ -10,19 +10,24 @@ would make a fresh clone unbuildable on any other machine.
 | Package | `@mineral/sync-core` |
 | Version | `0.1.0` |
 | Source repository | `bedrock-mcp` (`packages/sync-core`) |
-| Source commit | `4775c23` — the commit that last touched `packages/sync-core` |
+| Source commit | `adc924e` — the commit the artifact was packed from (`git log -1 -- packages/sync-core`) |
 | Artifact | `vendor/mineral-sync-core-0.1.0.tgz` |
-| SHA-256 (tarball) | `186BC5910BCE74144906AC88AE39D832A22F2E3B5C5521F32DE29B72F05790EB` |
-| npm shasum | `6d9f5918646f2b9de9b749c2b2ed1dbeae03941d` |
-| npm integrity | `sha512-Rv/PRON0k9Zd+QAdBltteTcDfk0tmqkmdeTd6FmvGGA8rbZoFWFq75D3C+rFtlEkME5Yok9xwEFjFcJkjWWxiw==` |
+| SHA-256 (tarball) | `5BCBDF9D625A5E6393844AA9734CCE77706630079D51682E38DEB489FF2DF685` |
+| npm shasum | `1f5f4f94127e9e6b5f519ce5a303d3865baae6fe` |
+| npm integrity | `sha512-RlbQeOwqhzQCCfek5ROIZpCZzEblrGYMJDZBXTf2+3nGUqR5kik6bBKTWHl8FfmCalNtEgfOpY4T9RO2o+IQMA==` |
 | Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.1.0.tgz"` |
+
+This revision carries the mutation contract the plugin reports against: `RemoteChangeHint.mutationId`
+(the gateway's writer idempotency key) and the `RemoteChange[]` hint the `/dirty` route accepts. It is
+the same source the Vault's `packages/sync-core` publishes, so the plugin and the backend cannot drift
+apart on the wire.
 
 ## Rebuilding this artifact
 
 ```powershell
-cd <backend>/packages/sync-core
-npm run build          # tsc -> dist/ (js + d.ts); `prepack` runs this automatically
-npm pack               # -> mineral-sync-core-0.1.0.tgz
+cd <backend>
+npm run build -w @mineral/sync-core   # tsc -> packages/sync-core/dist (js + d.ts)
+npm pack --silent -w @mineral/sync-core   # -> ./mineral-sync-core-0.1.0.tgz at the repo root
 Copy-Item -Force .\mineral-sync-core-0.1.0.tgz <plugin>\vendor\
 ```
 

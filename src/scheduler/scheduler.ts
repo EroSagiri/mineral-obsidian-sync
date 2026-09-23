@@ -360,7 +360,12 @@ export class SyncScheduler {
   private async finishGenerationHandshake(handshake: RemoteGenerationHandshake, state: { halted: boolean; counts: ResultCounts; stale: boolean; remoteMutation: CycleRemoteMutation | undefined; remoteChanges: RemoteChange[] }): Promise<ConfirmationOutcome> {
     const remote = this.dependencies.remoteChange;
     const outcome = await this.confirmGeneration(handshake, state);
-    if (remote && state.remoteMutation !== undefined) {
+    // One writer, one announcer. When the mutation journal announces this device's landed writes, the
+    // Vault's Sync Publisher is what produces the generation for them, and a second `/dirty` call here
+    // would bump it again for the same write. This is a mode choice, not a fallback: an ingress report
+    // that failed is retried with the same mutation id, because its response may merely have been lost.
+    const announcedByIngress = this.dependencies.mutationIngress?.announcesLandedWrites() ?? false;
+    if (remote && state.remoteMutation !== undefined && !announcedByIngress) {
       // Writer notification, coalesced to one call per cycle and issued once the boundary is final.
       // Notification can neither roll back a committed write nor reclassify any operation result.
       try {

@@ -88,6 +88,15 @@ export interface SchedulerRemoteChange {
 export interface SchedulerMutationIngress {
   /** Records writes that landed, with the revision each produced or retired. Never changes an outcome. */
   report(writes: readonly LandedWrite[]): Promise<void>;
+  /**
+   * Whether this port, and not the Gateway, is the writer's announcer for a landed write.
+   *
+   * The two are a **mode-level** choice, never a fallback: a report whose response was lost may still
+   * have been recorded, so answering that with a `/dirty` call would announce one write twice. When
+   * this is true the journal — and therefore the Vault's own Sync Publisher — is the only source of
+   * gateway generations for this device's writes, and this cycle skips its own notification.
+   */
+  announcesLandedWrites(): boolean;
 }
 
 export interface SchedulerDependencies {

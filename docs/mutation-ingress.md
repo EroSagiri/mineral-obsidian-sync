@@ -68,30 +68,57 @@ Vault worker 的公开基址（例如 https://mineral-vault.<subdomain>.workers.
 MUTATION_INGRESS_TOKEN 的值
 ```
 
+`MINERAL_R2_ENDPOINT` 必须是**带协议的完整 URL**（例如
+`https://<account-id>.r2.cloudflarestorage.com`，无尾斜杠）：两侧都走 `canonicalEndpoint()`
+重新解析 URL，只有解析结果一致，派生出的 channel 才一致。少了 `https://` 会得到另一个 channel。
+
 另外请确认部署环境的 `MINERAL_R2_ENDPOINT` / `MINERAL_BUCKET` / `MINERAL_REMOTE_PREFIX`
 与插件使用的 R2 identity 一致：Vault 的 publisher 由这三个值派生 channel
 （`entrypoint.gatewayChannel()`），派生结果必须等于插件/Gateway 的 channel，否则 mutation 会被记录到
-另一个 channel，设备永远不会被唤醒。`apps/vault/wrangler.jsonc` 里的 `MINERAL_R2_ENDPOINT`
-目前是占位值 `https://example.r2.cloudflarestorage.com`，若线上就是这个值，则整条发布链路指向错误的 channel。
+另一个 channel，设备永远不会被唤醒。
+
+`apps/vault/wrangler.jsonc` 目前写的是占位值 `https://example.r2.cloudflarestorage.com`；
+服务端现在把 `example.r2.cloudflarestorage.com` 当作**未配置**（publisher 记录
+`mutation broadcast disabled` 而不是算出一个错误的 channel），部署时必须替换。
 
 若你更希望"一个控制平面端点"，可让 Sync Gateway 代理 `/internal/mutations`（它没有 R2 binding，
-只能转发不能校验）；那是网关侧改动，需要你确认。
+只能转发不能校验）；那是网关侧改动，需要你确认。**当前按直连 Vault 落地。**
 
-### R3 一次写入可能产生两个 generation（可选优化）
+### R3（已实现）模式级互斥，不是 fallback
 
-Ingress 收到事实后 Vault publisher 会用 `mutationId = mutation.id` 调 Gateway
-`POST /v1/channels/{c}/dirty`；与此同时插件仍会发自己 cycle 级的 `/dirty`（无 `mutationId`）。
-Hub 幂等按 `mutationId`，两者 key 不同 → 同一次写入可能 bump 两次 generation，所有设备多跑一轮 reconcile。
-选项：接受（当前默认）／配置 Ingress 后插件不再自发 `/dirty`／插件改为逐 mutation 发 `/dirty` 并复用同一 `mutationId`（需要 R4）。
+**配置了 Ingress 之后，插件不再对同一次文件 mutation 自发调用 `/dirty`。** 唯一链路是：
 
-### R4 vendored sync-core 落后于 Gateway
+```text
+Obsidian → Mutation Ingress → Journal → Sync Publisher → Gateway
+```
 
-Gateway 仓库 `packages/sync-core/src/sync-change.ts` 已有 `RemoteChangeHint.mutationId`，
-插件 vendor 的 `mineral-sync-core-0.1.0.tgz` 还没有。R3 的第三种做法需要重新出包（跨仓库动作）。
+实现方式是模式级选择：
 
-### R5 批量上报（可选）
+```text
+MutationIngressReporter.announcesLandedWrites()
+  = enabled && endpoint 非空 && token 非空
+    → true：journal（及其背后的 Vault Sync Publisher）是本设备写入的唯一 generation 来源，
+            scheduler 跳过本轮的 notifyRemoteDirty
+    → false：legacy 模式，行为与本轮之前完全一致
+```
 
-当前上报器逐条 POST。若希望减少请求，可加批量形式（数组或 `{mutations:[...]}`）；插件侧改动很小。
+为什么不做"POST 失败就 fallback `/dirty`"：POST 可能**实际已经成功、只是响应丢了**，此时再发
+`/dirty` 会让同一次写入 bump 第二个 generation。Ingress 模式的失败语义是**用同一个 mutationId
+重试报告**（内存队列，上限 64），永远不等于"改走 `/dirty`"。
+
+这只互斥**写入方向的唤醒**：Gateway 连接（`current-generation`、订阅、待协调握手）照常工作，
+因为其他设备仍可能通过 Gateway 唤醒我们。被跳过的只有"我自己这次写入"的通知。
+
+### R4（已同步）重新 vendor `@mineral/sync-core`
+
+已从 backend 的 `packages/sync-core` 重新构建、出包并重装（含 `RemoteChangeHint.mutationId` 与
+`/dirty` 接受的 `RemoteChange[]`）；`package-lock.json` 与 `node_modules` 一起重建，插件不再手抄任何
+临时类型。来源 commit、tarball 哈希与 integrity 见 `vendor/README.md`。
+
+### R5（结论：不做）
+
+一 mutation 一事实保持清晰。个人知识库的 POST 数量不值得为 batch 引入部分成功、批次幂等、单项
+retry 这些额外状态。
 
 ### R6 已确认的语义
 

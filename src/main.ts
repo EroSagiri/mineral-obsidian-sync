@@ -190,7 +190,12 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // A second control-plane port, for the service that owns the *facts* rather than the wake-up. It is
       // handed only what this device observed a write to leave in R2, and its answer is never read: the
       // write is durable before this runs, so a report can only defer, never fail or reclassify.
-      mutationIngress: { report: (changes) => this.mutationIngress.report(changes) },
+      mutationIngress: {
+        report: (changes) => this.mutationIngress.report(changes),
+        // One writer, one announcer: a configured ingress makes the journal the only source of gateway
+        // generations for this device's writes, so the scheduler stops sending its own `/dirty`.
+        announcesLandedWrites: () => this.mutationIngress.announcesLandedWrites(),
+      },
       onResolutionApplied: (conflictId, path) => this.clearResolution(conflictId, path),
       remoteChange: {
         hasPending: () => this.gateway?.hasPending() ?? false,

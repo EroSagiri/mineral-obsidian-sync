@@ -31,15 +31,16 @@ const flush = async () => { for (let i = 0; i < 16; i++) await Promise.resolve()
 /** Mirrors the real Gateway client: a delta is only applicable when it is the exact next generation. */
 function fakeRemote(reconciled = "80", announced = "81") {
   const confirmed: string[] = [];
+  const notified: unknown[][] = [];
   const state = { reconciled, announced };
   const remote: SchedulerRemoteChange = {
     hasPending: () => BigInt(state.announced) > BigInt(state.reconciled),
     readGeneration: async () => ({ ok: true, generation: state.announced }),
     confirmReconciled: async (value) => { confirmed.push(value); state.reconciled = value; },
-    notifyRemoteDirty: async () => ({ ok: true, generation: state.reconciled }),
+    notifyRemoteDirty: async (changes) => { notified.push([...(changes ?? [])]); return { ok: true, generation: state.reconciled }; },
     canApplyIncrementally: (generation) => BigInt(generation) === BigInt(state.reconciled) + 1n,
   };
-  return { remote, confirmed, announce: (generation: string) => { state.announced = generation; } };
+  return { remote, confirmed, notified, announce: (generation: string) => { state.announced = generation; } };
 }
 
 const NOTE_LOCAL: LocalEntry = { key: "note.md", size: 5, mtime: 10 };
@@ -47,9 +48,9 @@ const NOTE_REMOTE: RemoteEntry = { key: "note.md", size: 5, etag: "ETAG-2", last
 const NOTE_PREVIOUS: PreviousEntry = { key: "note.md", local: { size: 5, mtime: 10 }, remote: { size: 5, etag: "ETAG-1" }, syncedAt: 1 };
 const DOWNLOAD: SyncOperation = { type: "download", key: "note.md", reason: "remote changed", expectedLocal: NOTE_LOCAL, expectedRemote: NOTE_REMOTE };
 
-function harness(execute: CycleDependencies["execute"], ingest?: { reported: unknown[][] }) {
+function harness(execute: CycleDependencies["execute"], ingest?: { reported: unknown[][]; announces?: boolean }) {
   const timers = new FakeTimers();
-  const { remote, confirmed, announce } = fakeRemote();
+  const { remote, confirmed, notified, announce } = fakeRemote();
   const observedLocally: string[][] = [];
   const observedIncrementally: RemoteChange[][] = [];
   // Starts empty so that establishing a trusted window via `startup` executes nothing; a test then
@@ -74,9 +75,14 @@ function harness(execute: CycleDependencies["execute"], ingest?: { reported: unk
   });
   const scheduler = new SyncScheduler({
     captureCycle: cycle, visible: () => true, timers, remoteChange: remote,
-    ...(ingest ? { mutationIngress: { report: async (changes) => { ingest.reported.push([...changes]); } } } : {}),
+    ...(ingest ? {
+      mutationIngress: {
+        report: async (changes) => { ingest.reported.push([...changes]); },
+        announcesLandedWrites: () => ingest.announces ?? false,
+      },
+    } : {}),
   });
-  return { scheduler, timers, confirmed, announce, observedLocally, observedIncrementally, plan, fullRemoteScans: () => fullRemoteScans };
+  return { scheduler, timers, confirmed, notified, announce, observedLocally, observedIncrementally, plan, fullRemoteScans: () => fullRemoteScans };
 }
 
 /** One confirmed full window is what makes an exact-next-generation delta applicable. */
@@ -351,5 +357,55 @@ describe("landed mutations are reported with their revision", () => {
     // A delete with no revision means "the object is gone", which this plugin can never claim about its
     // own logical deletions, so nothing is sent rather than something unverifiable.
     expect(ingest.reported).toEqual([]);
+  });
+});
+
+/**
+ * One writer, one announcer.
+ *
+ * The Gateway and the mutation journal are a **mode-level** choice, not a fallback: when the ingress
+ * announces this device's landed writes, the Vault's Sync Publisher produces their generation, and a
+ * second `/dirty` call would bump it again for the same write. A failed report is retried with the
+ * same mutation id, so it must never be answered with a `/dirty` call — the report may have been
+ * recorded even though its response was lost.
+ */
+describe("the mutation journal and the gateway never both announce one write", () => {
+  const landed: CycleDependencies["execute"] = async () => ({ status: "applied", key: "note.md", remote: { size: 5, etag: "ETAG-2" } });
+  const UPLOAD: SyncOperation = { type: "upload", key: "note.md", reason: "local changed", expectedLocal: NOTE_LOCAL, expectedRemote: { kind: "etag", value: "ETAG-1" } };
+
+  async function writeThroughCycle(env: ReturnType<typeof harness>) {
+    await establishTrustedWindow(env);
+    env.notified.length = 0;
+    env.plan.operations = [UPLOAD];
+    env.scheduler.requestReconcile("manual");
+    env.timers.fire(0);
+    await flush();
+  }
+
+  it("skips the gateway call when the journal announces landed writes", async () => {
+    const ingest = { reported: [] as unknown[][], announces: true };
+    const env = harness(landed, ingest);
+    await writeThroughCycle(env);
+
+    expect(ingest.reported).toEqual([[{ op: "put", path: "note.md", etag: "ETAG-2", size: 5 }]]);
+    // The Vault's Sync Publisher is the announcer now; this cycle sends nothing.
+    expect(env.notified).toEqual([]);
+  });
+
+  it("still notifies the gateway in legacy mode, where the journal is off", async () => {
+    const ingest = { reported: [] as unknown[][], announces: false };
+    const env = harness(landed, ingest);
+    await writeThroughCycle(env);
+
+    expect(ingest.reported).toEqual([[{ op: "put", path: "note.md", etag: "ETAG-2", size: 5 }]]);
+    // In legacy mode the Gateway is still this device's announcer, so the cycle's own hint goes out.
+    expect(env.notified).toEqual([[{ op: "put", path: "note.md", etag: "ETAG-2", size: 5 }]]);
+  });
+
+  it("keeps the gateway call when no journal is wired at all", async () => {
+    const env = harness(landed);
+    await writeThroughCycle(env);
+
+    expect(env.notified).toEqual([[{ op: "put", path: "note.md", etag: "ETAG-2", size: 5 }]]);
   });
 });

@@ -93,6 +93,15 @@ export interface MutationIngressDependencies {
 export interface MutationIngressReporter {
   /** Reports the writes a cycle landed. Never throws, and never blocks on an unconfigured ingress. */
   report(writes: readonly LandedWrite[]): Promise<void>;
+  /**
+   * Whether this reporter is the writer's announcer.
+   *
+   * True exactly when it is configured well enough to send: from that moment the journal — and the
+   * Vault's Sync Publisher behind it — owns the wake-up for this device's writes, and the plugin must
+   * stop calling `/dirty` for them. A failed report is retried with the same mutation id, never
+   * answered with a `/dirty` call, because the report may in fact have been recorded.
+   */
+  announcesLandedWrites(): boolean;
   /** How many facts are waiting for a retry. Diagnostics only. */
   pendingCount(): number;
 }
@@ -176,6 +185,10 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
 
   return {
     pendingCount: () => pending.size,
+    announcesLandedWrites: () => {
+      const settings = dependencies.settings();
+      return settings.enabled && settings.endpoint.trim().length > 0 && settings.token.trim().length > 0;
+    },
     async report(writes: readonly LandedWrite[]): Promise<void> {
       const settings = dependencies.settings();
       if (!settings.enabled || !settings.endpoint.trim() || !settings.token.trim()) return;
