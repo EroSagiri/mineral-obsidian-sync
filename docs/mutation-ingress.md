@@ -4,6 +4,9 @@
 以及**只能在 Vault / Sync Gateway 侧解决的需求**。插件侧改动见 `src/sync/executor.ts`（落地 revision）、
 `src/scheduler/scheduler.ts`（change 列表）、`src/gateway/mutation-ingress.ts`（上报器）。
 
+**状态**：R1（逻辑删除可上报）服务端已实现，插件侧已同步接上（`delete` 携带被删除的 revision）。
+其余需求见第 3 节。
+
 ## 1. 为什么需要把 ETag 传出来
 
 Ingress 是**报告**，不是写入代理：它拿 `head(path)` 与上报的 revision 比对，不一致就是 409。
@@ -30,75 +33,71 @@ PUT 都从响应里拿到它。反过来说，**没有 revision 就不上报**�
 | 项 | 值 |
 | --- | --- |
 | 端点 | `POST {endpoint}/internal/mutations`，`Authorization: Bearer <token>` |
-| 报文体 | `{ id, source:"obsidian", committedAt, op:"put", path, etag, size }` |
+| 报文体（put） | `{ id, source:"obsidian", committedAt, op:"put", path, etag, size }` |
+| 报文体（delete） | `{ id, source:"obsidian", committedAt, op:"delete", path, etag }`，`etag` = 被该次删除淘汰的 revision（条件 HEAD 刚证明过、tombstone 也正是写它）；服务端按 put 的同一规则校验 |
 | `id` | 每次落地写一个新 id（时间 + 随机，≤128）。**不**由 path/etag 派生：ETag 是内容摘要，删除后用完全相同的文本重建会得到同一个 ETag，内容派生的 key 会把一次真实的新写入误判为 duplicate |
 | 重试 | 202 → 完成；204 → 非 mutation；409 → 永久放弃（重发无用）；401/403/413/400 → 永久放弃；429/5xx/超时 → 保留，下一轮**用同一个 id**重发（ingress 按 id 幂等，所以丢响应重发是安全的） |
 | 队列 | 仅内存，上限 64 条，超出丢最旧并记日志。**不是**跨重启的 outbox |
 | 失败影响 | 无。R2 写在之前已经落地，上报失败只是"延迟"，不改变任何 cycle 结果、不回滚、不重分类 |
 | 关闭时 | 完全不发请求，行为与本轮之前逐字节相同（默认关闭） |
-| 删除 | **不上报**，见 R1 |
+| 删除 | 上报，且**必须**带被淘汰的 revision。没有 revision 的 delete 意为"对象已不存在"，本插件对逻辑删除永远不能这么声明，所以宁可不上报也不发一条无法校验的事实 |
 | 下载 / keep-remote | 不涉及 R2 写，不上报（它们是 remote apply） |
+| ambiguous PUT | 不上报：没有 revision 可命名。它只作为 hint 进 Gateway 通知 |
+
+注意 put 与 delete 使用**两套形状**：Gateway 的 change 词汇禁止 delete 带 `etag`
+（`validChange` 只允许 `op`/`path`），而 journal 需要它。二者由同一个 `OperationResult` 派生，
+在 `src/scheduler/scheduler.ts` 里分成 `remoteChangeForOperation`（hint）与
+`landedWriteForOperation`（fact）。
 
 设置项：`Report landed writes` / `Ingress endpoint` / `Ingress token`（默认全关）。
 
 ## 3. 需要在 Vault / Sync Gateway 侧处理的需求
 
-### R1（阻塞性）删除目前无法上报
+### R1（已解决）逻辑删除可上报
 
-Ingress 校验 `delete` 的方式是 `observe(path) === null`，即**对象必须已经不在 R2**。
-本插件的删除是**逻辑删除**：写不可变 tombstone、对象原地保留（这正是删除可恢复的前提）。
-于是 `{op:"delete", path}` 对这条链路是**必然 409**，插件只能选择不上报。
+服务端已实现：`delete` 可以携带被删除的 revision，并按 `put` 的同一规则校验
+（`normalizeEtag(observe(path).etag) === normalizeEtag(etag)`）；不带 `etag` 的 delete 仍要求对象已不存在。
+插件侧已接上，wire 上的 change 形状未变。
 
-**后果**：删除事实进不了 journal → Sync Publisher 不广播该删除 → 基于该 journal 的索引会一直保留已删除的笔记。
+### R2 上报端点与凭据（需要确认）
 
-**建议改法（向后兼容）**：允许 `delete` 携带被删除的 revision，并按 `put` 的同一规则校验它：
+插件直连 **Vault worker**（`Ingress endpoint` + `Ingress token` 两个设置）。**部署时请提供**：
 
 ```text
-delete 且带 etag  → normalizeEtag(observe(path).etag) === normalizeEtag(etag)   # 该 revision 已被逻辑删除
-delete 且不带 etag → observe(path) === null                                      # 现有语义，保持不变
+Vault worker 的公开基址（例如 https://mineral-vault.<subdomain>.workers.dev）
+MUTATION_INGRESS_TOKEN 的值
 ```
 
-这样 MCP/web 的硬删除继续工作，Obsidian 的逻辑删除也能被记录。注意 Gateway 的 `validChange` 目前禁止
-delete change 带 `etag`，但 `gatewayChangesFor()` 本来就把 delete 归一成 `{op:"delete", path}`，
-所以**无需改动 wire 上的 change 形状**，etag 只用于 Ingress 校验。
+另外请确认部署环境的 `MINERAL_R2_ENDPOINT` / `MINERAL_BUCKET` / `MINERAL_REMOTE_PREFIX`
+与插件使用的 R2 identity 一致：Vault 的 publisher 由这三个值派生 channel
+（`entrypoint.gatewayChannel()`），派生结果必须等于插件/Gateway 的 channel，否则 mutation 会被记录到
+另一个 channel，设备永远不会被唤醒。`apps/vault/wrangler.jsonc` 里的 `MINERAL_R2_ENDPOINT`
+目前是占位值 `https://example.r2.cloudflarestorage.com`，若线上就是这个值，则整条发布链路指向错误的 channel。
 
-### R2 上报端点与凭据的拓扑
-
-插件现在直连 **Vault worker**（新增 endpoint + token 两个设置）。若希望"一个控制平面端点"，
-可以让 Sync Gateway 代理 `/internal/mutations` 转给 Vault——但 Gateway 按设计没有 R2 binding，
-它只能转发、不能校验。两种拓扑都可行，需要你定：
-
-- 直连 Vault（当前实现，零网关改动）；或
-- 经 Gateway 代理（插件只配一个 endpoint，网关侧需要新路由）。
+若你更希望"一个控制平面端点"，可让 Sync Gateway 代理 `/internal/mutations`（它没有 R2 binding，
+只能转发不能校验）；那是网关侧改动，需要你确认。
 
 ### R3 一次写入可能产生两个 generation（可选优化）
 
-Ingress 收到事实后，Vault publisher 会以 `mutationId = mutation.id` 调 Gateway
-`POST /v1/channels/{c}/dirty`；与此同时**插件自己仍然发**原来的 cycle 级 `/dirty`（无 `mutationId`）。
-Hub 的幂等按 `mutationId` 去重，两者 key 不同 → 同一次写入可能 bump 两次 generation，所有设备多跑一轮
-reconcile。三个选项：
-
-1. 接受这一轮额外 generation（当前默认，无额外改动）；
-2. 配置了 Ingress 时，插件不再自己发 `/dirty`（Vault publish 成为唯一唤醒源）；
-3. 插件改为**逐 mutation** 发 `/dirty` 并复用同一个 `mutationId`（需要 R4）。
+Ingress 收到事实后 Vault publisher 会用 `mutationId = mutation.id` 调 Gateway
+`POST /v1/channels/{c}/dirty`；与此同时插件仍会发自己 cycle 级的 `/dirty`（无 `mutationId`）。
+Hub 幂等按 `mutationId`，两者 key 不同 → 同一次写入可能 bump 两次 generation，所有设备多跑一轮 reconcile。
+选项：接受（当前默认）／配置 Ingress 后插件不再自发 `/dirty`／插件改为逐 mutation 发 `/dirty` 并复用同一 `mutationId`（需要 R4）。
 
 ### R4 vendored sync-core 落后于 Gateway
 
-Gateway 仓库的 `packages/sync-core/src/sync-change.ts` 已有 `RemoteChangeHint.mutationId`，
-但插件 vendor 的 `mineral-sync-core-0.1.0.tgz` 还是旧的（没有该字段）。选项 3 需要重新 vendor
-（在 Gateway 仓库 `packages/sync-core` 构建并出包，属于跨仓库动作）。请确认由谁执行，或告知可以直接
-重新生成 tarball。
+Gateway 仓库 `packages/sync-core/src/sync-change.ts` 已有 `RemoteChangeHint.mutationId`，
+插件 vendor 的 `mineral-sync-core-0.1.0.tgz` 还没有。R3 的第三种做法需要重新出包（跨仓库动作）。
 
 ### R5 批量上报（可选）
 
-一次 cycle 可能落地多个 path。当前上报器是**逐条 POST**（与 journal 的一条 mutation 一条事实一致）。
-如果希望减少请求，可以增加 `POST /internal/mutations` 的批量形式（数组或 `{mutations: [...]}`）；插件侧改动很小。
+当前上报器逐条 POST。若希望减少请求，可加批量形式（数组或 `{mutations:[...]}`）；插件侧改动很小。
 
-### R6 确认语义细节
+### R6 已确认的语义
 
-- `source: "obsidian"` 是 `INGRESS_SOURCES` 允许的写入方（已确认）。
+- `source: "obsidian"` 在 `INGRESS_SOURCES` 内。
 - `committedAt` 用本机 `Date.now()`，符合"vault-record time，不是分布式时钟断言"。
-- 上报器**不**发 `X-Mineral-Mutation-Origin: remote-apply`（插件只上报自己写 R2 的操作；下载不上报）。
+- 插件**不**发 `X-Mineral-Mutation-Origin: remote-apply`（只上报自己写 R2 的操作；下载不上报）。
 
 ## 4. 顺带发现的一个既有缺口（不在本轮范围）
 

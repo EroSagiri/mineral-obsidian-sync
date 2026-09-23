@@ -150,7 +150,8 @@ describe("SafeExecutor", () => {
       putTombstone: async (record) => { created.push(record); return { tombstone: record }; },
     });
     const result = await new SafeExecutor(vault({}) as never, client, saved, identity, "[]").execute({ type: "delete-remote", key: "a", reason: "test", expectedRemoteETag: "A" });
-    expect(result).toEqual({ status: "applied", key: "a" });
+    // The retired revision travels with the result: a deletion report has to name it to be verifiable.
+    expect(result).toEqual({ status: "applied", key: "a", retired: "A" });
     expect(created).toMatchObject([{ path: "a", deletedRemoteETag: "A", protocol: 1 }]);
     expect(deleted).toEqual(["a"]);
   });

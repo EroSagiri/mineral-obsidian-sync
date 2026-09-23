@@ -323,7 +323,22 @@ describe("landed mutations are reported with their revision", () => {
     expect(ingest.reported).toEqual([]);
   });
 
-  it("reports a deletion as a deletion, with no revision to claim", async () => {
+  it("reports a deletion with the revision it retired, as a journal fact rather than a Gateway hint", async () => {
+    const ingest = { reported: [] as unknown[][] };
+    const env = harness(async () => ({ status: "applied", key: "note.md", retired: "ETAG-1" }), ingest);
+    await establishTrustedWindow(env);
+    env.plan.operations = [{ type: "delete-remote", key: "note.md", reason: "local deletion", expectedRemoteETag: "ETAG-1" }];
+
+    env.scheduler.requestReconcile("manual");
+    env.timers.fire(0);
+    await flush();
+
+    // The Gateway's change vocabulary forbids an ETag on a delete, so the journal gets a delete *fact*
+    // while the wake-up hint stays exactly as it was — the two are derived from the same result.
+    expect(ingest.reported).toEqual([[{ op: "delete", path: "note.md", etag: "ETAG-1" }]]);
+  });
+
+  it("reports nothing for a deletion whose retired revision was never established", async () => {
     const ingest = { reported: [] as unknown[][] };
     const env = harness(async () => ({ status: "applied", key: "note.md" }), ingest);
     await establishTrustedWindow(env);
@@ -333,8 +348,8 @@ describe("landed mutations are reported with their revision", () => {
     env.timers.fire(0);
     await flush();
 
-    // It reaches the port as a delete; whether a `delete` can be *journaled* is the ingress's contract,
-    // and the plugin does not pretend a revision exists for a write it never performed.
-    expect(ingest.reported).toEqual([[{ op: "delete", path: "note.md" }]]);
+    // A delete with no revision means "the object is gone", which this plugin can never claim about its
+    // own logical deletions, so nothing is sent rather than something unverifiable.
+    expect(ingest.reported).toEqual([]);
   });
 });

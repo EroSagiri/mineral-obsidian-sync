@@ -1,5 +1,6 @@
 import type { OperationResult } from "../sync/executor";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
+import type { LandedWrite } from "../gateway/mutation-ingress";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
 
 export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "foreground-resume" | "integrity-check" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
@@ -85,8 +86,8 @@ export interface SchedulerRemoteChange {
  * over what it observed — which writes landed, and with which revision — and is told nothing back.
  */
 export interface SchedulerMutationIngress {
-  /** Records writes that landed, with the revision each left in R2. Never changes a cycle's outcome. */
-  report(changes: readonly RemoteChange[]): Promise<void>;
+  /** Records writes that landed, with the revision each produced or retired. Never changes an outcome. */
+  report(writes: readonly LandedWrite[]): Promise<void>;
 }
 
 export interface SchedulerDependencies {

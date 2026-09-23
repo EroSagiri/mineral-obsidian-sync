@@ -17,22 +17,34 @@ import type { GatewayTransport } from "./transport";
  * ETag this device did not receive from the PUT response would be rejected as a state mismatch (409) —
  * which is why the revision has to travel from the executor's result and not be re-read or guessed.
  *
- * **Deletion is not reportable yet, and is skipped on purpose.** The ingress verifies a `delete` by
- * requiring the object to be *gone* from R2, while this plugin deletes logically: it writes an immutable
- * tombstone and leaves the object in place, so a `delete` report would be a guaranteed 409. Reporting
- * nothing is honest; reporting a hard delete this device did not perform would be a lie. The requirement
- * on the ingress side is written up in `docs/mutation-ingress.md`.
+ * **Deletion is reportable because the report can name the revision it retired.** This plugin deletes
+ * logically — an immutable tombstone, with the object left in place so the deletion stays recoverable —
+ * and the ingress verifies a `delete` that carries a revision against R2 exactly as it verifies a `put`.
+ * A `delete` with no revision means "the object is gone" instead, which is not something this plugin can
+ * claim about its own deletions, so it never sends one.
  */
+
+/**
+ * A write this device landed, in the journal's vocabulary.
+ *
+ * Deliberately not the Gateway's `RemoteChange`: a mutation is verified against R2 by the receiver, so a
+ * `put` must name the revision it left and a logical `delete` must name the revision it retired, while
+ * the Gateway's change vocabulary forbids an ETag on a delete and describes a wake-up hint rather than a
+ * fact. The two are derived from the same result and diverge here, at the only place that needs to.
+ */
+export type LandedWrite =
+  | { op: "put"; path: string; etag: string; size: number }
+  | { op: "delete"; path: string; etag: string };
 
 /** The mutation vocabulary, as the Vault's ingress accepts it from a writer. */
 export interface WriterMutation {
   id: string;
   source: "obsidian";
   committedAt: number;
-  op: "put";
+  op: "put" | "delete";
   path: string;
   etag: string;
-  size: number;
+  size?: number;
 }
 
 export interface MutationIngressSettings {
@@ -80,7 +92,7 @@ export interface MutationIngressDependencies {
 
 export interface MutationIngressReporter {
   /** Reports the writes a cycle landed. Never throws, and never blocks on an unconfigured ingress. */
-  report(changes: readonly RemoteChange[]): Promise<void>;
+  report(writes: readonly LandedWrite[]): Promise<void>;
   /** How many facts are waiting for a retry. Diagnostics only. */
   pendingCount(): number;
 }
@@ -102,12 +114,18 @@ function defaultNewId(now: number): string {
   return `obsidian-${now.toString(36)}-${suffix}`;
 }
 
-/** A change is reportable only when it is a write whose landed revision this device actually observed. */
-export function mutationForChange(change: RemoteChange, id: string, committedAt: number): WriterMutation | undefined {
-  if (change.op !== "put") return undefined;
-  if (typeof change.etag !== "string" || change.etag.length === 0 || change.etag.length > 256) return undefined;
-  if (typeof change.size !== "number" || !Number.isFinite(change.size) || change.size < 0) return undefined;
-  return { id, source: "obsidian", committedAt, op: "put", path: change.path, etag: change.etag, size: change.size };
+/**
+ * The mutation a landed write becomes, or nothing when the write cannot be verified.
+ *
+ * A `put` needs both the revision and the size the PUT response reported, and a logical `delete` needs
+ * the revision it retired: the ingress checks the report against R2, so a fact without them could only
+ * be rejected. There is no "report it anyway" path — an unverifiable report is noise, not evidence.
+ */
+export function mutationForWrite(write: LandedWrite, id: string, committedAt: number): WriterMutation | undefined {
+  if (!write.etag || write.etag.length > 256) return undefined;
+  if (write.op === "delete") return { id, source: "obsidian", committedAt, op: "delete", path: write.path, etag: write.etag };
+  if (!Number.isFinite(write.size) || write.size < 0) return undefined;
+  return { id, source: "obsidian", committedAt, op: "put", path: write.path, etag: write.etag, size: write.size };
 }
 
 /** How the ingress answered, reduced to what a writer has to do about it. */
@@ -158,16 +176,14 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
 
   return {
     pendingCount: () => pending.size,
-    async report(changes: readonly RemoteChange[]): Promise<void> {
+    async report(writes: readonly LandedWrite[]): Promise<void> {
       const settings = dependencies.settings();
       if (!settings.enabled || !settings.endpoint.trim() || !settings.token.trim()) return;
 
       const now = dependencies.now();
-      let skippedDeletes = 0;
       let unreportable = 0;
-      for (const change of changes) {
-        if (change.op === "delete") { skippedDeletes += 1; continue; }
-        const mutation = mutationForChange(change, newId(now), now);
+      for (const write of writes) {
+        const mutation = mutationForWrite(write, newId(now), now);
         if (!mutation) { unreportable += 1; continue; }
         // A write to the same path in a later cycle is a new fact; only a retry reuses an id.
         pending.set(mutation.id, mutation);
@@ -190,9 +206,8 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
       }
 
       if (deferred > 0) dependencies.debug?.(`mutation ingress deferred pending=${pending.size}`);
-      if (skippedDeletes > 0) dependencies.debug?.(`mutation ingress skipped op=delete count=${skippedDeletes} reason=logical-delete`);
       if (unreportable > 0) dependencies.debug?.(`mutation ingress skipped reason=no-verified-revision count=${unreportable}`);
-      if (pending.size === 0 && deferred === 0 && (skippedDeletes + unreportable) === 0) dependencies.debug?.(`mutation ingress recorded count=${changes.length}`);
+      if (pending.size === 0 && deferred === 0 && unreportable === 0) dependencies.debug?.(`mutation ingress recorded count=${writes.length}`);
     },
   };
 }

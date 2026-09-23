@@ -76,24 +76,22 @@ describe("what is reported", () => {
     expect(sent[0]!.url).toBe("https://vault.example/internal/mutations");
   });
 
-  it("skips a deletion instead of reporting one it did not perform", async () => {
-    // A delete report is verified by requiring the object to be *gone* from R2. This plugin deletes
-    // logically — the tombstone hides a still-present object — so a delete report would be a guaranteed
-    // 409, and reporting a hard delete would be a lie about what happened.
-    const { instance, sent, debug } = reporter([202]);
+  it("reports a logical deletion with the revision it retired", async () => {
+    // A delete that names a revision is verified against R2 exactly as a put is, which is the only way a
+    // logical deletion — a tombstone with the object left in place — can be checked at all.
+    const { instance, sent } = reporter([202]);
 
-    await instance.report([{ op: "delete", path: "notes/gone.md" }]);
+    await instance.report([{ op: "delete", path: "notes/gone.md", etag: "ETAG-GONE" }]);
 
-    expect(sent).toEqual([]);
-    expect(debug).toContain("mutation ingress skipped op=delete count=1 reason=logical-delete");
+    expect(JSON.parse(sent[0]!.body!)).toEqual({ id: expect.any(String), source: "obsidian", committedAt: 1_700_000_000_000, op: "delete", path: "notes/gone.md", etag: "ETAG-GONE" });
   });
 
-  it("skips a write whose landed revision it never observed", async () => {
+  it("reports nothing for a write whose landed revision it never observed", async () => {
     // An ambiguous PUT has no revision to name, and the ingress checks a report against R2, so there is
     // nothing honest to send.
     const { instance, sent, debug } = reporter([202]);
 
-    await instance.report([{ op: "put", path: "notes/a.md" }, { op: "put", path: "notes/b.md", etag: "E" }, { op: "rename", from: "a", to: "b" }]);
+    await instance.report([{ op: "put", path: "notes/a.md", etag: "", size: 3 }, { op: "put", path: "notes/b.md", etag: "E", size: Number.NaN }, { op: "delete", path: "notes/c.md", etag: "" }]);
 
     expect(sent).toEqual([]);
     expect(debug).toContain("mutation ingress skipped reason=no-verified-revision count=3");

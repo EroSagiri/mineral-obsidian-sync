@@ -390,7 +390,8 @@ describe("delete conflict resolutions", () => {
 
     const result = await new SafeExecutor(vault({}) as never, client, saved, identity, "[]").execute(acceptLocalDelete);
 
-    expect(result).toEqual({ status: "applied", key: "a.md" });
+    // The tombstone names the revision the user was shown, and so does the result.
+    expect(result).toEqual({ status: "applied", key: "a.md", retired: "R" });
     expect(created).toEqual([{ path: "a.md", deletedRemoteETag: "R" }]);
     expect(deleted).toEqual(["a.md"]);
   });

@@ -1,6 +1,7 @@
 import { RemoteHttpError, RemoteTransportError } from "../remote/errors";
 import { canonicalKey, pathDigest } from "../sync/path";
 import type { OperationResult } from "../sync/executor";
+import type { LandedWrite } from "../gateway/mutation-ingress";
 import type { LocalEntry, SyncOperation } from "../sync/types";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
@@ -137,7 +138,7 @@ export class SyncScheduler {
      * mutation journal wants a fact: an ambiguous PUT has no revision to name, and a made-up one would be
      * rejected against R2 anyway.
      */
-    const landedMutations: RemoteChange[] = [];
+    const landedMutations: LandedWrite[] = [];
     const localWrites = new Map<string, LocalEntry>();
     const resultDetails = new Map<string, number>();
     const conflicts: ConflictObservation[] = [];
@@ -210,7 +211,10 @@ export class SyncScheduler {
               // can accept is the journal's contract, not something this cycle should pre-judge. A PUT whose
               // outcome is unknown is *not* here — there is no revision to name — which is what keeps a
               // report from ever being a guess.
-              if (mutation === "confirmed" && change) landedMutations.push(change);
+              if (mutation === "confirmed") {
+                const write = landedWriteForOperation(operation, result);
+                if (write) landedMutations.push(write);
+              }
             }
             // A resolution that actually applied is retired here, once, outside the planner: the
             // conflict it described no longer exists, and keeping its intent would let a stale decision
@@ -281,7 +285,6 @@ export class SyncScheduler {
       try { await this.dependencies.mutationIngress.report(landedMutations); }
       catch { this.dependencies.debug?.("mutation ingress report failed"); }
     }
-
     this.lastCycleFinishedAt = Date.now(); this.lastResultCounts = counts; this.lastFailureClass = failure;
     this.lastCycleRemoteMutation = remoteMutation !== undefined;
     // Conflicts are handed to the coordinator after the cycle has fully executed. Nothing here
@@ -438,16 +441,35 @@ export class SyncScheduler {
 /**
  * The change one operation implies for the remote control plane, with the revision it left behind.
  *
- * The Gateway accepts `etag`/`size` as optional hints and validates them, and a mutation journal
- * requires them: an ingress checks a reported `put` against R2 itself, so a report without the exact
- * revision can only be rejected. Both therefore read the same value, taken from the write's own
- * response — never re-read afterwards, which would race a later writer, and never guessed.
+ * The Gateway accepts `etag`/`size` as optional hints and validates them. This is the *hint* shape: a
+ * delete carries no revision here, because the Gateway's vocabulary forbids one — the fact that names the
+ * retired revision is built separately, for the journal that can verify it.
  */
 function remoteChangeForOperation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): RemoteChange | undefined {
   const revision = "remote" in result ? result.remote : undefined;
   if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") return { op: "delete", path: operation.key };
   if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") {
     return { op: "put", path: operation.key, ...(revision?.etag ? { etag: revision.etag } : {}), ...(typeof revision?.size === "number" ? { size: revision.size } : {}) };
+  }
+  return undefined;
+}
+
+/**
+ * The same operation as a journal fact: the revision it produced, or the one it retired.
+ *
+ * A write with no revision to name produces nothing rather than a guess, which is what keeps every report
+ * verifiable against R2. The revision a logical delete retired is as much a fact as the one a PUT left —
+ * it is the version the conditional HEAD proved before the tombstone was written.
+ */
+function landedWriteForOperation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): LandedWrite | undefined {
+  if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") {
+    const revision = "remote" in result ? result.remote : undefined;
+    if (!revision?.etag || typeof revision.size !== "number") return undefined;
+    return { op: "put", path: operation.key, etag: revision.etag, size: revision.size };
+  }
+  if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") {
+    const retired = "retired" in result ? result.retired : undefined;
+    return retired ? { op: "delete", path: operation.key, etag: retired } : undefined;
   }
   return undefined;
 }

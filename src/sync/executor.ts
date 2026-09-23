@@ -73,13 +73,14 @@ export type PartialReason =
  * committed — the write is a fact even when this device failed to account for it.
  */
 export type OperationResult =
-  | { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry; remote?: RemoteVersion }
+  | /** `retired` is the remote revision this operation logically deleted, when it deleted one. */
+  { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry; remote?: RemoteVersion; retired?: string }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" | "conflict-superseded" }
   | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" | "remote-deletion-requires-version-identity" }
   /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
   | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure | VaultTrashFailure | ResolutionWriteFailure; httpStatus?: number }
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
-  | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed"; remote?: RemoteVersion }
+  | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed"; remote?: RemoteVersion; retired?: string }
   /**
    * A transfer that may have left a side effect this device cannot describe with a baseline.
    *
@@ -190,9 +191,9 @@ export class SafeExecutor {
     return this.pruneResult(operation.key);
   }
 
-  private async pruneResult(key: string): Promise<OperationResult> {
-    try { await this.state.delete(key); return { status: "applied", key }; }
-    catch { return { status: "unresolved", key, reason: "state-commit-failed" }; }
+  private async pruneResult(key: string, retired?: { retired: string }): Promise<OperationResult> {
+    try { await this.state.delete(key); return { status: "applied", key, ...retired }; }
+    catch { return { status: "unresolved", key, reason: "state-commit-failed", ...retired }; }
   }
 
   /**
@@ -223,7 +224,11 @@ export class SafeExecutor {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
       return uploadFailure("PutObject tombstone", operation.key, error);
     }
-    return this.pruneResult(operation.key);
+    // The revision this deletion retired is the one the conditional HEAD just proved and the tombstone
+    // names, so it is a fact about this operation and not a re-statement of the plan: it travels with
+    // the result for the same reason a PUT's did — a report of the deletion has to name it to be
+    // verifiable at all.
+    return this.pruneResult(operation.key, { retired: etag });
   }
 
   // ---- conflict resolution ----------------------------------------------------------------------
