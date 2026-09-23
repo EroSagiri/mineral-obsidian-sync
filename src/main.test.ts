@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MarkdownView, Notice, Platform } from "obsidian";
+import { MarkdownView, Menu, Notice, Platform } from "obsidian";
 import { FakeElement } from "../test/dom";
 import R2PersonalSyncPlugin from "./main";
 import { DEFAULT_SETTINGS } from "./settings";
 import { ignorePolicyFingerprint } from "./sync/ignore";
 import { remoteIdentity } from "./remote/r2-client";
+import { CONFLICT_PROTOCOL_VERSION, type AutoMergeStatus, type ConflictRecord, type ResolutionIntent } from "./conflict/types";
+import type { SyncHistoryEntry } from "./history/types";
 import type { R2SyncSettings } from "./settings";
 import type { FailureClass, ResultCounts, SchedulerState } from "./scheduler/types";
 import type { LocalEntry, PreviousEntry } from "./sync/types";
@@ -36,6 +38,7 @@ interface Internals {
     markLocalPaths(paths: string[], ignores: (key: string) => boolean, reason?: string): boolean;
     diagnostics?(): { lastFailureClass?: FailureClass; currentState?: string; lastCycleReason?: string; pendingDirtyCount?: number; pendingRemoteDeltaCount?: number };
     requestReconcile?(reason: string): void;
+    refreshStatus?(): void;
   };
   stateStore: { loadAll(): Promise<Map<string, PreviousEntry>> };
   statusBar?: FakeElement;
@@ -383,5 +386,250 @@ describe("status bar wiring", () => {
     notices.shown.length = 0;
     env.plugin.reportStatusDetails();
     expect(notices.shown.join("\n")).toContain("conflicts 4");
+  });
+});
+
+/**
+ * The three-level merge decision, as the plugin wires it.
+ *
+ * Level 0 and level 1 are settled by the divergence policy and must reach the user only as history;
+ * level 2 is the only thing worth a badge. These tests pin that separation at the plugin boundary,
+ * where the count, the resolver list and the Notice all come from, and pin the safety of the one write
+ * the history viewer can cause.
+ */
+
+type FakeHistory = { entries: SyncHistoryEntry[]; record(entry: SyncHistoryEntry): Promise<void> };
+
+interface HistoryInternals extends Internals {
+  app: Internals["app"] & { vault: { getFileByPath(path: string): unknown; getAbstractFileByPath(path: string): unknown; createFolder(path: string): Promise<void>; modify(target: { path: string }, content: string): Promise<void>; create(path: string, content: string): Promise<void> } };
+  resolvedChannel?: string;
+  history: FakeHistory;
+  coordinator?: { setChannel(channel: string): void; list(): Promise<ConflictRecord[]>; intentFor(path: string): Promise<ResolutionIntent | undefined>; clear(conflictId: string, path: string): Promise<void> };
+  pendingConflicts(): Promise<ConflictRecord[]>;
+  refreshConflictStatus(): Promise<void>;
+  clearResolution(conflictId: string, path: string): Promise<void>;
+  restoreFromHistory(input: { path: string; content: string; sourceHistoryId: string }): Promise<void>;
+  openSyncHistory(): Promise<void>;
+  openStatusMenu(event: MouseEvent): void;
+}
+
+const conflictRecord = (conflictId: string, status: AutoMergeStatus, extra: Partial<ConflictRecord> = {}): ConflictRecord => ({
+  protocolVersion: CONFLICT_PROTOCOL_VERSION,
+  conflictId,
+  channel: "channel-1",
+  path: "note.md",
+  previous: { localVersion: { key: "note.md", size: 5, mtime: 100 }, remoteETag: "etag-base" },
+  detectedAt: 1,
+  autoMergeStatus: status,
+  snapshot: { local: "local\n", remote: "remote\n", base: "base\n", baseAvailable: true },
+  ...extra,
+});
+
+/** A plugin whose history, conflict store and Vault are all observable, with no real IndexedDB. */
+function historyEnv(options: { file?: string | null } = {}) {
+  const settings = { ...DEFAULT_SETTINGS, endpoint: "https://r2.example", bucket: "mineral" };
+  const contents = new Map<string, string>();
+  const file = options.file === null ? null : { path: "note.md" };
+  if (file) contents.set("note.md", options.file ?? "current\n");
+
+  const modified: Array<{ path: string; content: string }> = [];
+  const created: Array<{ path: string; content: string }> = [];
+  const marked: string[] = [];
+  const reconciles: string[] = [];
+  const stateWrites: unknown[] = [];
+  const logs: string[] = [];
+
+  const app = {
+    vault: {
+      getFileByPath: (path: string) => (file && path === file.path ? file : null),
+      getAbstractFileByPath: () => null,
+      createFolder: async () => {},
+      read: async (target: { path: string }) => contents.get(target.path) ?? "",
+      modify: async (target: { path: string }, content: string) => { contents.set(target.path, content); modified.push({ path: target.path, content }); },
+      create: async (path: string, content: string) => { contents.set(path, content); created.push({ path, content }); },
+    },
+    workspace: { getLeavesOfType: () => [] },
+  };
+
+  const plugin = newPlugin(app) as unknown as HistoryInternals;
+  plugin.app = app as unknown as HistoryInternals["app"];
+  plugin.settings = settings;
+  plugin.resolvedChannel = "channel-1";
+  plugin.scheduler = {
+    markLocalPaths: (paths: string[]) => { marked.push(...paths); return true; },
+    refreshStatus: () => {},
+    requestReconcile: (reason: string) => { reconciles.push(reason); },
+  };
+  // A state-store write here would mean a restore had moved the baseline, which is exactly what it must
+  // never do: the baseline is what makes the next cycle compare the restored text as a local change.
+  plugin.stateStore = { loadAll: async () => new Map(), saveVerified: async (entries: unknown) => { stateWrites.push(entries); } } as unknown as Internals["stateStore"];
+  const history: FakeHistory = { entries: [], record: async (entry) => { history.entries.push(entry); } };
+  plugin.history = history;
+  (plugin as unknown as { debug(message: string): void }).debug = (message) => { logs.push(message); };
+
+  const records: ConflictRecord[] = [];
+  const intents = new Map<string, ResolutionIntent>();
+  const cleared: string[] = [];
+  plugin.coordinator = {
+    setChannel: () => {},
+    list: async () => records,
+    intentFor: async (path) => intents.get(path),
+    clear: async (conflictId) => { cleared.push(conflictId); },
+  };
+
+  return { plugin, history, records, intents, cleared, contents, modified, created, marked, reconciles, stateWrites, logs, settings };
+}
+
+describe("automatic merges stay out of the user's way", () => {
+  beforeEach(() => { (Notice as unknown as { shown: string[] }).shown.length = 0; });
+
+  it("reports a settled divergence as no work at all, and says nothing", async () => {
+    const env = historyEnv();
+    env.records.push(conflictRecord("auto-clean", "clean"), conflictRecord("auto-handoff", "handoff"));
+
+    await env.plugin.refreshConflictStatus();
+
+    // The badge counts decisions, and there are none: an automatic merge is not a conflict to the user.
+    expect(env.plugin.lastConflictCount).toBe(0);
+    expect(await env.plugin.pendingConflicts()).toEqual([]);
+    expect((Notice as unknown as { shown: string[] }).shown).toEqual([]);
+  });
+
+  it("counts a conflict that needs a decision, and still does not interrupt", async () => {
+    const env = historyEnv();
+    env.records.push(conflictRecord("auto-clean", "clean"), conflictRecord("manual-1", "manual-required"), conflictRecord("auto-handoff", "handoff"));
+
+    await env.plugin.refreshConflictStatus();
+
+    expect(env.plugin.lastConflictCount).toBe(1);
+    // The same filtered list is what the resolver is opened with, so this one assertion covers both the
+    // badge and the queue the user is offered.
+    expect((await env.plugin.pendingConflicts()).map((record) => record.conflictId)).toEqual(["manual-1"]);
+    // The badge is the whole announcement; a Notice here is the interruption this behaviour removes.
+    expect((Notice as unknown as { shown: string[] }).shown).toEqual([]);
+  });
+});
+
+describe("history records what a resolution actually did", () => {
+  it("records a manual resolution with both sides, the ancestor and what it replaced", async () => {
+    const env = historyEnv();
+    env.records.push(conflictRecord("manual-1", "manual-required", {
+      reason: "overlapping edits",
+      snapshot: { local: "mine\n", remote: "theirs\n", base: "base\n", draft: "draft\n", baseAvailable: true },
+    }));
+    env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "manual-1", channel: "channel-1", path: "note.md", type: "keep-local", createdAt: 2, origin: "manual" });
+
+    await env.plugin.clearResolution("manual-1", "note.md");
+
+    expect(env.history.entries).toHaveLength(1);
+    const entry = env.history.entries[0]!;
+    expect(entry.type).toBe("manual-conflict-resolved");
+    expect(entry.path).toBe("note.md");
+    // keep-local means the text this device already held is what landed.
+    expect(entry.result.content).toBe("mine\n");
+    expect(entry.base?.content).toBe("base\n");
+    expect(entry.localBefore?.content).toBe("mine\n");
+    expect(entry.remoteBefore?.content).toBe("theirs\n");
+    expect(entry.metadata.resolutionType).toBe("keep-local");
+    expect(entry.result.sha256).toMatch(/^[0-9a-f]{64}$/);
+    // The conflict is retired only after its evidence is written.
+    expect(env.cleared).toEqual(["manual-1"]);
+  });
+
+  it("records an automatic handoff merge as a merge event, with the evidence behind it", async () => {
+    const env = historyEnv();
+    env.records.push(conflictRecord("auto-handoff", "handoff", {
+      reason: "short device handoff",
+      handoff: { reason: "short device handoff", branchSeparationMs: 3500, branchAgeMs: 900, localDeltaBytes: 13, remoteDeltaBytes: 5, hunkCount: 1, order: "local-first" },
+      snapshot: { local: "a\nlocal\n", remote: "a\nremote\n", base: "a\n", baseAvailable: true },
+    }));
+    env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "auto-handoff", channel: "channel-1", path: "note.md", type: "merged", createdAt: 2, origin: "auto", merged: { content: "merged\n", sha256: "x", encoding: { bom: false, eol: "lf", trailingNewline: true } } });
+
+    await env.plugin.clearResolution("auto-handoff", "note.md");
+
+    const entry = env.history.entries[0]!;
+    expect(entry.type).toBe("handoff-auto-merge");
+    // The merged bytes are the result, not either side: both additions were kept.
+    expect(entry.result.content).toBe("merged\n");
+    expect(entry.metadata).toMatchObject({ mergeReason: "short device handoff", branchSeparationMs: 3500, branchAgeMs: 900, localDeltaBytes: 13, remoteDeltaBytes: 5, hunkCount: 1, order: "local-first" });
+  });
+
+  it("records nothing for a resolution that does not correspond to a record", async () => {
+    const env = historyEnv();
+    await env.plugin.clearResolution("gone", "note.md");
+
+    // A stale intent is not evidence of anything that happened, so no entry claims it did.
+    expect(env.history.entries).toEqual([]);
+    expect(env.cleared).toEqual(["gone"]);
+  });
+});
+
+describe("restoring an earlier version", () => {
+  it("writes the snapshot locally and leaves the decision to normal sync", async () => {
+    const env = historyEnv({ file: "current\n" });
+
+    await env.plugin.restoreFromHistory({ path: "note.md", content: "older\n", sourceHistoryId: "h1" });
+
+    expect(env.modified).toEqual([{ path: "note.md", content: "older\n" }]);
+    expect(env.contents.get("note.md")).toBe("older\n");
+    expect(env.marked).toEqual(["note.md"]);
+    expect(env.reconciles).toEqual(["manual"]);
+
+    const entry = env.history.entries[0]!;
+    expect(entry.type).toBe("restore");
+    expect(entry.result.content).toBe("older\n");
+    // What was current before is kept, so the restore is itself undoable.
+    expect(entry.previousCurrent?.content).toBe("current\n");
+    expect(entry.metadata.sourceHistoryId).toBe("h1");
+
+    // No baseline write and no direct transfer: the restored text must be seen as an ordinary local
+    // edit, which is what makes a remote that moved in the meantime a conflict instead of an overwrite.
+    expect(env.stateWrites).toEqual([]);
+  });
+
+  it("recreates a file that no longer exists", async () => {
+    const env = historyEnv({ file: null });
+    await env.plugin.restoreFromHistory({ path: "note.md", content: "older\n", sourceHistoryId: "h1" });
+
+    expect(env.created).toEqual([{ path: "note.md", content: "older\n" }]);
+    expect(env.modified).toEqual([]);
+    expect(env.history.entries[0]?.type).toBe("restore");
+  });
+
+  it("claims nothing when the write fails", async () => {
+    const env = historyEnv({ file: "current\n" });
+    env.plugin.app.vault.modify = async () => { throw new Error("vault is read-only"); };
+
+    await expect(env.plugin.restoreFromHistory({ path: "note.md", content: "older\n", sourceHistoryId: "h1" })).rejects.toThrow("read-only");
+
+    // Recorded after the write, so a failed restore leaves no entry saying it happened.
+    expect(env.history.entries).toEqual([]);
+    expect(env.reconciles).toEqual([]);
+  });
+
+  it("refuses to open history without a configured namespace", async () => {
+    const env = historyEnv();
+    env.plugin.resolvedChannel = undefined;
+    env.plugin.settings = { ...env.settings, endpoint: "", bucket: "" };
+    (Notice as unknown as { shown: string[] }).shown.length = 0;
+
+    await env.plugin.openSyncHistory();
+
+    expect((Notice as unknown as { shown: string[] }).shown.join("\n")).toContain("sync history needs");
+  });
+
+  it("is reachable from the status bar's secondary click", async () => {
+    const env = historyEnv();
+    let opened = 0;
+    env.plugin.openSyncHistory = async () => { opened += 1; };
+    const menus = Menu as unknown as { shown: Array<{ items: Array<{ title: string; callback: () => void }> }> };
+    menus.shown.length = 0;
+
+    env.plugin.openStatusMenu({ preventDefault: () => {} } as unknown as MouseEvent);
+
+    const items = menus.shown[menus.shown.length - 1]!.items;
+    expect(items.map((item) => item.title)).toEqual(["Sync history", "Status details"]);
+    items[0]!.callback();
+    expect(opened).toBe(1);
   });
 });

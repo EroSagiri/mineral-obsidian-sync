@@ -242,6 +242,8 @@ export class ConflictResolverModal extends Modal {
       expectedRemoteETag: record.observedRemoteETag,
       expectedRemoteDeletion: record.observedRemoteDeletion,
       createdAt: Date.now(),
+      // A person made this decision, which is what distinguishes its history entry from an auto-merge.
+      origin: "manual",
     };
     try {
       if (type === "merged" && this.draft) intent.merged = await mergedContentOf(this.draft.text);

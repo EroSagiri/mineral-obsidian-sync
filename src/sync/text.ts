@@ -112,3 +112,24 @@ export function encodeText(normalizedText: string, shape: TextShape): Uint8Array
  * lets a pure line-ending change be recognized as "not a content change".
  */
 export function normalizedEquals(left: string, right: string): boolean { return normalizeToLf(left) === normalizeToLf(right); }
+
+/**
+ * The normal form used to decide whether a difference is *content* at all.
+ *
+ * Line endings, a byte-order mark, trailing spaces on a line and trailing newlines are how a file is
+ * stored rather than what the user wrote. Both the conflict decision and its presentation compare in
+ * this form, so "the other side added a newline" can neither be auto-merged as a real addition nor
+ * shown to the user as one. Nothing here rewrites a file or a snapshot: the original text is what a
+ * merge produces and what a resolution applies.
+ */
+export function significantText(text: string): string {
+  return normalizeToLf(text)
+    .replace(/\uFEFF/g, "")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/, ""))
+    .join("\n")
+    .replace(/\n+$/, "");
+}
+
+/** UTF-8 byte length, which is the unit every size threshold is expressed in. */
+export function byteLength(text: string): number { return new TextEncoder().encode(text).byteLength; }

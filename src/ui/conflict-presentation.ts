@@ -1,7 +1,7 @@
 import { shortConflictId } from "../conflict/identity";
-import type { ConflictRecord } from "../conflict/types";
+import { isAutoResolved, type ConflictRecord } from "../conflict/types";
 import { threeWayMerge, type MergeConflictHunk } from "../sync/merge";
-import { fromLines, toLines, type DecodedText } from "../sync/text";
+import { fromLines, significantText, toLines, type DecodedText } from "../sync/text";
 
 /**
  * What the resolver is allowed to say, decided once, in a pure function.
@@ -107,17 +107,10 @@ const CONTEXT_AFTER_LINES = 2;
  * Line endings, a byte-order mark, trailing spaces on a line and trailing newlines are how a file is
  * stored, not what the user wrote differently. Comparing in this form is what stops "the other side
  * added a newline" from ever reaching the screen. The original text is never rewritten by this — it is
- * still what technical details shows and what a resolution applies.
+ * still what technical details shows and what a resolution applies. It lives in `sync/text` because the
+ * divergence policy applies exactly the same rule when deciding what may be merged.
  */
-export function significantText(text: string): string {
-  return text
-    .replace(/\r\n/g, "\n")
-    .replace(/\uFEFF/g, "")
-    .split("\n")
-    .map((line) => line.replace(/[ \t]+$/, ""))
-    .join("\n")
-    .replace(/\n+$/, "");
-}
+export { significantText } from "../sync/text";
 
 /** Whether both sides only added text on top of the ancestor's own content. */
 function addedOnBothSides(base: string, current: string, other: string): boolean {
@@ -208,8 +201,9 @@ function differenceViews(hunks: MergeConflictHunk[], local: string, remote: stri
 
 /** The result the resolver is willing to stand behind, with the evidence for it. */
 function suggestedFor(record: ConflictRecord, base: string, local: string, remote: string): { text: string; source: ResultSource } | undefined {
-  // 1. The coordinator's own clean auto-merge: its draft *is* the merged text.
-  if (record.autoMergeStatus === "clean" && record.snapshot.draft !== undefined) return { text: record.snapshot.draft, source: "auto-merge" };
+  // 1. The divergence policy's own verdict: its draft *is* the text it settled on, whether that was a
+  //    non-colliding merge or a handoff whose two additions it combined.
+  if (isAutoResolved(record.autoMergeStatus) && record.snapshot.draft !== undefined) return { text: record.snapshot.draft, source: record.autoMergeStatus === "handoff" ? "combination" : "auto-merge" };
   // 2. The engine's own answer, recomputed from the snapshot we are about to show.
   const merge = threeWayMerge(asDecoded(base), asDecoded(local), asDecoded(remote));
   if (merge.status === "clean") return { text: merge.text, source: "engine" };

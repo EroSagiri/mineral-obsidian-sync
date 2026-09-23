@@ -125,6 +125,142 @@ describe("conflict identity", () => {
   });
 });
 
+describe("divergence policy through the coordinator", () => {
+  let env: ReturnType<typeof setup>;
+  let remoteBodies: Map<string, string>;
+  let reconcileReasons: string[];
+
+  const client = (): R2Client => ({
+    listObjects: async () => [],
+    headObject: async () => ({ key: "", size: 0, lastModified: 0 }),
+    getObject: async (key: string) => {
+      const body = remoteBodies.get(key);
+      if (body === undefined) throw new Error("not in remote");
+      return bytes(body);
+    },
+    putObject: async () => ({ size: 0, etag: "new" }),
+  });
+
+  const coordinator = () => new ConflictCoordinator({
+    vault: env.vault as unknown as Vault,
+    client: client(),
+    channel: CHANNEL,
+    mergeBase: env.stores,
+    conflicts: env.stores,
+    intents: env.stores,
+    requestReconcile: (reason) => { reconcileReasons.push(reason); },
+    now: () => 1000,
+  });
+
+  /** Records the ancestor for a baseline the way a converged transfer would have. */
+  const recordAncestor = async (key: string, content: string, baseline: PreviousEntry, mtime: number): Promise<void> => {
+    await env.stores.put({
+      protocolVersion: CONFLICT_PROTOCOL_VERSION, channel: CHANNEL, path: key,
+      baseline: { localVersion: localEntry(key, new TextEncoder().encode(content).byteLength, mtime), remoteETag: baseline.remote!.etag! },
+      sha256: "0".repeat(64), byteLength: new TextEncoder().encode(content).byteLength,
+      encoding: { bom: false, eol: "lf", trailingNewline: content.endsWith("\n") }, content, updatedAt: 1,
+    });
+  };
+
+  const sizeOf = (value: string): number => new TextEncoder().encode(value).byteLength;
+
+  beforeEach(() => { env = setup(); remoteBodies = new Map(); reconcileReasons = []; });
+
+  it("settles a short device handoff, records it as evidence, and proposes the combined text", async () => {
+    const ancestor = "windows\nsf\n";
+    const mine = "windows\nsf\nfrom windows\n";
+    const theirs = "windows\nsf\noppo\n";
+    // This device wrote first and the other side picked it up 3.5s later.
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode(mine), mtime: 1_500 });
+    remoteBodies.set("note.md", theirs);
+    const baseline = previous("note.md", sizeOf(ancestor), 1_000, "A");
+    await recordAncestor("note.md", ancestor, baseline, 1_000);
+
+    await coordinator().handleConflicts([{
+      key: "note.md", previous: baseline,
+      observedLocal: localEntry("note.md", sizeOf(mine), 1_500),
+      observedRemote: { key: "note.md", size: sizeOf(theirs), etag: "B", lastModified: 5_000 },
+    }]);
+
+    // The planner gets a proposal, not an instruction: nothing here writes anything.
+    const intents = await env.stores.listIntents(CHANNEL);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({ type: "merged", origin: "auto", path: "note.md" });
+    expect(intents[0]!.merged!.content).toBe("windows\nsf\nfrom windows\noppo\n");
+    // Recorded, so the history entry can carry the ancestor and both sides ...
+    const records = await env.stores.listConflicts(CHANNEL);
+    expect(records).toHaveLength(1);
+    expect(records[0]!.autoMergeStatus).toBe("handoff");
+    expect(records[0]!.handoff).toMatchObject({ branchSeparationMs: 3_500, hunkCount: 1, localDeltaBytes: 13, remoteDeltaBytes: 5, order: "local-first" });
+    expect(records[0]!.snapshot).toMatchObject({ base: ancestor, local: mine, remote: theirs, draft: "windows\nsf\nfrom windows\noppo\n" });
+    // ... and a follow-up cycle is scheduled to apply it.
+    expect(reconcileReasons).toContain("conflict-auto-merge");
+  });
+
+  it("still asks the user when the same shape of change arrived slowly", async () => {
+    const ancestor = "windows\nsf\n";
+    const mine = "windows\nsf\nfrom windows\n";
+    const theirs = "windows\nsf\noppo\n";
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode(mine), mtime: 10_000_000 });
+    remoteBodies.set("note.md", theirs);
+    const baseline = previous("note.md", sizeOf(ancestor), 1_000, "A");
+    await recordAncestor("note.md", ancestor, baseline, 1_000);
+
+    await coordinator().handleConflicts([{
+      key: "note.md", previous: baseline,
+      observedLocal: localEntry("note.md", sizeOf(mine), 10_000_000),
+      observedRemote: { key: "note.md", size: sizeOf(theirs), etag: "B", lastModified: 1_000 },
+    }]);
+
+    expect(await env.stores.listIntents(CHANNEL)).toHaveLength(0);
+    const records = await env.stores.listConflicts(CHANNEL);
+    expect(records[0]).toMatchObject({ autoMergeStatus: "manual-required" });
+    expect(records[0]!.reason).toContain("longer than a handoff");
+  });
+
+  it("settles a divergence that is only formatting, without consulting time", async () => {
+    const ancestor = "a\nb\n";
+    const mine = "a\nb \n";
+    const theirs = "a\nb\t\n";
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode(mine), mtime: 999_999_999 });
+    remoteBodies.set("note.md", theirs);
+    const baseline = previous("note.md", sizeOf(ancestor), 1_000, "A");
+    await recordAncestor("note.md", ancestor, baseline, 1_000);
+
+    await coordinator().handleConflicts([{
+      key: "note.md", previous: baseline,
+      observedLocal: localEntry("note.md", sizeOf(mine), 999_999_999),
+      observedRemote: { key: "note.md", size: sizeOf(theirs), etag: "B", lastModified: 1_000 },
+    }]);
+
+    const records = await env.stores.listConflicts(CHANNEL);
+    expect(records[0]).toMatchObject({ autoMergeStatus: "clean" });
+    expect(records[0]!.reason).toContain("formatting");
+    expect(records[0]!.handoff).toBeUndefined();
+  });
+
+  it("keeps a replaced region manual, with the marker draft the resolver can show", async () => {
+    const ancestor = "value = A\n";
+    const mine = "value = B\n";
+    const theirs = "value = C\n";
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode(mine), mtime: 5_000 });
+    remoteBodies.set("note.md", theirs);
+    const baseline = previous("note.md", sizeOf(ancestor), 1_000, "A");
+    await recordAncestor("note.md", ancestor, baseline, 1_000);
+
+    await coordinator().handleConflicts([{
+      key: "note.md", previous: baseline,
+      observedLocal: localEntry("note.md", sizeOf(mine), 5_000),
+      observedRemote: { key: "note.md", size: sizeOf(theirs), etag: "B", lastModified: 1_000 },
+    }]);
+
+    expect(await env.stores.listIntents(CHANNEL)).toHaveLength(0);
+    const records = await env.stores.listConflicts(CHANNEL);
+    expect(records[0]).toMatchObject({ autoMergeStatus: "manual-required" });
+    expect(records[0]!.snapshot.draft).toContain("<<<<<<< LOCAL");
+  });
+});
+
 describe("conflict coordinator", () => {
   let env: ReturnType<typeof setup>;
   let remoteBodies: Map<string, string>;

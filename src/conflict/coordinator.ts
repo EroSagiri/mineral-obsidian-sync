@@ -2,10 +2,12 @@ import type { Vault } from "obsidian";
 import { RemoteHttpError, RemoteObjectChangedError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation } from "../sync/types";
-import { MAX_MERGEABLE_BYTES, decodeText, isMergeablePath } from "../sync/text";
+import { MAX_MERGEABLE_BYTES, decodeText, isMergeablePath, preferredShape } from "../sync/text";
 import { threeWayMerge } from "../sync/merge";
+import { pathDigest } from "../sync/path";
+import { classifyDivergence } from "./handoff";
 import { baselineMatches, conflictIdFor, sha256Hex, shortConflictId } from "./identity";
-import { CONFLICT_PROTOCOL_VERSION, type AutoMergeStatus, type ConflictRecord, type ConflictStore, type MergeBaseRecord, type MergeBaseStore, type ResolutionIntent, type ResolutionIntentStore } from "./types";
+import { CONFLICT_PROTOCOL_VERSION, isAutoResolved, type AutoMergeStatus, type ConflictRecord, type ConflictStore, type MergeBaseRecord, type MergeBaseStore, type ResolutionIntent, type ResolutionIntentStore } from "./types";
 
 /**
  * Turns "the planner says this key is conflicted" into either an automatic resolution proposal or a
@@ -99,13 +101,21 @@ export class ConflictCoordinator {
     if (!this.dependencies.channel) return;
     const active = new Map<string, string>();
     // Both outcomes need a follow-up cycle: a recorded conflict (so the user sees it, and so the
-    // intent list is refreshed) and a clean auto-merge (so the planner can actually apply it).
+    // intent list is refreshed) and an automatic merge (so the planner can actually apply it).
     let followUp = false;
     for (const conflict of conflicts) {
       const record = await this.inspect(conflict);
       if (!record) continue;
       active.set(record.path, record.conflictId);
-      if (record.autoMergeStatus === "clean") { followUp = true; continue; }
+      // An automatically settled divergence is never surfaced as something to decide, but it *is*
+      // recorded: the record carries the ancestor and both sides, which is what lets the history entry
+      // show what was merged and offer either side back. The resolver and the status count both filter
+      // on `isAutoResolved`, so recording it here costs the user nothing.
+      if (isAutoResolved(record.autoMergeStatus)) {
+        await this.safePutConflict(record);
+        followUp = true;
+        continue;
+      }
       // A conflict we have already examined in this session is not re-attempted on every cycle.
       if (this.attempted.has(record.conflictId)) {
         // Still refresh the visible record so the UI can show it, but do not re-run the merge.
@@ -245,29 +255,67 @@ export class ConflictCoordinator {
     const baseText = { text: snapshot.content, shape: snapshot.encoding };
     if (!local || !remote) return { ...base, autoMergeStatus: "decode-failed", reason: "one side is not valid UTF-8 text", snapshot: { baseAvailable: true, base: snapshot.content } };
 
-    const merged = threeWayMerge(baseText, local, remote);
-    if (merged.status === "unavailable") return { ...base, autoMergeStatus: "manual-required", reason: "the merge could not be performed", snapshot: { baseAvailable: true, base: snapshot.content, local: local.text, remote: remote.text } };
-    if (merged.status === "conflict") {
-      return { ...base, autoMergeStatus: "manual-required", reason: `${merged.hunks.length} overlapping region(s)`, snapshot: { baseAvailable: true, base: snapshot.content, local: local.text, remote: remote.text, draft: merged.draft } };
+    // One decision, three levels. The policy settles what it can prove — a non-colliding merge, or a
+    // short handoff of small additions from a recorded ancestor — and hands everything else to the
+    // user. It never guesses at meaning, and every threshold it applies lives in the policy module.
+    const decision = classifyDivergence({
+      base: snapshot.content,
+      local: local.text,
+      remote: remote.text,
+      // All three stamps are already here: the local file's mtime, the object's own last-modified, and
+      // when this device last committed the ancestor both branches grew from.
+      localChangedAt: observedLocal.mtime,
+      remoteChangedAt: observedRemote.lastModified,
+      baseSyncedAt: previous.syncedAt,
+    });
+    const evidence = decision.stats && decision.class !== "clean"
+      ? {
+          reason: decision.reason,
+          ...(decision.branchSeparationMs === undefined ? {} : { branchSeparationMs: decision.branchSeparationMs }),
+          ...(decision.branchAgeMs === undefined ? {} : { branchAgeMs: decision.branchAgeMs }),
+          localDeltaBytes: decision.deltas?.local ?? 0,
+          remoteDeltaBytes: decision.deltas?.remote ?? 0,
+          hunkCount: decision.stats.hunkCount,
+          ...(decision.order === undefined ? {} : { order: decision.order }),
+        }
+      : undefined;
+
+    if (decision.class === "manual" || decision.mergedText === undefined) {
+      const draft = threeWayMerge(baseText, local, remote);
+      // The policy's own explanation, except in the impossible case of a settled class with no content:
+      // that is undecided, and must not be described by a reason that says otherwise.
+      const reason = decision.class === "manual" ? decision.reason : "a settled merge produced no content to apply";
+      return { ...base, autoMergeStatus: "manual-required", reason, snapshot: { baseAvailable: true, base: snapshot.content, local: local.text, remote: remote.text, ...(draft.status === "conflict" ? { draft: draft.draft } : {}) } };
     }
 
-    // A clean merge becomes a `merged` intent — a proposal, not an action. The planner applies it on
-    // the next cycle, so this cycle's plan is never silently rewritten underneath itself.
-    const sha256 = await sha256Hex(new TextEncoder().encode(merged.text));
+    // A settled divergence becomes a `merged` intent — a proposal, not an action. The planner applies it
+    // on the next cycle, so this cycle's plan is never silently rewritten underneath itself.
+    const sha256 = await sha256Hex(new TextEncoder().encode(decision.mergedText));
     const intent: ResolutionIntent = {
       protocolVersion: CONFLICT_PROTOCOL_VERSION,
       conflictId,
       channel: this.dependencies.channel,
       path: key,
       type: "merged",
+      origin: "auto",
       expectedLocalVersion: observedLocal,
       expectedRemoteETag: observedRemote.etag,
       createdAt: this.now(),
-      merged: { content: merged.text, sha256, encoding: merged.shape },
+      merged: { content: decision.mergedText, sha256, encoding: preferredShape(local.shape, remote.shape, baseText.shape) },
     };
     try { await this.dependencies.intents.putIntent(intent); } catch { return { ...base, autoMergeStatus: "manual-required", reason: "the merge succeeded but could not be recorded" }; }
-    this.dependencies.debug?.(`conflict auto-merge clean path-hash=${shortConflictId(conflictId)}`);
-    return { ...base, autoMergeStatus: "clean", snapshot: { baseAvailable: true, base: snapshot.content, local: local.text, remote: remote.text, draft: merged.text } };
+    if (decision.class === "handoff") {
+      this.dependencies.debug?.(`auto merge strategy=handoff path-digest=${pathDigest(key)} branchSeparationMs=${Math.round(decision.branchSeparationMs ?? -1)} deltaBytes=${decision.stats!.insertedBytes} hunks=${decision.stats!.hunkCount} order=${decision.order}`);
+    } else {
+      this.dependencies.debug?.(`auto merge strategy=clean path-digest=${pathDigest(key)} reason=${decision.reason}`);
+    }
+    return {
+      ...base,
+      autoMergeStatus: decision.class,
+      reason: decision.reason,
+      ...(evidence === undefined ? {} : { handoff: evidence }),
+      snapshot: { baseAvailable: true, base: snapshot.content, local: local.text, remote: remote.text, draft: decision.mergedText },
+    };
   }
 
   private async readLocal(key: string): Promise<Uint8Array | undefined> {

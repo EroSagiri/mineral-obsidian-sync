@@ -6,6 +6,7 @@ import type { R2Client } from "../remote/r2-client";
 import { TOMBSTONE_PROTOCOL, type RemoteTombstone } from "../remote/tombstones";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, RemoteVersion, SyncOperation } from "./types";
+import { pathDigest } from "./path";
 import { sha256 } from "./fingerprint";
 
 /**
@@ -94,23 +95,6 @@ async function localStillMatches(vault: Vault, key: string, expected: LocalEntry
   return same(await vault.adapter.stat(expected.key), expected);
 }
 function message(error: unknown): string { return error instanceof Error ? error.message.slice(0, 180) : "unknown error"; }
-
-/**
- * A short, non-reversible digest of a path.
- *
- * Debug telemetry in this plugin deliberately never carries a key, and this is how the two constraints
- * — "say which path this was about" and "never log a path" — are reconciled: the digest is stable for
- * correlation within a session and reveals nothing on its own. FNV-1a keeps this synchronous, so a
- * diagnostic can never add an await to a transfer.
- */
-export function pathDigest(key: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < key.length; index++) {
-    hash ^= key.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
-}
 
 const shortEtag = (etag: string | undefined): string => etag ? `${etag.slice(0, 8)}…` : "none";
 

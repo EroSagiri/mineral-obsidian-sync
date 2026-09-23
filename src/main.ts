@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
+import { MarkdownView, Menu, Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
 import { scanLocal, scanLocalAdapterMetadata } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { flushAction, isOwnWrite, writeChangedFile, type FileStamp } from "./local/android-editor-save";
@@ -11,7 +11,8 @@ import { buildBootstrapResult } from "./bootstrap/bootstrap";
 import { DryRunModal } from "./ui/dry-run-modal";
 import { createVaultPathFilter, ignorePolicyFingerprint } from "./sync/ignore";
 import { registerDevelopmentSelfTests } from "./dev/self-test-command";
-import { SafeExecutor, pathDigest, type VaultFileRemover } from "./sync/executor";
+import { SafeExecutor, type VaultFileRemover } from "./sync/executor";
+import { pathDigest } from "./sync/path";
 import { buildSyncPlan } from "./sync/planner";
 import { localChanged } from "./sync/fingerprint";
 import { SyncScheduler } from "./scheduler/scheduler";
@@ -28,8 +29,15 @@ import { canonicalKey } from "./sync/path";
 import { IndexedDbConflictStores } from "./conflict/stores";
 import { createMergeBaseRecorder, recordMergeBaseBatch, type MergeBaseInput } from "./conflict/merge-base";
 import { ConflictCoordinator } from "./conflict/coordinator";
+import { isAutoResolved, type ConflictRecord, type HandoffEvidence, type ResolutionIntent } from "./conflict/types";
 import { ConflictResolverModal } from "./ui/conflict-resolver-modal";
 import { CONFLICT_RESOLVER_CSS } from "./ui/conflict-styles";
+import { ensureParentFolders } from "./local/ensure-folders";
+import { mergeHistoryEntry, manualHistoryEntry, restoreHistoryEntry, snapshotOf } from "./history/entry";
+import { IndexedDbSyncHistoryStore } from "./history/store";
+import type { SyncHistoryMetadata, SyncHistoryStore } from "./history/types";
+import { SyncHistoryModal } from "./ui/sync-history-modal";
+import { SYNC_HISTORY_CSS } from "./ui/history-styles";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
@@ -79,8 +87,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly androidEditorSavesInFlight = new Set<string>();
   /** The version this plugin's own editor saves produced, so their Vault event is not double-reported. */
   private readonly androidEditorWriteStamps = new Map<string, FileStamp>();
-  /** Conflict ids already announced, so a Notice is shown once per conflict rather than per cycle. */
-  private readonly announcedConflicts = new Set<string>();
+  /**
+   * Local, best-effort record of what sync did to each file.
+   *
+   * Never read on the sync path — the plan is unaffected by whether history exists — so it is the one
+   * store this plugin can lose without changing behaviour. It is what makes automatic merges reviewable
+   * after the fact, which is the trade the automation depends on.
+   */
+  private readonly history: SyncHistoryStore = new IndexedDbSyncHistoryStore();
   private lastConflictCount = 0;
   /** The derived channel for the current settings, refreshed once per cycle. */
   private resolvedChannel?: string;
@@ -104,6 +118,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.addCommand({ id: "r2-sync-now", name: "Mineral Sync: Sync Now", callback: () => this.scheduler?.requestReconcile("manual") });
     this.addCommand({ id: "r2-sync-gateway-status", name: "Mineral Sync: Gateway Status", callback: () => this.reportGatewayStatus() });
     this.addCommand({ id: "r2-sync-resolve-conflicts", name: "Mineral Sync: Resolve Conflicts", callback: () => this.openConflictResolver() });
+    this.addCommand({ id: "r2-sync-history", name: "Mineral Sync: Open Sync History", callback: () => this.openSyncHistory() });
     // Development-only diagnostics: never registered, and not even bundled, in production.
     if (__DEV__) {
       registerDevelopmentSelfTests({
@@ -114,15 +129,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
         setStatus: (text) => this.showBusyStatus(text),
       });
     }
-    // Theme-variable CSS for the status glyph and the resolver, injected rather than shipped as a
-    // second file, so the deployment surface stays exactly `main.js` + `manifest.json`.
-    const statusStyle = document.head.createEl("style", { text: `${SYNC_STATUS_CSS}\n${CONFLICT_RESOLVER_CSS}` });
+    // Theme-variable CSS for the status glyph, the resolver and the history viewer, injected rather than
+    // shipped as a second file, so the deployment surface stays exactly `main.js` + `manifest.json`.
+    const statusStyle = document.head.createEl("style", { text: `${SYNC_STATUS_CSS}\n${CONFLICT_RESOLVER_CSS}\n${SYNC_HISTORY_CSS}` });
     this.register(() => statusStyle.remove());
     this.statusBar = this.addStatusBarItem();
     // Attached once, to the item itself, because its inner content is rebuilt on every state change.
     // A conflict click goes straight to the resolver: never a menu the user has to click through.
     this.registerDomEvent(this.statusBar, "click", () => this.onStatusClick());
-    this.registerDomEvent(this.statusBar, "contextmenu", (event) => { event.preventDefault(); this.reportStatusDetails(); });
+    this.registerDomEvent(this.statusBar, "contextmenu", (event) => { event.preventDefault(); this.openStatusMenu(event); });
     this.renderStatus(presentSyncStatus({ state: "idle", counts: NO_RESULTS, conflictCount: 0 }));
     this.gateway = new GatewayClient(
       () => gatewayConnectionConfig(this.settings),
@@ -157,7 +172,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
       onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
       debug: (message) => this.debug(message),
       onConflicts: (conflicts) => this.handleConflicts(conflicts),
-      onResolutionApplied: (conflictId, path) => this.clearResolution(conflictId, path),      remoteChange: {
+      onResolutionApplied: (conflictId, path) => this.clearResolution(conflictId, path),
+      remoteChange: {
         hasPending: () => this.gateway?.hasPending() ?? false,
         readGeneration: () => this.gateway?.readGeneration() ?? Promise.resolve({ ok: false as const, kind: "misconfigured" }),
         confirmReconciled: async (generation) => { await this.gateway?.confirmReconciled(generation); },
@@ -310,6 +326,35 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private onStatusClick(): void {
     if ((this.statusPresentation?.action ?? "sync-now") === "resolve-conflicts") { void this.openConflictResolver(); return; }
     this.scheduler?.requestReconcile("manual");
+  }
+
+  /**
+   * Right-click is the secondary surface. It is kept to two entries on purpose: history is the one thing
+   * a user needs *about* sync rather than *to* it, and everything else already has a command.
+   */
+  private openStatusMenu(event: MouseEvent): void {
+    const menu = new Menu();
+    menu.addItem((item) => item.setTitle("Sync history").setIcon("history").onClick(() => void this.openSyncHistory()));
+    menu.addItem((item) => item.setTitle("Status details").setIcon("info").onClick(() => this.reportStatusDetails()));
+    menu.showAtMouseEvent(event);
+  }
+
+  /**
+   * Opens the history viewer for the current channel.
+   *
+   * History is keyed by channel, so it follows the namespace in use rather than the vault as a whole:
+   * pointing the plugin at a different bucket does not show, or offer to restore, versions that came
+   * from another one. The restore itself is delegated to the plugin, which writes locally and lets the
+   * planner decide the rest.
+   */
+  private async openSyncHistory(): Promise<void> {
+    const channel = this.currentChannel() ?? await this.resolveChannel();
+    if (!channel) { new Notice("Mineral Sync: sync history needs a configured endpoint and bucket."); return; }
+    new SyncHistoryModal(this.app, {
+      list: () => this.history.list(channel),
+      restore: (input) => this.restoreFromHistory(input),
+      debug: (message) => this.debug(message),
+    }).open();
   }
 
   /**
@@ -695,7 +740,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
     try { await this.refreshConflictsForResolver(); }
     catch { this.debug("conflict resolver refresh failed"); }
     new ConflictResolverModal(this.app, {
-      list: () => coordinator.list(),
+      // Only decisions, never evidence: an automatically settled divergence stays recorded but is not
+      // offered here, because asking the user to review a merge the engine already made is the
+      // interruption this behaviour exists to remove.
+      list: () => this.pendingConflicts(),
       propose: (intent) => coordinator.propose(intent),
       debug: (message) => this.debug(message),
     }).open();
@@ -744,18 +792,114 @@ export default class R2PersonalSyncPlugin extends Plugin {
     if (!channel) return;
     this.coordinator?.setChannel(channel);
     this.debug(`resolution applied path-hash=${conflictId.slice(0, 8)}`);
+    // Written before the record and its intent are retired, because together they are the only
+    // evidence of what the two sides were and what was decided.
+    await this.recordResolutionHistory(channel, conflictId, path);
     await this.coordinator?.clear(conflictId, path);
     await this.refreshConflictStatus();
   }
 
-  /** Announces each newly seen conflict exactly once and republishes the status bar. */
-  private async refreshConflictStatus(): Promise<void> {
+  /**
+   * Records what a resolution actually did, including the versions it replaced.
+   *
+   * Only reached from `onResolutionApplied`, so an entry exists only for something that landed: a
+   * merge that was merely proposed, or a resolution that turned out stale, leaves no history and is
+   * not claimed. Every snapshot here is what makes the automation recoverable.
+   */
+  private async recordResolutionHistory(channel: string, conflictId: string, path: string): Promise<void> {
+    try {
+      const record = (await this.coordinator?.list() ?? []).find((candidate) => candidate.conflictId === conflictId);
+      if (!record) return;
+      const intent = await this.coordinator?.intentFor(path);
+      const resolutionType = intent?.conflictId === conflictId ? intent.type : "unknown";
+      const result = this.resolutionResultText(record, intent);
+      if (result === undefined) return;
+
+      const base = record.snapshot.baseAvailable && record.snapshot.base !== undefined ? await snapshotOf(record.snapshot.base) : undefined;
+      const localBefore = record.snapshot.local === undefined ? undefined : await snapshotOf(record.snapshot.local);
+      const remoteBefore = record.snapshot.remote === undefined ? undefined : await snapshotOf(record.snapshot.remote);
+      const shared = { channel, path, timestamp: Date.now(), ...(base ? { base } : {}), ...(localBefore ? { localBefore } : {}), ...(remoteBefore ? { remoteBefore } : {}), result };
+      const entry = isAutoResolved(record.autoMergeStatus)
+        ? await mergeHistoryEntry({
+            ...shared,
+            type: record.autoMergeStatus === "handoff" ? "handoff-auto-merge" : "clean-auto-merge",
+            metadata: { mergeReason: record.reason, ...handoffHistoryMetadata(record.handoff) },
+          })
+        : await manualHistoryEntry({ ...shared, conflictId, resolutionType });
+      await this.history.record(entry);
+      this.debug(`history recorded type=${entry.type} path-digest=${pathDigest(path)}`);
+    } catch { this.debug("history write failed"); }
+  }
+
+  /**
+   * The text a resolution left behind. A deletion has no result text, and records an empty one rather
+   * than inventing content for it; its before-snapshots are what make it recoverable.
+   */
+  private resolutionResultText(record: ConflictRecord, intent: ResolutionIntent | undefined): string | undefined {
+    if (intent?.merged) return intent.merged.content;
+    switch (intent?.type) {
+      case "keep-local": return record.snapshot.local ?? "";
+      case "keep-remote": return record.snapshot.remote ?? "";
+      case "accept-remote-delete":
+      case "accept-local-delete": return "";
+      default: return record.snapshot.draft ?? record.snapshot.local;
+    }
+  }
+
+  /**
+   * The conflicts that actually need the user. Anything the divergence policy settled is recorded as
+   * evidence but is not work, so it is neither counted nor shown: the badge is only for real decisions.
+   */
+  private async pendingConflicts(): Promise<ConflictRecord[]> {
     const records = (await this.coordinator?.list()) ?? [];
-    this.lastConflictCount = records.length;
-    const fresh = records.filter((record) => !this.announcedConflicts.has(record.conflictId));
-    for (const record of fresh) this.announcedConflicts.add(record.conflictId);
-    if (fresh.length) new Notice(`Mineral Sync: ${records.length} conflict${records.length === 1 ? "" : "s"} need attention. Run "Mineral Sync: Resolve Conflicts".`);
+    return records.filter((record) => !isAutoResolved(record.autoMergeStatus));
+  }
+
+  /**
+   * Republishes the status bar. Deliberately silent: a conflict is reported by the badge alone, and the
+   * user opens the resolver when they choose to. Proactive notices were the thing this behaviour was
+   * asked to stop, since a note that keeps diverging would otherwise interrupt on every cycle.
+   */
+  private async refreshConflictStatus(): Promise<void> {
+    this.lastConflictCount = (await this.pendingConflicts()).length;
     this.scheduler?.refreshStatus();
+  }
+
+  /**
+   * Makes a historical snapshot current again.
+   *
+   * This is the one write the history UI performs, and it is deliberately the *least* powerful one: the
+   * snapshot becomes this device's working version, and the ordinary exact-path pipeline then decides
+   * what happens to it. Nothing here touches a baseline, an ETag or a generation, so a remote that has
+   * moved on since produces the normal merge or conflict rather than an overwrite — a restore can never
+   * be a way around the safety checks.
+   */
+  private async restoreFromHistory(input: { path: string; content: string; sourceHistoryId: string }): Promise<void> {
+    const channel = this.currentChannel();
+    if (!channel) throw new Error("no channel is configured for this vault");
+    this.debug(`history restore requested path-digest=${pathDigest(input.path)} sourceHistoryId=${input.sourceHistoryId}`);
+    const file = this.app.vault.getFileByPath(input.path);
+    const previousText = file ? await this.app.vault.read(file) : undefined;
+    if (file) await this.app.vault.modify(file, input.content);
+    else {
+      // A restore into a file that no longer exists has to recreate it, so its folders may be gone too.
+      // Checked rather than ignored: a silent failure here would look like a restore that landed.
+      const prepared = await ensureParentFolders(this.app.vault, input.path);
+      if (!prepared.ok) throw new Error(`restore target folder unavailable (${prepared.reason})`);
+      await this.app.vault.create(input.path, input.content);
+    }
+    try {
+      // Recorded after the write, so a failed write leaves no entry claiming it happened.
+      await this.history.record(await restoreHistoryEntry({
+        channel, path: input.path, timestamp: Date.now(),
+        sourceHistoryId: input.sourceHistoryId,
+        previousCurrent: await snapshotOf(previousText ?? ""),
+        result: input.content,
+      }));
+      this.debug(`history recorded type=restore path-digest=${pathDigest(input.path)}`);
+    } catch { this.debug("history write failed"); }
+    this.scheduler?.markLocalPaths([input.path], (key) => createVaultPathFilter(this.settings).ignores(key));
+    this.scheduler?.requestReconcile("manual");
   }
   private safeConnectionDiagnostic(error: unknown): string {
     if (!(error instanceof Error) || !error.message) return "unknown error";
@@ -807,4 +951,23 @@ export default class R2PersonalSyncPlugin extends Plugin {
       new Notice("Sync inspection failed. Check settings, network, and R2 access.");
     } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; this.scheduler?.refreshStatus(); }
   }
+}
+
+/**
+ * The handoff policy facts, in the shape history stores them.
+ *
+ * Everything is copied from what the policy actually measured, so an entry never claims a separation
+ * or a size the decision did not have. `reason` is the exception: on the record it explains one
+ * handoff, while the entry's `mergeReason` explains the event, so the caller supplies that field.
+ */
+function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistoryMetadata {
+  if (!facts) return {};
+  return {
+    ...(facts.branchSeparationMs === undefined ? {} : { branchSeparationMs: facts.branchSeparationMs }),
+    ...(facts.branchAgeMs === undefined ? {} : { branchAgeMs: facts.branchAgeMs }),
+    ...(facts.localDeltaBytes === undefined ? {} : { localDeltaBytes: facts.localDeltaBytes }),
+    ...(facts.remoteDeltaBytes === undefined ? {} : { remoteDeltaBytes: facts.remoteDeltaBytes }),
+    ...(facts.hunkCount === undefined ? {} : { hunkCount: facts.hunkCount }),
+    ...(facts.order === undefined ? {} : { order: facts.order }),
+  };
 }

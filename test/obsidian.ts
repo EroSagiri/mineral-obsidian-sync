@@ -177,3 +177,46 @@ export class Setting {
     return this;
   }
 }
+
+/**
+ * Minimal `Menu` stand-in.
+ *
+ * It records the title and handler of every item a caller adds, in creation order, which is all a test
+ * needs to press a context-menu entry. As with `Setting.addButton`, the item is recorded when its
+ * `onClick` is registered rather than on `showAtPosition`, because the item's identity and handler are
+ * the caller's own logic; the popup itself is Obsidian's.
+ */
+export class Menu {
+  /**
+   * Every menu built since the module loaded, in creation order.
+   *
+   * The menu itself is the only object a caller hands to Obsidian, so a test that wants to press an
+   * entry has no other reference to reach for. Mirrors `Notice.shown`.
+   */
+  static readonly shown: Menu[] = [];
+  readonly items: Array<{ title: string; icon: string; callback: () => void }> = [];
+  constructor() { Menu.shown.push(this); }
+  addItem(callback: (item: MenuStubItem) => unknown): this {
+    let title = "";
+    let icon = "";
+    const item: MenuStubItem = {
+      setTitle: (text: string) => { title = text; return item; },
+      setIcon: (name: string) => { icon = name; return item; },
+      onClick: (handler: () => void) => {
+        this.items.push({ title, icon, callback: handler });
+        return item;
+      },
+    };
+    callback(item);
+    return this;
+  }
+  showAtPosition(): void {}
+  showAtMouseEvent(): void {}
+}
+
+/** The item shape `Menu.addItem` passes to its callback, as far as this stub supports it. */
+export interface MenuStubItem {
+  setTitle(title: string): MenuStubItem;
+  setIcon(name: string): MenuStubItem;
+  onClick(handler: () => void): MenuStubItem;
+}

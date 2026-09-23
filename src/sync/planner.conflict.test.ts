@@ -31,6 +31,28 @@ describe("planner output without resolutions is unchanged", () => {
   });
 });
 
+/**
+ * A restore is only ever a local edit.
+ *
+ * The history viewer writes a snapshot into the Vault and nothing else, so these two cases are the whole
+ * safety story for recovering an earlier version: the restored text is compared against the baseline like
+ * any hand-typed change, which means an unchanged remote is uploaded over and a remote that moved on is a
+ * conflict — never an unconditional overwrite of the newer remote.
+ */
+describe("a restored version goes through the normal plan", () => {
+  it("uploads the restored text when the remote has not moved since the baseline", () => {
+    // A restore rewrites the file, so the local version differs from the baseline while the ETag still
+    // matches: a one-sided local change, and therefore an ordinary upload.
+    const operation = planWith(undefined, { local: local("note.md", 8, 300), remote: remote("note.md", 10, "etag-base") });
+    expect(operation).toMatchObject({ type: "upload", key: "note.md" });
+  });
+
+  it("conflicts instead of overwriting when the remote moved on", () => {
+    const operation = planWith(undefined, { local: local("note.md", 8, 300) });
+    expect(operation).toMatchObject({ type: "conflict", conflict: "both-modified" });
+  });
+});
+
 describe("resolution operations", () => {
   it("emits an explicit resolve-keep-local carrying the observed versions", () => {
     const operation = planWith({ intent: { conflictId: "cid-1", type: "keep-local" } });

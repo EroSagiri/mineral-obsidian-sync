@@ -36,7 +36,25 @@ export interface MergeBaseRecord {
   updatedAt: number;
 }
 
-export type AutoMergeStatus = "not-attempted" | "clean" | "manual-required" | "base-unavailable" | "unsupported" | "too-large" | "decode-failed";
+export type AutoMergeStatus = "not-attempted" | "clean" | "handoff" | "manual-required" | "base-unavailable" | "unsupported" | "too-large" | "decode-failed";
+
+/** Statuses that the coordinator settled on its own, so no user decision is outstanding. */
+export const AUTO_RESOLVED_STATUSES: readonly AutoMergeStatus[] = ["clean", "handoff"];
+export function isAutoResolved(status: AutoMergeStatus): boolean { return status === "clean" || status === "handoff"; }
+
+/**
+ * The evidence behind a handoff decision, kept on the record so the history entry can explain itself
+ * and so the thresholds can be tuned later against real cases rather than guesses.
+ */
+export interface HandoffEvidence {
+  reason: string;
+  branchSeparationMs?: number;
+  branchAgeMs?: number;
+  localDeltaBytes: number;
+  remoteDeltaBytes: number;
+  hunkCount: number;
+  order?: "local-first" | "remote-first" | "deterministic";
+}
 
 export interface ConflictRecord {
   protocolVersion: typeof CONFLICT_PROTOCOL_VERSION;
@@ -51,6 +69,8 @@ export interface ConflictRecord {
   detectedAt: number;
   autoMergeStatus: AutoMergeStatus;
   reason?: string;
+  /** Present when the divergence policy decided this itself, for history and later tuning. */
+  handoff?: HandoffEvidence;
   /** Bounded snapshots for the resolver UI; refreshed on each detection, never accumulated. */
   snapshot: { local?: string; remote?: string; base?: string; draft?: string; baseAvailable: boolean };
 }
@@ -71,6 +91,8 @@ export interface ResolutionIntent {
   expectedRemoteETag?: string;
   expectedRemoteDeletion?: RemoteDeletionIdentity;
   createdAt: number;
+  /** Who authored this proposal: the divergence policy, or a person. It decides the history event. */
+  origin?: "auto" | "manual";
   /** Present for `merged`: the exact bytes the user or the auto-merge wants to become the truth. */
   merged?: { content: string; sha256: string; encoding: { bom: boolean; eol: "lf" | "crlf" | "mixed"; trailingNewline: boolean } };
 }
