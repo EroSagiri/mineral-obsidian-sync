@@ -373,6 +373,163 @@ describe("hot editor binding", () => {
     expect(updates).toHaveLength(0);
     expect(freezes).toHaveLength(1);
   });
+
+  it("drops further remote Yjs updates after freeze, so the diagnostic scene stays put", () => {
+    /**
+     * The most dangerous post-freeze failure: the binding freezes when the editor / Y.Doc
+     * disagreement is caught at revision N, but the live socket keeps delivering updates from
+     * the room. If those updates still advance the Y.Doc, the diagnostic scene (the buffer
+     * and the document at the moment of divergence) is gone — the resolver no longer has the
+     * frozen state to compare against, and the conflict UI's "remote truth" is the moving
+     * target that caused the loop in the first place.
+     *
+     * `applyEncoded` is the single chokepoint from any incoming Yjs frame to the document:
+     * it must refuse to integrate once frozen.
+     */
+    const editor = new FakeEditor("twwwww");
+    const freezes: string[] = [];
+    const binding = new HotEditorBinding({
+      editor: editor as unknown as Editor,
+      onLocalUpdate: () => {},
+      onFreeze: (reason) => { freezes.push(reason); },
+      nextOperationId: () => "op-1",
+    });
+    binding.attach();
+
+    // Force a freeze: the welcome applies "twwwww" → editor has it; a remote write that
+    // succeeds is "mww", but we sabotage the editor so the post-condition fires.
+    const originalTransaction = editor.transaction.bind(editor);
+    editor.transaction = ((tx: EditorTransaction, origin?: string) => {
+      originalTransaction(tx, origin);
+      // Pretend the write landed, but undo it — the post-condition then sees a divergence.
+      editor.value = "twwwww";
+    }) as typeof editor.transaction;
+
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "twwwww");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+
+    const before = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "m");
+    room.getText("markdown").delete(1, 4);
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before)));
+    expect(freezes).toHaveLength(1);
+    // Capture the post-freeze Y.Doc. This is the diagnostic scene the resolver must see.
+    const frozenDoc = binding.text();
+    const frozenEditor = editor.value;
+    expect(frozenDoc).not.toBe(frozenEditor); // sanity: divergence is real
+
+    // More remote updates keep arriving. None of them must touch the Y.Doc.
+    const before2 = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "X");
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before2)));
+    expect(binding.text()).toBe(frozenDoc);
+
+    const before3 = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "Y");
+    room.getText("markdown").delete(1, 1);
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before3)));
+    expect(binding.text()).toBe(frozenDoc);
+
+    // `applyState` (the welcome path) is the same chokepoint — it must also refuse.
+    const before4 = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "Z");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room, before4)));
+    expect(binding.text()).toBe(frozenDoc);
+
+    // No new freeze signal: the bridge was already frozen.
+    expect(freezes).toHaveLength(1);
+  });
+
+  it("freeze is sticky: a later successful reconcile does not unfreeze", async () => {
+    /**
+     * Freeze must be a one-way door. The text mismatch at freeze time is the bridge's
+     * terminal state; a subsequent successful reconcile that would otherwise bring the
+     * editor and Y.Doc together is a *new* session on a fresh baseline, not the same
+     * session healing itself. Otherwise the next divergent remote write re-enters the
+     * loop without ever surfacing as a conflict.
+     */
+    const editor = new FakeEditor("abc");
+    const freezes: string[] = [];
+    const binding = new HotEditorBinding({
+      editor: editor as unknown as Editor,
+      onLocalUpdate: () => {},
+      onFreeze: (reason) => { freezes.push(reason); },
+      nextOperationId: () => "op-1",
+    });
+    binding.attach();
+
+    // First write succeeds.
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "abc");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+    expect(freezes).toEqual([]);
+
+    // Second write would land cleanly if the bridge were not frozen — but we force a freeze
+    // by overriding transaction() so the post-condition fails.
+    const originalTransaction = editor.transaction.bind(editor);
+    editor.transaction = ((tx: EditorTransaction, origin?: string) => {
+      originalTransaction(tx, origin);
+      editor.value = "abc"; // no-op the write
+    }) as typeof editor.transaction;
+    const before = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "x");
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before)));
+    expect(binding.isFrozen()).toBe(true);
+    expect(freezes).toHaveLength(1);
+
+    // Restore the editor to honour its transactions again. The next write would succeed —
+    // but the bridge must stay frozen anyway.
+    editor.transaction = originalTransaction;
+    const before2 = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "y");
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before2)));
+
+    expect(binding.isFrozen()).toBe(true);
+    expect(freezes).toHaveLength(1);
+    // The Y.Doc must not have been advanced — otherwise the loop is back.
+    expect(binding.text()).not.toBe("yabc");
+  });
+
+  it("BrokenEditor: a no-op transaction is caught by the post-condition", () => {
+    /**
+     * The "fake editor that silently ignores transactions" failure mode. Before the
+     * post-condition, the bridge would have believed the editor had been brought up to date
+     * and would have started generating operations off the buffer that still showed the old
+     * text — exactly the divergence that fed the 5400-revision loop. The post-condition
+     * catches it and freezes.
+     */
+    class BrokenEditor extends FakeEditor {
+      override transaction(_tx: EditorTransaction, _origin?: string): void {
+        // Pretends to accept changes. Does nothing. The bridge must notice.
+      }
+    }
+    const editor = new BrokenEditor("abc");
+    const freezes: string[] = [];
+    const binding = new HotEditorBinding({
+      editor: editor as unknown as Editor,
+      onLocalUpdate: () => {},
+      onFreeze: (reason) => { freezes.push(reason); },
+      nextOperationId: () => "op-1",
+    });
+    binding.attach();
+
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "abc");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+
+    const before = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "x");
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before)));
+
+    expect(freezes).toHaveLength(1);
+    expect(binding.isFrozen()).toBe(true);
+    // The freeze reason distinguishes the *trigger* ("remote" or "state" — both go through
+    // applyEncoded) so the diagnostic in the resolver's notice tells the user which path was
+    // writing when the divergence was caught. The full reason also carries the truncated editor
+    // and document buffers.
+    expect(binding.freezeDetail()).toMatch(/^hot freeze after (update|state):/);
+  });
 });
 
 /**
@@ -432,7 +589,15 @@ describe("hot editor binding: random convergence", () => {
   }
 
   function applyOp(value: string, op: Op): string {
-    return value.slice(0, op.index) + op.insert + value.slice(op.index + op.delete);
+    // Apply through a Y.Text so the op is surrogate-pair-safe. Naive string slicing on a UTF-16
+    // string can split a surrogate pair and corrupt the document; Y.Text addresses characters as
+    // logical positions, so delete+insert around a surrogate pair leaves it intact.
+    const doc = new Y.Doc();
+    const text = doc.getText("markdown");
+    text.insert(0, value);
+    text.delete(op.index, op.delete);
+    text.insert(op.index, op.insert);
+    return text.toString();
   }
 
   /**
@@ -507,4 +672,189 @@ describe("hot editor binding: random convergence", () => {
       }
     }
   });
+
+  it("converges when two Y.Docs edit independently and exchange updates with overlapping history", async () => {
+    /**
+     * The harder case the production hit exposed: each side is its own real Y.Doc with its own
+     * client-id clock and delete-set. The deltas they exchange are not "one keystroke at a
+     * time" but the accumulated history of an independent editing session. The bridge must
+     * absorb any such delta without ever needing to reason about how it was produced.
+     */
+    type Side = {
+      editor: FakeEditor;
+      binding: HotEditorBinding;
+      doc: Y.Doc;
+      updates: string[];
+    };
+
+    function buildSide(updates: string[], name: string): Side {
+      const editor = new FakeEditor("");
+      const doc = new Y.Doc();
+      const binding = new HotEditorBinding({
+        editor: editor as unknown as Editor,
+        onLocalUpdate: (update) => { updates.push(update); },
+        // The binding owns its own Y.Doc for the bridge, but the test's "side" has a parallel
+        // peer Y.Doc — that one records the "what the room actually holds" version of the
+        // text. Both must end up the same at the end of every trial.
+        nextOperationId: () => `${name}-op-${updates.length + 1}`,
+      });
+      binding.attach();
+      // Seed both: the bridge's Y.Doc and the peer Y.Doc start empty.
+      return { editor, binding, doc, updates };
+    }
+
+    function applySideUpdate(side: Side, update: string): void {
+      const bytes = decodeHotPayload(update);
+      if (!bytes) throw new Error("update was not decodable");
+      Y.applyUpdate(side.doc, bytes);
+    }
+
+    /**
+     * Push a peer's update into both the peer's parallel Y.Doc and the bridge.
+     *
+     * In a real room, the bridge and the room's authoritative Y.Doc are kept in sync by the same
+     * wire — applying the same delta to both makes the bridge's Y.Text converge with the peer
+     * Y.Text. Calling `Y.applyUpdate(bridge, encodeStateAsUpdate(peer))` instead (a "full state"
+     * dump) does *not* replace the bridge: Yjs merges the state update, so the bridge ends up
+     * holding its own content *plus* the peer's. The bridge must instead absorb each peer's
+     * delta in turn, the same way a real room would deliver it.
+     */
+    function applyPeerUpdate(peer: Side, update: string): void {
+      applySideUpdate(peer, update);
+      peer.binding.applyRemote(update);
+    }
+
+    const trials = 6;
+    const localStepsPerSide = 40;
+    for (let trial = 0; trial < trials; trial++) {
+      const left = buildSide([], `L-${trial}`);
+      const right = buildSide([], `R-${trial}`);
+
+      // Seed both sides from the same welcome — that is how a real room hands its state to a
+      // joining device. Each side's bridge integrates the same update, so both bridges end up
+      // with the same Y.Text content (no concurrent inserts at position 0). Without the shared
+      // welcome, each side would do its own `editor = "hello\n"; handleEditorChange()`, and the
+      // two CRDT inserts would be ordered by client ID — a permanent divergence at the very
+      // head of the document, even before any random edit happens.
+      const seed = new Y.Doc();
+      seed.getText("markdown").insert(0, "hello\n");
+      const seedUpdate = encodeHotPayload(Y.encodeStateAsUpdate(seed));
+      // Every Y.Doc in the test (both bridges and both parallel peer Y.Docs) starts from the
+      // same state — that is the only way to keep the four texts in sync without an init-time
+      // CRDT divergence at position 0.
+      left.binding.applyState(seedUpdate);
+      right.binding.applyState(seedUpdate);
+      applySideUpdate(left, seedUpdate);
+      applySideUpdate(right, seedUpdate);
+
+      const rng = mulberry32((trial + 7) * 53 + 11);
+
+      // Each side independently edits its buffer; then we exchange accumulated updates.
+      for (let step = 0; step < localStepsPerSide; step++) {
+        const side = rng() < 0.5 ? left : right;
+        const peer = side === left ? right : left;
+        const docText = side.binding.text();
+        const op = richRandomEdit(rng, docText);
+        if (op === null) continue;
+
+        // Local edit on the side. This produces an update via onLocalUpdate.
+        const beforeCount = side.updates.length;
+        side.editor.value = applyOp(docText, op);
+        const newText = side.editor.value;
+        // Some replacements are no-ops in the buffer's own terms — "replace 'ab' with 'ab'"
+        // leaves the text unchanged. The bridge's content-based echo suppression is the right
+        // thing here: a real user selecting and re-typing the same text does not generate an
+        // operation, and the test must accept the same outcome.
+        if (newText === docText) continue;
+        await side.binding.handleEditorChange();
+        if (side.binding.isFrozen()) {
+          const sideName = side === left ? "left" : "right";
+          throw new Error(`side froze (trial=${trial}, step=${step}, side=${sideName}, op=${JSON.stringify(op)}, freezeDetail=${side.binding.freezeDetail()})`);
+        }
+        expect(side.updates.length, `side produced an update (trial ${trial}, step ${step})`).toBe(beforeCount + 1);
+
+        // The side's own edit must also reach the room's authoritative doc — that is what a
+        // real server does on every accepted operation, and is why the bridge's own updates
+        // are recorded against side.doc as well. Without this, side.doc would only ever see
+        // the peer's edits and would diverge from side.binding from the very first keystroke.
+        applySideUpdate(side, side.updates[side.updates.length - 1]);
+
+        // The peer's room-doc + bridge receive the side's update batched at the end of the
+        // trial — that mirrors how a real room buffers and flushes; the bridge must absorb
+        // any accumulated history in one go.
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      // Exchange everything in one batch: every update each side has not yet seen.
+      // The peer's parallel Y.Doc and the bridge both receive each update — that is what a real
+      // room does, and is the only way for the bridge's Y.Text to converge with the peer's Y.Text
+      // without leaving stale content behind.
+      for (const update of left.updates) applyPeerUpdate(right, update);
+      for (const update of right.updates) applyPeerUpdate(left, update);
+
+      const leftText = left.editor.value;
+      const rightText = right.editor.value;
+      const leftBridgeDoc = left.binding.text();
+      const rightBridgeDoc = right.binding.text();
+      const leftPeerDoc = left.doc.getText("markdown").toString();
+      const rightPeerDoc = right.doc.getText("markdown").toString();
+
+      expect(leftBridgeDoc, `left bridge doc (trial ${trial})`).toBe(leftPeerDoc);
+      expect(rightBridgeDoc, `right bridge doc (trial ${trial})`).toBe(rightPeerDoc);
+      expect(leftText, `left editor (trial ${trial})`).toBe(leftBridgeDoc);
+      expect(rightText, `right editor (trial ${trial})`).toBe(rightBridgeDoc);
+      expect(leftBridgeDoc, `left and right agree (trial ${trial})`).toBe(rightBridgeDoc);
+      expect(leftBinding_isFrozen(left), `left not frozen (trial ${trial})`).toBe(false);
+      expect(leftBinding_isFrozen(right), `right not frozen (trial ${trial})`).toBe(false);
+    }
+  });
 });
+
+/** Reach into the test's left/right bindings without polluting the production surface. */
+function leftBinding_isFrozen(side: { binding: { isFrozen: () => boolean } }): boolean {
+  return side.binding.isFrozen();
+}
+
+/**
+ * A richer edit palette than the basic `randomEdit`. Includes the "ugly but legal" shapes
+ * the production hit produced: large deletes, multi-line insertions, emoji, CJK, and the
+ * empty string after a round trip. Every shape is what a real Yjs update could deliver.
+ */
+function richRandomEdit(rng: () => number, original: string): { index: number; insert: string; delete: number } | null {
+  const r = rng();
+  if (r < 0.25) {
+    // Insert a single ASCII letter at a random position.
+    const index = Math.floor(rng() * (original.length + 1));
+    return { index, insert: String.fromCharCode(97 + Math.floor(rng() * 26)), delete: 0 };
+  } else if (r < 0.4) {
+    // Insert a multi-character chunk (CJK, emoji, or punctuation).
+    if (original.length > 200) return null;
+    const index = Math.floor(rng() * (original.length + 1));
+    const chunks = ["好", "🎉", "→ ", "（注）", "\n\n", "lorem ", "..."];
+    return { index, insert: chunks[Math.floor(rng() * chunks.length)], delete: 0 };
+  } else if (r < 0.6) {
+    // Delete a small range.
+    if (original.length < 2) return null;
+    const index = Math.floor(rng() * (original.length - 1));
+    return { index, insert: "", delete: 1 + Math.floor(rng() * 2) };
+  } else if (r < 0.75) {
+    // Large delete — collapse 5..40% of the buffer.
+    if (original.length < 10) return null;
+    const index = Math.floor(rng() * (original.length - 1));
+    const span = Math.max(1, Math.floor(original.length * (0.05 + rng() * 0.35)));
+    return { index, insert: "", delete: Math.min(span, original.length - index) };
+  } else if (r < 0.9) {
+    // Same-position replacement — the bug shape.
+    if (original.length === 0) return { index: 0, insert: "x", delete: 0 };
+    const index = Math.floor(rng() * original.length);
+    const char = String.fromCharCode(97 + Math.floor(rng() * 26));
+    const deleteCount = 1 + Math.floor(rng() * 3);
+    return { index, insert: char, delete: Math.min(deleteCount, original.length - index) };
+  } else {
+    // Replace 1..3 chars with a multi-char string.
+    if (original.length === 0) return { index: 0, insert: "xy", delete: 0 };
+    const index = Math.floor(rng() * original.length);
+    const deleteCount = 1 + Math.floor(rng() * 3);
+    return { index, insert: "ab", delete: Math.min(deleteCount, original.length - index) };
+  }
+}

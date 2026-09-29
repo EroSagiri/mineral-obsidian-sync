@@ -229,7 +229,11 @@ export class HotSyncCoordinator implements HotPathFence {
        * transaction. Continuing to translate further updates would extend the divergence forever, and
        * the next user keystroke would push the wrong content out to the room. The honest answer is a
        * conflict the user can act on: we mark the path conflicted, surface the freeze reason in the
-       * diagnostics, and refuse to generate further operations until the user resolves it.
+       * diagnostics, refuse to generate further operations until the user resolves it — and tear down
+       * the live socket so the room does not continue to apply Yjs updates that the bridge can no
+       * longer project. Recovery goes through `editor-document-divergence`, not the ordinary
+       * `keep-local` / `accept-remote` resolver, because the bridge's invariant has been broken, not
+       * the user's content.
        */
       onFreeze: (reason) => {
         this.conflicts.set(input.canonicalPath, "conflict");
@@ -238,6 +242,14 @@ export class HotSyncCoordinator implements HotPathFence {
         this.handoffPaths.add(input.canonicalPath);
         this.deps.debug?.(`hot freeze path-digest=${pathDigest(input.canonicalPath)} reason=${reason}`);
         this.deps.onConflict?.(input.canonicalPath, "editor-document-divergence");
+        // Tear down the live session: no more reconnects, no more incoming `operation` frames that
+        // would otherwise keep advancing the Y.Doc past the diagnostic scene the resolver needs.
+        const session = this.sessions.get(input.canonicalPath);
+        if (session) {
+          void session.freeze(`editor-document-divergence: ${reason}`).catch(error => {
+            this.deps.debug?.(`hot freeze persist failed: ${error instanceof Error ? error.message : "unknown"}`);
+          });
+        }
       },
       debug: this.deps.debug,
     });

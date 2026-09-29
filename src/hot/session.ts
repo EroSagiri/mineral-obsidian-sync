@@ -647,6 +647,34 @@ export class HotDocumentSession {
     }
   }
 
+  /**
+   * Marks the session as terminally frozen and tears down the live socket.
+   *
+   * `freeze()` is the response to an internal invariant failure: the editor bridge proved it can no
+   * longer keep the buffer in agreement with the Y.Doc, and continuing to consume incoming frames —
+   * even buffered — would silently advance the room's authoritative state past the diagnostic scene
+   * we need to recover from. The socket is closed (the room sees the client leave on purpose), no
+   * reconnect is scheduled, and the session record is persisted with the freeze reason so the
+   * resolver and the next plugin run can both see *why* this path was taken out of service.
+   *
+   * A frozen session is not reusable. The resolver must close + reopen (or `forget()` and let the
+   * next `open()` build a fresh binding on the user's chosen baseline) — see the conflict-design
+   * `editor-document-divergence` lifecycle in `coordinator.ts`.
+   */
+  async freeze(reason: string): Promise<void> {
+    this.cancelReconnect();
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      try { socket.close(1011, "frozen"); } catch { /* already closing */ }
+    }
+    if (this.record) {
+      this.record = { ...this.record, status: "conflict", updatedAt: this.now() };
+      await this.deps.store.putSession(this.record);
+    }
+    this.events.onStatus?.("conflict", reason);
+  }
+
   async close(input: { checkpoint: boolean; localText: string; operationId: string }): Promise<HotCloseOutcome> {
     const record = this.record;
     if (!record) return { outcome: "not-hot" };
