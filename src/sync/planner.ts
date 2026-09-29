@@ -2,6 +2,16 @@ import { localChanged, remoteChanged } from "./fingerprint";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteDeletionIdentity, type RemoteEntry, type SyncOperation, type SyncPlan } from "./types";
 
 /**
+ * The reason a path owned by a live hot session carries in the plan.
+ *
+ * A hot path is not missing, and it is not "nothing to do": it is being synchronized by the server on
+ * behalf of the room, and the cold path may observe it but must not act on it. Emitting this instead of
+ * an upload/download/delete is the strongest form of the guarantee — the dangerous inference never
+ * reaches a plan at all — while still leaving a legible fact for diagnostics and for the operator.
+ */
+export const DEFERRED_BY_HOT_OWNERSHIP = "deferred-by-hot-ownership";
+
+/**
  * The planner's view of a pending resolution.
  *
  * It is a plain value, not a store handle: the planner stays a pure function, so it must be handed
@@ -18,6 +28,17 @@ export interface ResolutionProposal {
     type: "keep-local" | "keep-remote" | "accept-remote-delete" | "accept-local-delete" | "merged";
     merged?: { content: string; sha256: string; encoding: { bom: boolean; eol: "lf" | "crlf" | "mixed"; trailingNewline: boolean } };
   };
+}
+
+/** Inputs that are not observations: ownership questions the planner is asked but cannot answer itself. */
+export interface PlanOptions {
+  /**
+   * Paths a hot session owns right now.
+   *
+   * Supplied as a predicate rather than a set so the caller decides what "owned" means (a live session,
+   * a pending handoff, a conflict) and this file stays free of that state machine.
+   */
+  deferPath?: (key: string) => boolean;
 }
 
 const operation = (type: SyncOperation["type"], key: string, reason: string, conflict?: Extract<SyncOperation, { type: "conflict" }>["conflict"]): SyncOperation =>
@@ -62,10 +83,18 @@ export function buildSyncPlan(
   remote: Map<string, RemoteEntry>,
   previous: Map<string, PreviousEntry>,
   resolutions?: Map<string, ResolutionProposal>,
+  options: PlanOptions = {},
 ): SyncPlan {
   const keys = new Set([...local.keys(), ...remote.keys(), ...previous.keys()]);
   const operations: SyncOperation[] = [];
   for (const key of [...keys].sort((a, b) => a.localeCompare(b))) {
+    // Ownership is asked about every key, including the ones that would only become a noop: a hot path
+    // must not be described as "nothing to do" either, because the reason it needs no cold action is
+    // that someone else is acting.
+    if (options.deferPath?.(key)) {
+      operations.push(operation("noop", key, DEFERRED_BY_HOT_OWNERSHIP));
+      continue;
+    }
     const here = local.get(key), there = remote.get(key), before = previous.get(key);
     if (isRemoteDeleted(there)) {
       // A tombstone is remote metadata, not a remotely-created user file. It cannot bootstrap a
@@ -86,6 +115,7 @@ export function buildSyncPlan(
       const changedLocal = localChanged(here, before), changedRemote = remoteChanged(there, before);
       if (!changedLocal && !changedRemote) operations.push(operation("noop", key, "unchanged since previous successful sync"));
       else if (changedLocal && !changedRemote) operations.push({ type: "upload", key, reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: there.etag } });
+      else if (!changedLocal && changedRemote && there.size === 0 && here.size > 0) operations.push(operation("conflict", key, "the remote revision is empty while the local file is not", "remote-emptied"));
       else if (!changedLocal && changedRemote) operations.push({ type: "download", key, reason: "remote changed since previous successful sync", expectedLocal: here, expectedRemote: there });
       else operations.push(resolutionOperation(resolutions?.get(key), key, here, there) ?? operation("conflict", key, "both sides changed since previous successful sync", "both-modified"));
     } else if (!here && !there) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { canonicalKey, normalizePrefix, remoteObjectKey, vaultKeyFromRemote } from "./path";
-import { buildSyncPlan } from "./planner";
+import { DEFERRED_BY_HOT_OWNERSHIP, buildSyncPlan } from "./planner";
 import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "./types";
 
 const local = (key = "note.md", size = 10, mtime = 100): LocalEntry => ({ key, size, mtime });
@@ -123,6 +123,82 @@ describe("baseline GC and safe local deletion", () => {
   });
 });
 
+describe("an emptied remote revision is a question, not a download", () => {
+  it("asks before replacing real local content with nothing", () => {
+    // The shape a real device run produced: a session checkpointed an empty document, and every other
+    // device was about to download zero bytes over a file that had content. "Remote changed" is normally
+    // a download; here it must be a decision.
+    const emptyRemote = remote("note.md", 0, "etag-empty", 2000);
+    const unchangedLocal = buildSyncPlan(
+      new Map([["note.md", local("note.md", 120, 100)]]),
+      new Map([["note.md", emptyRemote]]),
+      new Map([["note.md", previous("note.md", 120, 100, "etag-a", 1000)]]),
+    );
+    expect(unchangedLocal.operations[0]).toMatchObject({ type: "conflict", conflict: "remote-emptied" });
+
+    // A normal remote change is still a download: the guard is about emptiness, not about caution.
+    const normalRemote = buildSyncPlan(
+      new Map([["note.md", local("note.md", 120, 100)]]),
+      new Map([["note.md", remote("note.md", 140, "etag-b", 2000)]]),
+      new Map([["note.md", previous("note.md", 120, 100, "etag-a", 1000)]]),
+    );
+    expect(normalRemote.operations[0]).toMatchObject({ type: "download" });
+
+    // And a local file that is already empty is not protected: downloading something into it is additive.
+    const emptyLocal = buildSyncPlan(
+      new Map([["note.md", local("note.md", 0, 100)]]),
+      new Map([["note.md", remote("note.md", 50, "etag-c", 2000)]]),
+      new Map([["note.md", previous("note.md", 0, 100, "etag-a", 1000)]]),
+    );
+    expect(emptyLocal.operations[0]).toMatchObject({ type: "download" });
+  });
+});
+
+describe("hot ownership is a plan input, not only an execution check", () => {
+  const baseline = (key: string): PreviousEntry => ({ key, local: { size: 10, mtime: 100 }, remote: { size: 10, etag: "etag-a", lastModified: 1000 }, syncedAt: 1 });
+
+  it("describes an owned path as deferred instead of planning an action for it", () => {
+    const localEntries = new Map([["owned.md", local("owned.md")], ["cold.md", local("cold.md")]]);
+    // The owned path's object is not in R2 — a room that has not checkpointed yet, or an external
+    // deletion — while its baseline is still recorded. That is the shape that produces a deletion.
+    const remoteEntries = new Map([["vanished.md", remote("vanished.md")]]);
+    const previousEntries = new Map([["owned.md", baseline("owned.md")], ["cold.md", baseline("cold.md")], ["vanished.md", baseline("vanished.md")]]);
+
+    const unowned = buildSyncPlan(localEntries, remoteEntries, previousEntries);
+    // Without ownership those observations plan *deleting the user's local file*. The executor's fence
+    // would refuse to run it, but a plan that says "delete this" is not a fact the cold path may hold
+    // about a path a room owns — which is why ownership is an input here, not only a check later.
+    expect(unowned.operations.find(operation => operation.key === "owned.md")).toMatchObject({ type: "delete-local" });
+
+    const owned = buildSyncPlan(localEntries, remoteEntries, previousEntries, undefined, { deferPath: key => key === "owned.md" });
+    expect(owned.operations.filter(operation => operation.key === "owned.md")).toEqual([{ type: "noop", key: "owned.md", reason: DEFERRED_BY_HOT_OWNERSHIP }]);
+    // The fence is per path, not per cycle: every other key is planned exactly as it would be without it.
+    const withoutFence = new Map(unowned.operations.map(operation => [operation.key, operation.type]));
+    for (const operation of owned.operations) {
+      if (operation.key === "owned.md") continue;
+      expect(withoutFence.get(operation.key), `${operation.key} must be unaffected by another path's ownership`).toBe(operation.type);
+    }
+  });
+
+  it("never plans a transfer for an owned key, whatever the two observations look like", () => {
+    const onlyLocal = buildSyncPlan(new Map([["owned.md", local("owned.md")]]), new Map(), new Map(), undefined, { deferPath: () => true });
+    expect(onlyLocal.operations).toEqual([{ type: "noop", key: "owned.md", reason: DEFERRED_BY_HOT_OWNERSHIP }]);
+    // Without the fence the same observations are an upload, which is exactly what must not be planned
+    // while a room owns the path.
+    expect(buildSyncPlan(new Map([["owned.md", local("owned.md")]]), new Map(), new Map()).operations[0]).toMatchObject({ type: "upload" });
+
+    const bothChanged = buildSyncPlan(
+      new Map([["owned.md", local("owned.md", 20, 200)]]),
+      new Map([["owned.md", remote("owned.md", 30, "etag-z", 3000)]]),
+      new Map([["owned.md", baseline("owned.md")]]),
+      undefined,
+      { deferPath: () => true },
+    );
+    // A conflict is not planned either: the room is the authority for that path while it owns it.
+    expect(bothChanged.operations.map(operation => operation.type)).toEqual(["noop"]);
+  });
+});
+
 describe("path normalization", () => {
   it("uses vault-relative slash-separated keys and normalized prefixes", () => {
     expect(canonicalKey("folder\\note.md")).toBe("folder/note.md");
@@ -132,3 +208,4 @@ describe("path normalization", () => {
   });
   it.each(["/../note.md", "folder/../note.md", "", "folder//note.md"])("rejects non-canonical traversal or empty paths: %s", (value) => expect(() => canonicalKey(value)).toThrow());
 });
+

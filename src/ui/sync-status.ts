@@ -39,6 +39,26 @@ export interface SyncStatusInput {
   lastFailureClass?: FailureClass;
   /** Unresolved conflicts the resolver can actually show. */
   conflictCount: number;
+  /**
+   * The hot layer's own state, when it is running.
+   *
+   * "Syncing" alone cannot distinguish "a cold cycle is running" from "the file you are typing in is
+   * hot and R2 has not caught up yet", and those mean very different things to the person looking at the
+   * status bar. Omitted entirely when hot sync is off, which keeps the cold presentation unchanged.
+   */
+  hot?: HotStatusInput;
+}
+
+/** The hot states the bar has to tell apart, as the design's observability section requires. */
+export interface HotStatusInput {
+  /** The open document's session status; `idle` when no document is open. */
+  status: "idle" | "connecting" | "hot" | "disconnected" | "saving" | "handoff-pending" | "conflict" | "closed";
+  /** A checkpoint this device still owes R2. */
+  pendingSave: boolean;
+  /** Paths whose handoff has not completed. */
+  handoffPending: number;
+  /** Paths in a hot conflict: the cold path is fenced and nothing was overwritten. */
+  conflicts: number;
 }
 
 export interface SyncStatusPresentation {
@@ -50,7 +70,7 @@ export interface SyncStatusPresentation {
   /** `aria-label`, which is what Obsidian turns into a tooltip. */
   tooltip: string;
   /** What a click should do. A conflict click goes straight to the resolver, never via a menu. */
-  action: "resolve-conflicts" | "sync-now";
+  action: "resolve-conflicts" | "resolve-hot-conflicts" | "sync-now";
 }
 
 const plural = (count: number): string => (count === 1 ? "" : "s");
@@ -91,13 +111,49 @@ export function presentSyncStatus(input: SyncStatusInput): SyncStatusPresentatio
       action: "sync-now",
     };
   }
+  // The hot tier sits below the transport tiers on purpose: an unreachable R2 or a rejected credential
+  // affects everything, whereas these states are about one document. What matters is that they are told
+  // apart from each other and from a plain cold cycle.
+  const hot = input.hot;
+  if (hot && (hot.conflicts > 0 || hot.status === "conflict")) {
+    return {
+      tone: "conflict", icon: SYNC_STATUS_ICON, spinning: false, badge: "!",
+      tooltip: "Mineral Sync\nHot sync conflict\nThat file's cold sync is paused and nothing was overwritten\nClick to decide",
+      action: "resolve-hot-conflicts",
+    };
+  }
+  if (hot && (hot.handoffPending > 0 || hot.status === "handoff-pending")) {
+    return {
+      tone: "waiting", icon: SYNC_STATUS_ICON, spinning: false, badge: hot.handoffPending > 0 ? String(hot.handoffPending) : "1",
+      tooltip: "Mineral Sync\nHandoff pending\nThose files will not be cold-synced until the handoff finishes",
+      action: "sync-now",
+    };
+  }
+  if (hot && hot.status === "disconnected") {
+    return {
+      tone: "offline", icon: SYNC_STATUS_ICON, spinning: false,
+      tooltip: "Mineral Sync\nHot session disconnected\nEdits are kept locally and will be sent when it reconnects",
+      action: "sync-now",
+    };
+  }
+  if (hot && (hot.status === "connecting" || hot.status === "saving" || hot.pendingSave)) {
+    return {
+      tone: "syncing", icon: SYNC_STATUS_ICON, spinning: true,
+      tooltip: hot.status === "connecting" ? "Mineral Sync\nJoining the hot session…" : "Mineral Sync\nHot sync\nSaving to R2…",
+      action: "sync-now",
+    };
+  }
   if (input.state === "running") {
     return { tone: "syncing", icon: SYNC_STATUS_ICON, spinning: true, tooltip: "Mineral Sync\nSyncing…", action: "sync-now" };
   }
   if (input.state === "debouncing" || input.state === "rerun-pending") {
     return { tone: "waiting", icon: SYNC_STATUS_ICON, spinning: false, tooltip: "Mineral Sync\nWaiting for changes to settle…", action: "sync-now" };
   }
-  return { tone: "idle", icon: SYNC_STATUS_ICON, spinning: false, tooltip: "Mineral Sync\nUp to date", action: "sync-now" };
+  return {
+    tone: "idle", icon: SYNC_STATUS_ICON, spinning: false,
+    tooltip: hot && hot.status === "hot" ? "Mineral Sync\nHot sync connected\nUp to date" : "Mineral Sync\nUp to date",
+    action: "sync-now",
+  };
 }
 
 /**
@@ -139,3 +195,4 @@ export const SYNC_STATUS_CSS = `
 @keyframes mineral-sync-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .mineral-sync-status.is-spinning .mineral-sync-status__icon { animation: none; } }
 `;
+

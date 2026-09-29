@@ -4,7 +4,8 @@ import type { OperationResult } from "../sync/executor";
 import type { LandedWrite } from "../gateway/mutation-ingress";
 import type { LocalEntry, SyncOperation } from "../sync/types";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
-import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
+import { DEFERRED_BY_HOT_OWNERSHIP } from "../sync/planner";
+import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake, HotAuthorityVerdict } from "./types";
 
 const LOCAL_DEBOUNCE = 1200;
 const FOCUS_DEBOUNCE = 800;
@@ -12,7 +13,7 @@ const CONFIG_DEBOUNCE = 400;
 const RETRY_INITIAL = 5000;
 const RETRY_MAX = 60000;
 
-const emptyCounts = (): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0 });
+const emptyCounts = (): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, deferred: 0 });
 const defaultTimers: SchedulerTimers = { set: (delay, callback) => window.setTimeout(callback, delay), clear: (handle) => window.clearTimeout(handle as number) };
 
 /** Event-driven, full-reconciliation scheduler. Dirty keys are only coalescing hints. */
@@ -128,6 +129,10 @@ export class SyncScheduler {
     const startVersion = this.syncDirtyVersion;
     const generation = this.configGeneration;
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
+    // deferredByHot is a deterministic conclusion (like a blocked delete), so it may confirm a
+    // generation; uthorityNotified records that a write proceeded without the server's answer.
+    let deferredByHot = false;
+    let authorityUnreachable = false;
     let remoteMutation: CycleRemoteMutation | undefined;
     const remoteChanges: RemoteChange[] = [];
     /**
@@ -194,9 +199,40 @@ export class SyncScheduler {
           const operationsStartedAt = Date.now();
           for (const operation of plan.operations) {
             if (this.shouldStop(generation)) { halted = true; break; }
+            // The fence is checked here, at the mutation boundary, and not in the planner: a plan can be
+            // built while a path is cold and reach the executor after it became hot.
+            if (this.dependencies.hotDeferral?.isFenced(operation.key)) {
+              this.dependencies.hotDeferral.noteDeferred(operation.key);
+              counts.deferred++;
+              deferredByHot = true;
+              this.dependencies.debug?.("cycle operation deferred-by-hot-ownership");
+              continue;
+            }
+            // The authority is asked before the mutation and released after it: a lease that was
+            // released before the write would guard nothing.
+            let authority: HotAuthorityVerdict | undefined;
+            if (this.dependencies.hotAuthority) {
+              authority = await this.dependencies.hotAuthority.authorize(operation.key);
+              if (authority === "deferred") {
+                counts.deferred++;
+                deferredByHot = true;
+                this.dependencies.debug?.("cycle operation deferred-by-hot-authority");
+                continue;
+              }
+              // A Gateway that cannot be reached may not stop R2 sync; the room's conditional
+              // checkpoint is what catches the write it could not be told about.
+              if (authority === "unreachable") authorityUnreachable = true;
+            }
             // Each operation is executed exactly once and its result classified once: the loop and
             // the `finally` block must never disagree about what counts as a shortfall.
-            const result = await this.apply(operation, cycle);
+            let result: OperationResult | { status: "noop" | "conflict" };
+            try {
+              result = await this.apply(operation, cycle);
+            } finally {
+              if (authority === "granted" && this.dependencies.hotAuthority) {
+                try { await this.dependencies.hotAuthority.settle(operation.key, authority); } catch { /* bookkeeping only */ }
+              }
+            }
             counts[result.status]++;
             if (result.status === "applied" && result.localWrite) localWrites.set(result.localWrite.key, result.localWrite);
             const detail = resultDetail(result);
@@ -235,9 +271,22 @@ export class SyncScheduler {
             if (this.shouldStop(generation)) { halted = true; break; }
           }
           this.dependencies.debug?.(`cycle operations durationMs=${Date.now() - operationsStartedAt}`);
+          if (deferredByHot) {
+            // Visible on purpose: a deferred path is work that did not happen, and the count is what
+            // keeps "nothing to do" from looking like "the hot session silently swallowed it".
+            this.dependencies.debug?.(`cycle deferred-by-hot count=${counts.deferred}`);
+          }
+          if (authorityUnreachable) {
+            // The write proceeded without the Gateway's answer, which is the documented degradation:
+            // R2 sync keeps working and the room's conditional checkpoint is what detects a collision.
+            this.dependencies.debug?.("cycle cold authority unavailable; write proceeded under R2 preconditions");
+          }
           if (!halted && cycle.observeConverged) {
             const mergeBaseStartedAt = Date.now();
-            const noops = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "noop" }> => entry.type === "noop");
+            // A deferred noop is not convergence: that path is being synchronized by a hot room, and
+            // recording a merge base for it would describe a state the cold path never verified.
+            const noops = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "noop" }> =>
+              entry.type === "noop" && entry.reason !== DEFERRED_BY_HOT_OWNERSHIP);
             try {
               await cycle.observeConverged(noops, observations);
               this.dependencies.debug?.(`cycle merge-base-backfill noops=${noops.length} durationMs=${Date.now() - mergeBaseStartedAt}`);
@@ -571,3 +620,7 @@ function resultDetail(result: OperationResult | { status: "noop" | "conflict" })
   if (result.status === "unresolved" || result.status === "blocked" || result.status === "stale") return result.reason;
   return undefined;
 }
+
+
+
+

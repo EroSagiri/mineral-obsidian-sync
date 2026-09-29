@@ -312,9 +312,13 @@ bearer header 仍然被接受，非浏览器调用方不受影响
 Vault / MCP 写入方通知            → Phase 4D
 Queue 投递可靠性                  → 后续
 R2 Event Notifications            → 后续
-Hot realtime / LiveDocumentRoom    → 未授权
 删除语义                          → 仍为 BLOCKED
 桌面端定期 R2 LIST polling         → 永不
 Gateway 代理文件内容               → 永不
 临时 R2 凭据 / OAuth               → 后续
 ```
+
+**Hot realtime / LiveDocumentRoom 已不再是"未授权"**：它已实现、部署并验证，见
+[`hot-sync.md`](hot-sync.md)。它默认关闭（`hotSyncEnabled`），打开后由 Gateway 的
+`/v1/channels/{channel}/hot/*` 承载；控制平面的其余性质不变——channel 仍由 R2 identity 派生，
+长期 token 仍不进 URL，Gateway 仍不读不写 R2 内容（checkpoint 由 Vault 执行）。

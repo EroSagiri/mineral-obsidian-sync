@@ -23,7 +23,7 @@ import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "./sy
  */
 
 type Stamp = { size: number; mtime: number };
-type StubView = { file: { path: string } | null; editor: { getValue(): string }; save(): Promise<void>; saved: number };
+type StubView = { file: { path: string; extension?: string } | null; editor: { getValue(): string }; save(): Promise<void>; saved: number };
 
 /** Obsidian resolves to the test stubs at run time, but to the real types for `tsc`. */
 const newView = (): StubView => new (MarkdownView as unknown as new () => StubView)();
@@ -32,7 +32,7 @@ const newPlugin = (app: unknown): Record<string, unknown> => new (R2PersonalSync
 /** The private surface these tests drive. */
 interface Internals {
   app: {
-    vault: { adapter: { stat(path: string): Promise<Stamp | null> }; read(file: { path: string }): Promise<string> };
+    vault: { adapter: { stat(path: string): Promise<Stamp | null>; read(path: string): Promise<string> }; read(file: { path: string }): Promise<string> };
     workspace: { getLeavesOfType(): Array<{ view: StubView }> };
   };
   settings: R2SyncSettings;
@@ -68,7 +68,7 @@ function harness(options: { buffer?: string; before?: Stamp | null; after?: Stam
   /** The Vault's current view of the file; a save moves it, exactly as a real write would. */
   const state: { current: Stamp | null } = { current: options.before === undefined ? { size: 5, mtime: 100 } : options.before };
   const view = newView();
-  view.file = { path: "note.md" };
+  view.file = { path: "note.md", extension: "md" };
   view.editor = { getValue: () => options.buffer ?? "" };
   view.save = async () => {
     view.saved += 1;
@@ -83,16 +83,23 @@ function harness(options: { buffer?: string; before?: Stamp | null; after?: Stam
     },
     workspace: {
       getLeavesOfType: () => views.map((candidate) => ({ view: candidate })),
+      // The plugin asks for the active file and its pane when it adopts what is already open.
+      getActiveFile: () => views[0]?.file ?? null,
+      getActiveViewOfType: () => views[0] ?? null,
       on: (event: string, handler: () => void) => { handlers.set(`workspace:${event}`, handler); return {}; },
     },
   };
   const plugin = newPlugin(app) as unknown as Internals;
   plugin.app = app as unknown as Internals["app"];
   plugin.settings = settings;
-  plugin.scheduler = { markLocalPaths: (paths, _ignores, reason) => { for (const path of paths) marked.push({ path, reason }); return true; } };
+  plugin.scheduler = { markLocalPaths: (paths, _ignores, reason) => { for (const path of paths) marked.push({ path, reason }); return true; }, refreshStatus: () => undefined };
   plugin.stateStore = { loadAll: async () => new Map() };
   (plugin as unknown as { debug(message: string): void }).debug = (message) => { notices.push(message); };
-  return { plugin, view, views, marked, notices, handlers, settings, state };
+  return {
+    plugin, view, views, marked, notices, handlers, settings, state,
+    /** Set the hot layer's switches on the plugin's own settings object, before wiring decisions read it. */
+    attachHotSettings(overrides: Partial<R2SyncSettings>): void { Object.assign(settings, overrides); },
+  };
 }
 
 /** A baseline as the state store records one, so the drift filter is exercised against real shapes. */
@@ -305,8 +312,304 @@ describe("android editor save lifecycle", () => {
   });
 });
 
+describe("hot ownership from the cold path's point of view", () => {
+  /**
+   * A recording stand-in for the plugin's hot coordinator.
+   *
+   * The fence is the only thing the cold path asks about, so the stub is deliberately tiny: what is
+   * under test is whether the *plugin* asks — on every entry — before it registers a local change.
+   */
+  function hotStub(fenced: string[], renameOutcome: "applied" | "conflict" = "applied") {
+    const deferred: string[] = [];
+    const renamed: Array<{ from: string; to: string }> = [];
+    return {
+      deferred,
+      renamed,
+      stub: {
+        isFenced: (key: string) => fenced.includes(key),
+        noteDeferred: (key: string) => { deferred.push(key); },
+        // Deleting a file ends its hot state; the tests exercise that handler, so the stub answers it.
+        forget: async (key: string) => { void key; },
+        rename: async (from: string, to: string) => {
+          renamed.push({ from, to });
+          return renameOutcome === "applied"
+            ? { protocol: 1, operationId: "r", type: "rename" as const, outcome: "applied" as const, phase: "acked" as const, canonicalPath: to, fromPath: from, binding: null, identity: { documentId: "doc", epoch: 2 } }
+            : { protocol: 1, operationId: "r", type: "rename" as const, outcome: "conflict" as const, reason: "target-exists" as const, phase: "failed" as const, canonicalPath: to, fromPath: from, binding: null };
+        },
+      },
+    };
+  }
+
+  /** The rename path is async but timer-free: microtasks are all it needs to settle. */
+  const settleHotRename = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+  const attach = (plugin: Internals, stub: unknown): void => {
+    (plugin as unknown as { hotCoordinator?: unknown }).hotCoordinator = stub;
+  };
+
+  it("stays entirely out of the way when the Gateway is disabled", async () => {
+    // The design's promise for a deployment without a Gateway: existing cold sync behaviour, unchanged.
+    // The mechanism is that nothing hot is ever constructed, so there is nothing to fence and nothing to
+    // talk to — which is what this asserts, at the entry point that would build it.
+    const env = harness();
+    env.attachHotSettings({ hotSyncEnabled: true, gatewayEnabled: false });
+    const internals = env.plugin as unknown as { refreshHotSync(): Promise<void>; hotCoordinator?: unknown; hotLastError?: string };
+    await internals.refreshHotSync();
+    expect(internals.hotCoordinator).toBeUndefined();
+    // No attempt to reach a Gateway was even recorded as a failure: the feature is off, not broken.
+    expect(internals.hotLastError).toBeUndefined();
+
+    // And the cold path is exactly as it was: a local change is marked, planned and uploaded as usual.
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+    expect(env.marked.map(entry => entry.path)).toEqual(["note.md"]);
+  });
+
+  it("takes the file already open hot, because enabling the feature produces no file-open event", async () => {
+    // The bug this pins: the plugin only reacted to `file-open`, so the note that was already in front of
+    // the user never became hot. The feature was working exactly as written and looked completely broken.
+    const env = harness();
+    const opened: string[] = [];
+    const hot = hotStub([]);
+    attach(env.plugin, {
+      ...hot.stub,
+      open: async (input: { canonicalPath: string }) => { opened.push(input.canonicalPath); return { outcome: "hot" }; },
+    });
+    (env.plugin as unknown as { openActiveFileHot(): void }).openActiveFileHot();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(opened).toEqual(["note.md"]);
+  });
+
+  it("does not register a cold change for a path a hot session owns", async () => {
+    const env = harness();
+    const hot = hotStub(["hot.md"]);
+    attach(env.plugin, hot.stub);
+
+    await env.plugin.markUnlessOwnEditorWrite("hot.md");
+    expect(env.marked).toEqual([]);
+    expect(hot.deferred).toEqual(["hot.md"]);
+
+    // A cold path in the same session is untouched by the fence.
+    await env.plugin.markUnlessOwnEditorWrite("cold.md");
+    expect(env.marked).toEqual([{ path: "cold.md", reason: undefined }]);
+  });
+
+  it("keeps create and delete of a hot path out of the cold plan", async () => {
+    const env = harness();
+    const hot = hotStub(["hot.md"]);
+    attach(env.plugin, hot.stub);
+    env.plugin.registerVaultListeners();
+
+    (env.handlers.get("vault:create") as unknown as (file: { path: string }) => void)({ path: "hot.md" });
+    (env.handlers.get("vault:delete") as unknown as (file: { path: string }) => void)({ path: "hot.md" });
+    expect(env.marked).toEqual([]);
+    expect(hot.deferred).toEqual(["hot.md", "hot.md"]);
+
+    (env.handlers.get("vault:create") as unknown as (file: { path: string }) => void)({ path: "cold.md" });
+    expect(env.marked).toEqual([{ path: "cold.md", reason: undefined }]);
+  });
+
+  it("turns a hot rename into a namespace operation and marks nothing", async () => {
+    const env = harness();
+    const hot = hotStub(["a.md"]);
+    attach(env.plugin, hot.stub);
+    env.plugin.registerVaultListeners();
+
+    (env.handlers.get("vault:rename") as unknown as (file: { path: string }, oldPath: string) => void)({ path: "b.md" }, "a.md");
+    await settleHotRename();
+
+    expect(hot.renamed).toEqual([{ from: "a.md", to: "b.md" }]);
+    // Nothing may be marked: the Vault writes the new path and tombstones the old one, so a cold mark
+    // here would race the namespace operation and could upload content the room already owns.
+    expect(env.marked).toEqual([]);
+  });
+
+  it("marks both paths when the hot rename is refused, because the file really did move", async () => {
+    const env = harness();
+    const hot = hotStub(["a.md"], "conflict");
+    attach(env.plugin, hot.stub);
+    env.plugin.registerVaultListeners();
+
+    (env.handlers.get("vault:rename") as unknown as (file: { path: string }, oldPath: string) => void)({ path: "b.md" }, "a.md");
+    await settleHotRename();
+
+    expect(hot.renamed).toEqual([{ from: "a.md", to: "b.md" }]);
+    // The old path is still fenced, so it is recorded as deferred rather than marked; the new path is a
+    // genuine local change the cold path has to reconcile, because the namespace operation did not run.
+    expect({ marked: env.marked.map(entry => entry.path), deferred: hot.deferred }).toEqual({ marked: ["b.md"], deferred: ["a.md"] });
+  });
+
+  it("marks an ordinary cold rename exactly as it always did", async () => {
+    const env = harness();
+    env.plugin.registerVaultListeners();
+    (env.handlers.get("vault:rename") as unknown as (file: { path: string }, oldPath: string) => void)({ path: "b.md" }, "a.md");
+    expect(env.marked.map(entry => entry.path)).toEqual(["a.md", "b.md"]);
+  });
+
+  it("keeps the cold behaviour identical when no hot layer is running", async () => {
+    // The feature is additive: with hot sync off, every entry that marked before still marks.
+    const env = harness();
+    env.plugin.registerVaultListeners();
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+    (env.handlers.get("vault:create") as unknown as (file: { path: string }) => void)({ path: "new.md" });
+    (env.handlers.get("vault:delete") as unknown as (file: { path: string }) => void)({ path: "gone.md" });
+    expect(env.marked.map(entry => entry.path)).toEqual(["note.md", "new.md", "gone.md"]);
+  });
+
+  it("flags a write to a hot file that the bound buffer does not contain", async () => {
+    const env = harness({ buffer: "typing in the buffer" });
+    const flagged: string[] = [];
+    const hot = hotStub(["note.md"]);
+    attach(env.plugin, { ...hot.stub, flagExternalEdit: (path: string) => { flagged.push(path); return true; } });
+    // The pane has to be a real MarkdownView: the plugin identifies the bound buffer by asking the view
+    // for it, and a stand-in object would make this test pass for the wrong reason.
+    const pane = newView();
+    pane.file = { path: "note.md" } as never;
+    pane.editor = { getValue: () => "typing in the buffer" } as never;
+    env.views.push(pane);
+    // The plugin reads the *adapter*, because that is what the Vault event is about.
+    let disk = "the file as this plugin last saw it";
+    env.plugin.app.vault.adapter.read = async () => disk;
+
+    // The first look only records what the file holds: without a previous observation there is nothing to
+    // compare against, and "unknown" must never be read as "someone else wrote it".
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+    expect(flagged).toEqual([]);
+
+    // Someone else writes the file while the buffer is quiet: that is the case the rule exists for.
+    disk = "something else wrote this file";
+    (env.plugin as unknown as { hotLastEditAt: Map<string, number> }).hotLastEditAt.set("note.md", Date.now() - 60_000);
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+
+    // The external edit is surfaced and *not* registered as a cold change: the path stays hot-owned.
+    expect(flagged).toEqual(["note.md"]);
+    expect(env.marked).toEqual([]);
+  });
+
+  it("does not call our own autosave an external write, however soon the user types again", async () => {
+    // The reported loop: resolve the conflict, type one character, conflict again. Obsidian writes the buffer
+    // itself, and the buffer has usually moved on by the time that write lands — so disk-versus-buffer alone
+    // fires on every save a moment after a keystroke.
+    const env = harness({ buffer: "typed a bit more" });
+    const flagged: string[] = [];
+    const hot = hotStub(["note.md"]);
+    attach(env.plugin, { ...hot.stub, flagExternalEdit: (path: string) => { flagged.push(path); return true; } });
+    const pane = newView();
+    pane.file = { path: "note.md" } as never;
+    pane.editor = { getValue: () => "typed a bit more" } as never;
+    env.views.push(pane);
+    let disk = "typed";
+    env.plugin.app.vault.adapter.read = async () => disk;
+
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+    // The autosave of what the user had typed lands, and one more character is already in the buffer.
+    disk = "typed a";
+    (env.plugin as unknown as { hotLastEditAt: Map<string, number> }).hotLastEditAt.set("note.md", Date.now());
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+
+    expect(flagged).toEqual([]);
+    expect(env.marked).toEqual([]);
+  });
+
+  it("leaves the editor's own save alone while the buffer is merely ahead of the file", async () => {
+    // The comparison is disk-versus-buffer on purpose. While the user types, the file is legitimately
+    // behind the buffer for a moment; comparing with the CRDT instead would raise a conflict on every
+    // ordinary save.
+    const env = harness({ buffer: "typed but not yet flushed" });
+    const flagged: string[] = [];
+    const hot = hotStub(["note.md"]);
+    attach(env.plugin, { ...hot.stub, flagExternalEdit: (path: string) => { flagged.push(path); return true; } });
+    const pane = newView();
+    pane.file = { path: "note.md" } as never;
+    pane.editor = { getValue: () => "typed but not yet flushed" } as never;
+    env.views.push(pane);
+    env.plugin.app.vault.adapter.read = async () => "typed but not yet flushed";
+
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+
+    expect(flagged).toEqual([]);
+    // It is still a hot path, so the cold path defers it rather than marking it.
+    expect(env.marked).toEqual([]);
+  });
+});
+
+describe("the hot socket adapter", () => {
+  /** The smallest WebSocket that behaves like the platform's, including throwing on a premature send. */
+  class FakeWebSocket {
+    static readonly instances: FakeWebSocket[] = [];
+    readonly sent: string[] = [];
+    readyState = 0;
+    closed = false;
+    private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
+    constructor(readonly url: string) { FakeWebSocket.instances.push(this); }
+    addEventListener(type: string, handler: (event: unknown) => void): void {
+      const existing = this.listeners.get(type) ?? [];
+      existing.push(handler);
+      this.listeners.set(type, existing);
+    }
+    send(data: string): void {
+      // This is the platform behaviour the adapter exists to absorb.
+      if (this.readyState !== 1) throw new Error("InvalidStateError: still in CONNECTING state");
+      this.sent.push(data);
+    }
+    close(): void { this.closed = true; this.readyState = 3; this.emit("close", {}); }
+    open(): void { this.readyState = 1; this.emit("open", {}); }
+    receive(data: string): void { this.emit("message", { data }); }
+    private emit(type: string, event: unknown): void { for (const handler of this.listeners.get(type) ?? []) handler(event); }
+  }
+
+  interface Adapter { send(data: string): void; close(): void; onMessage(handler: (data: string) => void): void; onClose(handler: () => void): void }
+
+  function adapter() {
+    const previous = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = FakeWebSocket;
+    FakeWebSocket.instances.length = 0;
+    const plugin = newPlugin({}) as unknown as { openHotSocket(url: string): Adapter };
+    const socket = plugin.openHotSocket("wss://gateway.test/session?ticket=t");
+    return { socket, underlying: FakeWebSocket.instances[0], restore: () => { (globalThis as Record<string, unknown>).WebSocket = previous; } };
+  }
+
+  it("holds frames until the handshake finishes instead of losing them to a CONNECTING throw", () => {
+    const { socket, underlying, restore } = adapter();
+    try {
+      // The session may produce a frame before the socket opens — on a phone that window is real.
+      expect(() => socket.send("first")).not.toThrow();
+      expect(underlying.sent).toEqual([]);
+
+      underlying.open();
+      expect(underlying.sent).toEqual(["first"]);
+      socket.send("second");
+      expect(underlying.sent).toEqual(["first", "second"]);
+    } finally { restore(); }
+  });
+
+  it("gives up on a handshake that never completes rather than queueing forever", () => {
+    const { socket, underlying, restore } = adapter();
+    try {
+      for (let index = 0; index < 100; index++) socket.send(`frame-${index}`);
+      // The socket is closed, so the session's durable outbox is what retries the work.
+      expect(underlying.closed).toBe(true);
+      expect(underlying.sent).toEqual([]);
+    } finally { restore(); }
+  });
+
+  it("delivers text frames and a close notification", () => {
+    const { socket, underlying, restore } = adapter();
+    try {
+      const messages: string[] = [];
+      let closed = 0;
+      socket.onMessage((data) => messages.push(data));
+      socket.onClose(() => { closed += 1; });
+      underlying.open();
+      underlying.receive("{\"type\":\"welcome\"}");
+      expect(messages).toEqual(["{\"type\":\"welcome\"}"]);
+      socket.close();
+      expect(closed).toBe(1);
+    } finally { restore(); }
+  });
+});
+
 describe("status bar wiring", () => {
-  const counts = (overrides: Partial<ResultCounts> = {}): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, ...overrides });
+  const counts = (overrides: Partial<ResultCounts> = {}): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, deferred: 0, ...overrides });
 
   /** The status bar item is Obsidian's element; the shim stands in for it. */
   function statusHarness(failure?: FailureClass) {
@@ -763,3 +1066,12 @@ describe("restoring an earlier version", () => {
     expect(opened).toBe(1);
   });
 });
+
+
+
+
+
+
+
+
+

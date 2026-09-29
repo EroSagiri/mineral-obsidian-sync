@@ -54,6 +54,15 @@ export type ConflictKind =
   | "local-modified-remote-deleted"
   | "local-deleted-remote-modified"
   | "both-created-different"
+  /**
+   * The remote revision is zero bytes and the local file is not.
+   *
+   * This is not "the user emptied the file": it is the shape a truncated or wrongly written remote
+   * object has, and downloading it replaces real content with nothing. A real device run produced exactly
+   * this shape — a hot session that checkpointed an empty document — so the planner refuses to resolve it
+   * on its own and asks, which is the only safe direction for a destructive download.
+   */
+  | "remote-emptied"
   | "ambiguous";
 
 export type SyncOperation =

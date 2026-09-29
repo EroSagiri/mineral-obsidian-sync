@@ -3,7 +3,7 @@ import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import type { LandedWrite } from "../gateway/mutation-ingress";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
 
-export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "foreground-resume" | "integrity-check" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
+export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "foreground-resume" | "integrity-check" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution" | "hot-handoff" | "hot-resolution";
 export type SchedulerState = "idle" | "debouncing" | "running" | "rerun-pending" | "blocked-by-auth";
 export type FailureClass = "retryable" | "stable" | "auth";
 /**
@@ -11,7 +11,7 @@ export type FailureClass = "retryable" | "stable" | "auth";
  * half could not be completed. It is counted separately from `applied` because it deliberately leaves
  * the baseline uncommitted and needs one more reconciliation.
  */
-export type ResultKind = OperationResult["status"] | "conflict" | "noop";
+export type ResultKind = OperationResult["status"] | "conflict" | "noop" | "deferred";
 export type ResultCounts = Record<ResultKind, number>;
 
 export interface SchedulerTimers {
@@ -120,6 +120,44 @@ export interface SchedulerDependencies {
   timers?: SchedulerTimers;
   onStatus?(state: SchedulerState, counts: ResultCounts): void;
   debug?(message: string): void;
+  /**
+   * The hot-path fence.
+   *
+   * A hot file is not a cold candidate: the planner may still *observe* it, but nothing may be
+   * executed against it. Asking here — immediately before execution, not at plan time — is the point:
+   * a plan can be built while a path is cold and execute after it became hot, and that window is
+   * exactly what the ownership token exists to close.
+   */
+  hotDeferral?: HotDeferralPort;
+  /**
+   * The server-issued authority a cold mutation must hold.
+   *
+   * This is the cross-device half of the same guard: the local fence knows about this device's own hot
+   * sessions, and only the Gateway knows whether *another* device is editing the path right now.
+   */
+  hotAuthority?: HotMutationAuthorityPort;
+}
+
+/** What the cold path needs to know about hot ownership of one path. */
+export interface HotDeferralPort {
+  isFenced(key: string): boolean;
+  /** Records the deferral for diagnostics: a skipped operation must be visible, never silent. */
+  noteDeferred(key: string): void;
+}
+
+/**
+ * The verdict of one cold-mutation authority request.
+ *
+ * `unreachable` is not `deferred`: a Gateway this device cannot reach may not stop R2 synchronisation
+ * from working (that is the degradation table's whole point), whereas a `deferred` verdict means the
+ * authority *answered* that a hot session owns this path.
+ */
+export type HotAuthorityVerdict = "granted" | "deferred" | "unreachable";
+
+export interface HotMutationAuthorityPort {
+  authorize(key: string): Promise<HotAuthorityVerdict>;
+  /** Releases whatever the request held. Never a write, never a decision: bookkeeping. */
+  settle(key: string, verdict: HotAuthorityVerdict): Promise<void>;
 }
 
 /** The minimum a conflict observation needs to carry: identity inputs, never content. */
@@ -169,3 +207,5 @@ export interface SchedulerDiagnostics {
   /** A completed cycle changed R2 during this session (confirmed or possibly). */
   lastCycleRemoteMutation: boolean;
 }
+
+

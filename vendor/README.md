@@ -8,19 +8,21 @@ would make a fresh clone unbuildable on any other machine.
 | Field | Value |
 | --- | --- |
 | Package | `@mineral/sync-core` |
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Source repository | `bedrock-mcp` (`packages/sync-core`) |
-| Source commit | `adc924e` — the commit the artifact was packed from (`git log -1 -- packages/sync-core`) |
-| Artifact | `vendor/mineral-sync-core-0.1.0.tgz` |
-| SHA-256 (tarball) | `5BCBDF9D625A5E6393844AA9734CCE77706630079D51682E38DEB489FF2DF685` |
-| npm shasum | `1f5f4f94127e9e6b5f519ce5a303d3865baae6fe` |
-| npm integrity | `sha512-RlbQeOwqhzQCCfek5ROIZpCZzEblrGYMJDZBXTf2+3nGUqR5kik6bBKTWHl8FfmCalNtEgfOpY4T9RO2o+IQMA==` |
-| Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.1.0.tgz"` |
+| Source commit | working tree — repacked for the hot conflict-resolution protocol and the coordinator's bounded resume |
+| Artifact | `vendor/mineral-sync-core-0.2.0.tgz` |
+| SHA-256 (tarball) | `E78AE67ED14F66F7418CF89293175FBA0FA8BDC8A53485986BFEB0A5FD78FE85` |
+| npm shasum | `bcec7811e4576746fb2d98392a47f7b4ee8788c2` |
+| npm integrity | `sha512-rZqXWgAY8Ie9LmF+a4KCuyB+bzXnLU40NJ7twDIFphrLGs93qnUYyb1UR+v3b41f+H1A5972z3R64d3k2FniRw==` |
+| Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.2.0.tgz"` |
 
-This revision carries the mutation contract the plugin reports against: `RemoteChangeHint.mutationId`
-(the gateway's writer idempotency key) and the `RemoteChange[]` hint the `/dirty` route accepts. It is
-the same source the Vault's `packages/sync-core` publishes, so the plugin and the backend cannot drift
-apart on the wire.
+This revision carries the mutation contract the plugin reports against (`RemoteChangeHint.mutationId`
+and the `RemoteChange[]` hint `/dirty` accepts) **and** the hot-sync protocol: `hot-protocol`
+(document identity, path binding, operation envelopes, acknowledgements, checkpoint receipts,
+acquisition, cold-mutation authority, session tickets), `namespace-protocol` (create/delete/rename),
+`tombstones` and `paths`. The tombstone derivation moved here so the plugin and the Vault compute the
+same key for the same deletion — a second implementation would be a silent correctness bug.
 
 ## Rebuilding this artifact
 
@@ -48,3 +50,4 @@ Only compiled output (`dist/*.js`, `dist/*.d.ts`) is vendored. The package sourc
 into this repository — there is exactly one source of truth, in the backend repo. This is a
 transitional distribution mechanism: once a package registry is available, the dependency should
 become a fixed semver version and this directory should be deleted.
+

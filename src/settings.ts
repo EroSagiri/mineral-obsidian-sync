@@ -8,17 +8,27 @@ export interface R2SyncSettings extends R2Configuration, GatewaySettings, Mutati
   debugLogging: boolean;
   ignoredPaths: string[];
   integrityReconcileIntervalMinutes: number;
+  /** This device's hot-session identity; minted once, never shown to the user. */
+  hotClientId: string;
+  /**
+   * Hot (realtime) collaboration, opt-in.
+   *
+   * It is off by default even when the Gateway is configured, because it changes the *authority* over a
+   * file while that file is open: the server checkpoints it and the cold path is fenced. A device that
+   * only wanted the wake-up channel must not acquire that silently.
+   */
+  hotSyncEnabled: boolean;
 }
 export const DEFAULT_SETTINGS: R2SyncSettings = {
   ...DEFAULT_GATEWAY_SETTINGS, ...DEFAULT_MUTATION_INGRESS_SETTINGS,
   endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "",
-  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20,
+  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20, hotSyncEnabled: false, hotClientId: "",
 };
 
 export class R2SyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: R2PersonalSyncPlugin) { super(app, plugin); }
   display(): void {
-    const { containerEl } = this; containerEl.empty(); containerEl.createEl("h2", { text: "Mineral Sync — Phase 1.5" });
+    const { containerEl } = this; containerEl.empty(); containerEl.createEl("h2", { text: `Mineral Sync v${this.plugin.manifest.version}` });
     containerEl.createEl("p", { text: "Credentials use Obsidian's normal local plugin settings storage; this plugin does not encrypt them." });
     const text = (name: string, description: string, key: keyof R2SyncSettings, secret = false) => {
       new Setting(containerEl).setName(name).setDesc(description).addText((input) => {
@@ -46,6 +56,10 @@ export class R2SyncSettingTab extends PluginSettingTab {
     text("Gateway endpoint", "Example: https://mineral-sync-gateway.<subdomain>.workers.dev", "gatewayEndpoint");
     text("Gateway token", "The Gateway bearer secret. Stored locally; never logged and never placed in a URL.", "gatewayToken", true);
     new Setting(containerEl).setName("Gateway status").setDesc(this.plugin.gatewayStatusText());
+    containerEl.createEl("h3", { text: "热同步（实时协作）" });
+    containerEl.createEl("p", { text: "打开一个 Markdown 文件时，本机与服务器建立 CRDT 会话：编辑实时互相可见，R2 由服务器按 2 秒静默 / 10 秒上限的节奏保存。会话期间该路径的冷同步会让路；关闭文件并完成交接后才恢复。未开启时行为与只配置 Gateway 时完全相同。" });
+    new Setting(containerEl).setName("启用热同步").setDesc("关闭时不建立任何热会话，冷同步行为不变。需要 Gateway 已启用且配置正确。").addToggle((toggle) => toggle.setValue(this.plugin.settings.hotSyncEnabled).onChange(async (value) => { this.plugin.settings.hotSyncEnabled = value; await this.plugin.saveSettings(); await this.plugin.refreshHotSync(); }));
+    new Setting(containerEl).setName("热同步状态").setDesc(this.plugin.hotSyncStatusText());
     containerEl.createEl("h3", { text: "Mutation journal (remote writes this device made)" });
     containerEl.createEl("p", { text: "Optional. After an R2 write lands, this device reports the fact — the exact path and revision — to the Sync Gateway, which relays it to the Vault for verification against R2 and journals it. Nothing else is configured here: the report goes to the Gateway endpoint above, over the channel derived from the R2 identity. It never changes a sync outcome — the write is already durable, so a failure only defers the report." });
     new Setting(containerEl).setName("Report landed writes").setDesc("When off, nothing is reported and the Gateway wake-up is the only notification. When on, this device stops sending its own wake-up: the journal's publisher becomes the only announcer for its writes.").addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.mutationIngressEnabled)).onChange(async (value) => { this.plugin.settings.mutationIngressEnabled = value; await this.plugin.saveSettings(); }));
@@ -59,3 +73,5 @@ export class R2SyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Inspect Sync State").setDesc("Scans metadata, safely verifies ambiguous equal-size pairs, and records only verified-identical initial baselines. It never writes local files or R2 objects.").addButton((button) => button.setButtonText("Inspect").setCta().onClick(async () => this.plugin.inspectSyncState()));
   }
 }
+
+

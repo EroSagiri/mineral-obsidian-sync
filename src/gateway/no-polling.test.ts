@@ -69,10 +69,14 @@ describe("no desktop remote polling", () => {
     }
   });
 
-  it("does not mention forbidden future features in production sources", () => {
+  it("does not grow a server or a remote-event notifier of its own", () => {
+    // This list used to include LiveDocumentRoom and CRDT, because hot realtime was explicitly out of
+    // scope when the audit was written. It is an implemented feature now (`src/hot`), so what stays
+    // forbidden is what would make the *plugin* a server or a second control plane: its own WebSocket
+    // server, or remote event notifications it would have to poll for.
     for (const path of files) {
       const text = readFileSync(path, "utf8");
-      for (const forbidden of ["LiveDocumentRoom", "CRDT", "EventNotification", "new WebSocketServer"]) {
+      for (const forbidden of ["new WebSocketServer", "EventNotification"]) {
         expect(text, `${path} mentions ${forbidden}`).not.toContain(forbidden);
       }
     }

@@ -8,7 +8,7 @@ import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_ICON, type SyncStatusI
  * icon, five tones, and an explicit priority order. Nothing in this file touches the sync engine.
  */
 
-const counts = (overrides: Partial<ResultCounts> = {}): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, ...overrides });
+const counts = (overrides: Partial<ResultCounts> = {}): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, deferred: 0, ...overrides });
 const input = (overrides: Partial<SyncStatusInput> = {}): SyncStatusInput => ({ state: "idle", counts: counts(), conflictCount: 0, ...overrides });
 
 const render = (value: SyncStatusInput): FakeElement => {
@@ -17,6 +17,64 @@ const render = (value: SyncStatusInput): FakeElement => {
   return host;
 };
 const status = (host: FakeElement): FakeElement => host.find((element) => element.classes.has("mineral-sync-status"))!;
+
+describe("hot sync states in the status bar", () => {
+  const hot = (overrides: Partial<NonNullable<SyncStatusInput["hot"]>> = {}) => ({
+    status: "hot" as const,
+    pendingSave: false,
+    handoffPending: 0,
+    conflicts: 0,
+    ...overrides,
+  });
+
+  it("says the same thing it always did when hot sync is off", () => {
+    // The feature is additive: an absent hot input must not change a single presentation field.
+    expect(presentSyncStatus(input())).toEqual(presentSyncStatus(input({ hot: undefined })));
+    expect(presentSyncStatus(input()).tooltip).toBe("Mineral Sync\nUp to date");
+  });
+
+  it("distinguishes a connected session from a plain cold idle", () => {
+    const presentation = presentSyncStatus(input({ hot: hot() }));
+    expect(presentation.tone).toBe("idle");
+    expect(presentation.tooltip).toContain("Hot sync connected");
+  });
+
+  it("shows a pending save as syncing, not as up to date", () => {
+    const presentation = presentSyncStatus(input({ hot: hot({ pendingSave: true }) }));
+    expect(presentation.tone).toBe("syncing");
+    expect(presentation.spinning).toBe(true);
+    expect(presentation.tooltip).toContain("Saving to R2");
+  });
+
+  it("shows joining a session and a disconnected session differently", () => {
+    expect(presentSyncStatus(input({ hot: hot({ status: "connecting" }) })).tooltip).toContain("Joining the hot session");
+    const disconnected = presentSyncStatus(input({ hot: hot({ status: "disconnected" }) }));
+    expect(disconnected.tone).toBe("offline");
+    expect(disconnected.tooltip).toContain("kept locally");
+  });
+
+  it("shows a pending handoff as a blocker with its count", () => {
+    const presentation = presentSyncStatus(input({ hot: hot({ status: "idle", handoffPending: 2 }) }));
+    expect(presentation.tone).toBe("waiting");
+    expect(presentation.badge).toBe("2");
+    expect(presentation.tooltip).toContain("will not be cold-synced");
+  });
+
+  it("shows a hot conflict as needing attention, and never as the cold resolver's conflict", () => {
+    const presentation = presentSyncStatus(input({ hot: hot({ status: "conflict" }) }));
+    expect(presentation.tone).toBe("conflict");
+    expect(presentation.badge).toBe("!");
+    // The cold resolver cannot settle a hot conflict, so the click must open the hot one instead.
+    expect(presentation.action).toBe("resolve-hot-conflicts");
+    expect(presentation.tooltip).toContain("nothing was overwritten");
+  });
+
+  it("keeps a transport problem above a hot state", () => {
+    // An unreachable R2 affects every file; a hot session affects one.
+    const presentation = presentSyncStatus(input({ counts: counts({ unresolved: 1 }), hot: hot({ pendingSave: true }) }));
+    expect(presentation.tone).toBe("offline");
+  });
+});
 
 describe("sync status mapping", () => {
   it("shows idle as a still, muted icon and no readable status text", () => {
@@ -131,3 +189,5 @@ describe("sync status mapping", () => {
     expect(SYNC_STATUS_CSS).toContain("var(--text-muted)");
   });
 });
+
+

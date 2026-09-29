@@ -28,6 +28,88 @@ function setup(capture: () => CycleDependencies, debug?: (message: string) => vo
 }
 
 describe("SyncScheduler", () => {
+  it("defers an operation whose path a hot session owns, without executing it", async () => {
+    // The fence is asked at the mutation boundary: a plan may be built while a path is cold and reach
+    // the executor after it became hot, and that window is the whole reason the check is here.
+    const executed: string[] = [];
+    const deferred: string[] = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => ({ ...base([upload("hot.md"), upload("cold.md")], async (operation) => { executed.push(operation.key); return { status: "applied", key: operation.key }; }) }),
+      visible: () => true,
+      timers,
+      hotDeferral: { isFenced: (key) => key === "hot.md", noteDeferred: (key) => void deferred.push(key) },
+    });
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    expect(executed).toEqual(["cold.md"]);
+    expect(deferred).toEqual(["hot.md"]);
+    expect(scheduler.diagnostics().lastResultCounts.deferred).toBe(1);
+    expect(scheduler.diagnostics().lastResultCounts.applied).toBe(1);
+  });
+
+  it("asks the Gateway for cold authority and releases it only after the mutation", async () => {
+    const events: string[] = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => ({ ...base([upload("shared.md")], async (operation) => { events.push("execute"); return { status: "applied", key: operation.key }; }) }),
+      visible: () => true,
+      timers,
+      hotAuthority: {
+        authorize: async (key) => { events.push(`authorize:${key}`); return "granted"; },
+        settle: async (key) => { events.push(`settle:${key}`); },
+      },
+    });
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    expect(events).toEqual(["authorize:shared.md", "execute", "settle:shared.md"]);
+  });
+
+  it("proceeds when the authority cannot be asked, and defers when it answers no", async () => {
+    const executed: string[] = [];
+    const run = async (verdict: "unreachable" | "deferred") => {
+      const timers = new FakeTimers();
+      const scheduler = new SyncScheduler({
+        captureCycle: () => ({ ...base([upload("shared.md")], async (operation) => { executed.push(operation.key); return { status: "applied", key: operation.key }; }) }),
+        visible: () => true,
+        timers,
+        hotAuthority: { authorize: async () => verdict, settle: async () => {} },
+      });
+      scheduler.requestReconcile("manual");
+      timers.fire(0);
+      await flush();
+      return scheduler.diagnostics().lastResultCounts;
+    };
+    // An unreachable control plane may not stop R2 sync.
+    expect((await run("unreachable")).applied).toBe(1);
+    // An answered "no" is a decision, and a decision is obeyed.
+    expect((await run("deferred")).deferred).toBe(1);
+    expect(executed).toEqual(["shared.md"]);
+  });
+
+  it("keeps a deferred hot path out of the failure classes", async () => {
+    // Deferral is a deterministic conclusion like a blocked delete: it must not look like a failure and
+    // must not look like an unresolved write, or the generation cursor would never advance.
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => base([upload("hot.md")], async (operation) => ({ status: "applied", key: operation.key })),
+      visible: () => true,
+      timers,
+      hotDeferral: { isFenced: () => true, noteDeferred: () => {} },
+    });
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    const counts = scheduler.diagnostics().lastResultCounts;
+    expect(counts.deferred).toBe(1);
+    expect(counts.failed).toBe(0);
+    expect(counts.unresolved).toBe(0);
+    expect(counts.stale).toBe(0);
+    expect(scheduler.diagnostics().lastFailureClass).toBeUndefined();
+  });
+
   it("uses one trailing global debounce for repeated and burst local events", async () => {
     let cycles = 0; const { scheduler, timers } = setup(() => { cycles++; return base([]); });
     scheduler.markLocalPaths(["a.md"], () => false); scheduler.markLocalPaths(["a.md"], () => false);
