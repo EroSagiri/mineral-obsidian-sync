@@ -476,8 +476,9 @@ describe("hot ownership from the cold path's point of view", () => {
     expect(flagged).toEqual([]);
 
     // Someone else writes the file while the buffer is quiet: that is the case the rule exists for.
+    // The new bytes match neither the buffer nor any snapshot this plugin owns, so the external write is
+    // surfaced without any time-based grace window.
     disk = "something else wrote this file";
-    (env.plugin as unknown as { hotLastEditAt: Map<string, number> }).hotLastEditAt.set("note.md", Date.now() - 60_000);
     await env.plugin.markUnlessOwnEditorWrite("note.md");
 
     // The external edit is surfaced and *not* registered as a cold change: the path stays hot-owned.
@@ -502,8 +503,10 @@ describe("hot ownership from the cold path's point of view", () => {
 
     await env.plugin.markUnlessOwnEditorWrite("note.md");
     // The autosave of what the user had typed lands, and one more character is already in the buffer.
+    // Simulate the editor-change handler recording the intermediate buffer state ("typed a") before the
+    // second write, exactly as the live plugin would.
+    (env.plugin as unknown as { hotRecentBuffers: Map<string, { text: string; at: number }[]> }).hotRecentBuffers.set("note.md", [{ text: "typed a", at: Date.now() }]);
     disk = "typed a";
-    (env.plugin as unknown as { hotLastEditAt: Map<string, number> }).hotLastEditAt.set("note.md", Date.now());
     await env.plugin.markUnlessOwnEditorWrite("note.md");
 
     expect(flagged).toEqual([]);

@@ -211,7 +211,16 @@ export class HotSyncCoordinator implements HotPathFence {
           this.deps.debug?.("hot local update dropped: the session is not registered yet");
           return;
         }
-        void session.applyLocalUpdate(update, operationId);
+        /**
+         * The contract is "persist before send" — so the durability of an edit must not depend on the
+         * caller awaiting it. Surfacing the error keeps a failed outbox write from looking like a
+         * successful keystroke: a transient IndexedDB failure ends up at the diagnostic log instead of
+         * silently leaving the Y.Doc ahead of the durable record. The session's own catch around
+         * `putOutbox` is what protects against the inverse direction.
+         */
+        session.applyLocalUpdate(update, operationId).catch(error => {
+          this.deps.debug?.(`hot outbox write failed: ${error instanceof Error ? error.message : "unknown"}`);
+        });
       },
       debug: this.deps.debug,
     });

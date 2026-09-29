@@ -45,7 +45,13 @@ class FakeDocument implements HotDocumentPort {
   text(): string { return this.content; }
 }
 
-function harness(options: { release?: (body: Record<string, unknown>) => { status: number; text: string }; acquireBody?: Record<string, unknown> } = {}) {
+function harness(options: {
+  release?: (body: Record<string, unknown>) => { status: number; text: string };
+  acquireBody?: Record<string, unknown>;
+  storeFault?: unknown;
+  reconnectInitialDelayMs?: number;
+  reconnectMaxDelayMs?: number;
+} = {}) {
   const requests: HotHttpRequest[] = [];
   const sockets: FakeSocket[] = [];
   const transport = async (request: HotHttpRequest): Promise<HotHttpResponse> => {
@@ -82,9 +88,11 @@ function harness(options: { release?: (body: Record<string, unknown>) => { statu
     },
   );
   const store = new MemoryHotStateStore();
+  store.putOutboxFault = options.storeFault ?? null;
   const doc = new FakeDocument();
   const statuses: HotSessionStatus[] = [];
   const conflicts: string[] = [];
+  let reconnectId = 0;
   const session = new HotDocumentSession({
     client,
     store,
@@ -95,6 +103,12 @@ function harness(options: { release?: (body: Record<string, unknown>) => { statu
     receiptTimeoutMs: 60,
     drainTimeoutMs: 200,
     drainStepMs: 5,
+    ...(options.reconnectInitialDelayMs !== undefined ? { reconnectInitialDelayMs: options.reconnectInitialDelayMs } : {}),
+    ...(options.reconnectMaxDelayMs !== undefined ? { reconnectMaxDelayMs: options.reconnectMaxDelayMs } : {}),
+    nextReconnectOperationId: () => {
+      reconnectId += 1;
+      return `reconnect-${reconnectId}`;
+    },
   });
   return { session, store, doc, sockets, requests, statuses, conflicts };
 }
@@ -174,6 +188,155 @@ describe("hot session durability", () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(restored.sockets[0].frames().some(frame => frame.type === "operation" && frame.clientOperationId === "op-1")).toBe(true);
     expect((await restored.store.loadOutbox()).map(entry => entry.key)).toEqual([outboxKey(DOCUMENT, 1, "op-1")]);
+  });
+
+  it("keeps the outbox row when a non-fatal reject lands, so the next resume replays the edit", async () => {
+    /**
+     * `too-large` is a verdict on the *packet*, not on the document identity. The edit still belongs
+     * to the user, the Y.Doc has already absorbed it, and dropping the row here would leave the local
+     * CRDT ahead of the server forever — exactly the silent fork the mobile rollout exposed.
+     */
+    const { session, sockets, store } = harness();
+    await session.start({ local: null, operationId: "acquire-1" });
+    sockets[0].emit(welcomeFrame);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await session.applyLocalUpdate(encodeHotPayload(new Uint8Array([1])), "op-1");
+    await session.handleFrame({ protocol: 1, type: "reject", documentId: DOCUMENT, epoch: 1, clientOperationId: "op-1", reason: "too-large" } as never);
+
+    expect(session.pending().map(entry => entry.clientOperationId)).toEqual(["op-1"]);
+    expect((await store.loadOutbox()).map(entry => entry.clientOperationId)).toEqual(["op-1"]);
+    expect(session.status).toBe("hot");
+  });
+
+  it("rolls back the in-memory outbox when the durable write fails and surfaces the error", async () => {
+    /**
+     * The contract is "persist before send". A throw from `putOutbox` previously left the entry in the
+     * map and silently failed the whole plugin: a transient IndexedDB hiccup sent a message the server
+     * never saw, and the next `flush` re-sent it from a row whose durable half was missing.
+     */
+    const { session, sockets } = harness({ storeFault: new Error("indexeddb-unavailable") });
+
+    await session.start({ local: null, operationId: "acquire-1" });
+    sockets[0].emit(welcomeFrame);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    await expect(session.applyLocalUpdate(encodeHotPayload(new Uint8Array([1])), "op-1")).rejects.toThrow("indexeddb-unavailable");
+    expect(session.pending()).toHaveLength(0);
+  });
+
+  it("reconnects after the socket drops unexpectedly and replays pending work", async () => {
+    /**
+     * The earlier behaviour marked the session `disconnected` and stopped there. A subsequent
+     * `open()` saw the existing record and returned without re-acquiring, so every local edit from
+     * then on stayed in the Y.Doc and outbox without ever reaching the room — and the handoff that
+     * eventually fired was doomed for a reason that looked like "this device contributed nothing".
+     * Reconnect must invoke `resume()` and bring the outbox with it.
+     */
+    const harnessOptions = {
+      reconnectInitialDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+    };
+    const { session, sockets, store } = harness(harnessOptions);
+
+    await session.start({ local: null, operationId: "acquire-1" });
+    sockets[0].emit(welcomeFrame);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await session.applyLocalUpdate(encodeHotPayload(new Uint8Array([1])), "op-1");
+
+    // The first socket dies without an explicit close.
+    sockets[0].close();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(session.status).toBe("disconnected");
+
+    // Reconnect fires, opens a second socket, receives a fresh welcome.
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(sockets).toHaveLength(2);
+    sockets[1].emit(welcomeFrame);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(session.status).toBe("hot");
+    // The pending edit was replayed on the new socket.
+    expect(sockets[1].frames().some(frame => frame.type === "operation" && frame.clientOperationId === "op-1")).toBe(true);
+    expect((await store.loadOutbox()).map(entry => entry.clientOperationId)).toEqual(["op-1"]);
+  });
+
+  it("gives up reconnecting when the server answers with a verdict instead of a socket", async () => {
+    /**
+     * The reconnect loop is for *transport* failure: the server refusing with a conflict or rejection
+     * is the room's verdict and must end the loop, not be retried forever. A session whose first
+     * acquire returned a normal "created" outcome and whose second (reconnect) acquire returned a
+     * conflict must therefore not open a third socket — the verdict is final for now and the user-
+     * facing conflict machinery takes over.
+     */
+    let acquireCount = 0;
+    const requests: HotHttpRequest[] = [];
+    const sockets: FakeSocket[] = [];
+    const transport = async (request: HotHttpRequest): Promise<HotHttpResponse> => {
+      requests.push(request);
+      if (request.url.endsWith("/hot/acquire")) {
+        acquireCount += 1;
+        const body = acquireCount === 1 ? {
+          protocol: 1,
+          outcome: "created",
+          canonicalPath: PATH,
+          binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 },
+          remote: null,
+          identity: { documentId: DOCUMENT, epoch: 1 },
+          serverRevision: 0,
+          latestCheckpointedRevision: 0,
+          roomState: "active",
+          sessionTicket: "ticket-1",
+        } : {
+          protocol: 1,
+          outcome: "conflict",
+          canonicalPath: PATH,
+          binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "conflicted", updatedAt: 1 },
+          remote: null,
+          reason: "local-remote-mismatch",
+          serverRevision: 0,
+          latestCheckpointedRevision: 0,
+          roomState: "conflicted",
+        };
+        return { status: 200, text: JSON.stringify(body) };
+      }
+      return { status: 200, text: "{}" };
+    };
+    const client = new HotGatewayClient(
+      { endpoint: "https://gateway.test", token: "token", channel: CHANNEL },
+      transport,
+      () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    );
+    const store = new MemoryHotStateStore();
+    const doc = new FakeDocument();
+    const session = new HotDocumentSession({
+      client,
+      store,
+      doc,
+      clientId: "device-a",
+      canonicalPath: PATH,
+      receiptTimeoutMs: 60,
+      drainTimeoutMs: 200,
+      drainStepMs: 5,
+      reconnectInitialDelayMs: 5,
+      reconnectMaxDelayMs: 5,
+      nextReconnectOperationId: () => "reconnect-1",
+    });
+
+    await session.start({ local: null, operationId: "acquire-1" });
+    expect(sockets).toHaveLength(1);
+    // The first socket drops without an explicit close, triggering the reconnect loop.
+    sockets[0].close();
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    // The reconnect loop made exactly one follow-up acquire that the server answered with conflict;
+    // because the verdict is final, no new socket was opened (connect is skipped on conflict) and no
+    // third acquire was attempted.
+    expect(sockets).toHaveLength(1);
+    expect(session.status).toBe("conflict");
+    expect(acquireCount).toBe(2);
   });
 });
 

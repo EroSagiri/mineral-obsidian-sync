@@ -55,6 +55,12 @@ export interface HotSessionDependencies {
   releaseAttempts?: number;
   /** How long a close waits between release attempts. */
   releaseRetryDelayMs?: number;
+  /** Initial delay before the first reconnect attempt after the socket closes unexpectedly. */
+  reconnectInitialDelayMs?: number;
+  /** Cap on the reconnect backoff so a long-lived session does not wait hours between attempts. */
+  reconnectMaxDelayMs?: number;
+  /** Generate the operation id used by `resume()` on each reconnect attempt; tests inject a counter. */
+  nextReconnectOperationId?: () => string;
 }
 
 export type HotCloseOutcome = {
@@ -76,6 +82,8 @@ type ReceiptWaiter = {
 
 const DEFAULT_RECEIPT_TIMEOUT_MS = 15_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 8_000;
+const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
+const DEFAULT_RECONNECT_MAX_DELAY_MS = 15_000;
 
 export class HotDocumentSession {
   private record: HotSessionRecord | null = null;
@@ -84,6 +92,11 @@ export class HotDocumentSession {
   private waiters: ReceiptWaiter[] = [];
   /** The most recent receipt this session saw, so a close can confirm a save it did not request. */
   private lastReceipt: CheckpointReceipt | null = null;
+  /** A timer for the next reconnect attempt; null when not waiting. */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The current backoff for the reconnect loop. Reset to the initial delay on a successful resume. */
+  private reconnectDelay: number;
+  private reconnectAttempts = 0;
   private readonly events: HotSessionEvents;
   private readonly now: () => number;
   private readonly receiptTimeoutMs: number;
@@ -91,6 +104,9 @@ export class HotDocumentSession {
   private readonly drainStepMs: number;
   private readonly releaseAttempts: number;
   private readonly releaseRetryDelayMs: number;
+  private readonly reconnectInitialDelayMs: number;
+  private readonly reconnectMaxDelayMs: number;
+  private readonly nextReconnectOperationId: () => string;
 
   constructor(private readonly deps: HotSessionDependencies) {
     this.events = deps.events ?? {};
@@ -100,6 +116,14 @@ export class HotDocumentSession {
     this.drainStepMs = deps.drainStepMs ?? 100;
     this.releaseAttempts = deps.releaseAttempts ?? 4;
     this.releaseRetryDelayMs = deps.releaseRetryDelayMs ?? 250;
+    this.reconnectInitialDelayMs = deps.reconnectInitialDelayMs ?? DEFAULT_RECONNECT_INITIAL_DELAY_MS;
+    this.reconnectMaxDelayMs = deps.reconnectMaxDelayMs ?? DEFAULT_RECONNECT_MAX_DELAY_MS;
+    this.reconnectDelay = this.reconnectInitialDelayMs;
+    let reconnectCounter = 0;
+    this.nextReconnectOperationId = deps.nextReconnectOperationId ?? (() => {
+      reconnectCounter += 1;
+      return `reconnect-${this.now().toString(36)}-${reconnectCounter.toString(36)}`;
+    });
   }
 
   get path(): string {
@@ -240,13 +264,71 @@ export class HotDocumentSession {
     const socket = this.deps.client.connect(ticket);
     this.socket = socket;
     socket.onMessage(data => void this.onMessage(data));
-    socket.onClose(() => {
-      if (this.socket !== socket) return;
-      this.socket = null;
-      const status = this.record?.status;
-      if (status === "closed" || status === "handoff-pending" || status === "conflict") return;
-      void this.persist("disconnected");
-    });
+    socket.onClose(() => this.onSocketClosed(socket));
+  }
+
+  /**
+   * Handles an unexpected socket close.
+   *
+   * A close that arrives while the session is still supposed to be live — i.e. before a deliberate
+   * `close()` / `abandon()` / `release()` — must reconnect; otherwise local edits accumulate in the
+   * outbox, no remote updates land, and the next visible handoff fails for a reason that looks like
+   * "this device never contributed anything" but is really "the socket died and nobody noticed".
+   *
+   * A successful `resume()` resets the backoff so a stable link is not punished for an early blip; a
+   * failed attempt doubles the delay up to the cap, so the loop does not busy-loop a dead gateway.
+   */
+  private onSocketClosed(socket: HotSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    const record = this.record;
+    if (!record) return;
+    if (record.status === "closed" || record.status === "handoff-pending" || record.status === "conflict") return;
+    void this.persist("disconnected").then(() => this.scheduleReconnect());
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== null) return;
+    const record = this.record;
+    if (!record) return;
+    if (record.status === "closed" || record.status === "handoff-pending" || record.status === "conflict") return;
+    const delay = this.reconnectDelay;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.performReconnect();
+    }, delay);
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer === null) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private async performReconnect(): Promise<void> {
+    const record = this.record;
+    if (!record) return;
+    if (record.status === "closed" || record.status === "handoff-pending" || record.status === "conflict") return;
+    this.reconnectAttempts += 1;
+    try {
+      const result = await this.resume(this.nextReconnectOperationId());
+      if (result.outcome === "joined" || result.outcome === "created") {
+        // A live socket means the loop is over. The next unexpected close starts backoff again from
+        // the floor — a single failed handshake should not be remembered across hours of editing.
+        this.reconnectDelay = this.reconnectInitialDelayMs;
+        this.reconnectAttempts = 0;
+        return;
+      }
+      // The server refused with a verdict (conflict / rejected); the room is the authority and the
+      // session has already been told. Stop the loop; the user-facing conflict machinery takes over.
+      this.debug(`hot reconnect gave up: ${result.outcome}${result.reason ? "/" + result.reason : ""}`);
+      this.cancelReconnect();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "unknown";
+      this.debug(`hot reconnect attempt ${this.reconnectAttempts} failed: ${detail}`);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.reconnectMaxDelayMs);
+      this.scheduleReconnect();
+    }
   }
 
   /** Drives one server frame. Exposed so the state machine can be tested without a socket. */
@@ -290,10 +372,33 @@ export class HotDocumentSession {
       }
       case "reject": {
         this.debug(`hot operation rejected reason=${frame.reason}`);
-        for (const [key, entry] of this.outbox) {
-          if (entry.clientOperationId === frame.clientOperationId) this.outbox.delete(key);
+        /**
+         * The outbox row's fate depends on the verdict, not on the rejection itself.
+         *
+         * `stale-epoch`, `unauthorized`, and `unknown-document` mean *this device's* document identity is
+         * wrong now: the room has moved on or no longer recognises this client, and replaying the edit
+         * would silently diverge the local Y.Doc from whatever the server actually holds. Dropping the
+         * row and surfacing the verdict is honest. So is `quiescing` — the room is handing off and will
+         * reject anything we send for a moment, which a close+drain already covers.
+         *
+         * Everything else (`too-large`, transient `overloaded`, a rate-limit `retry`) is a verdict on
+         * the *packet*, not on the document. The edit itself still belongs to this user, the Y.Doc has
+         * already absorbed it, and the cold path's handoff verification will catch a row that never
+         * lands. Removing the row here is what produced the silent permanent fork in the field: the
+         * document kept the keystrokes, the server never did, and the next editor-change found nothing
+         * to push.
+         */
+        const fatal = frame.reason === "stale-epoch" || frame.reason === "unauthorized" || frame.reason === "unknown-document" || frame.reason === "quiescing";
+        if (fatal) {
+          for (const [key, entry] of this.outbox) {
+            if (entry.clientOperationId === frame.clientOperationId) this.outbox.delete(key);
+          }
+          await this.deps.store.deleteOutbox(outboxKey(frame.documentId, frame.epoch, frame.clientOperationId));
+        } else {
+          // Reset the attempt counter so a previously-failed send is retried with the backoff that the
+          // send loop already owns; the row stays put until an `ack` arrives or a fatal verdict lands.
+          this.debug(`hot operation kept in outbox after non-fatal reject reason=${frame.reason}`);
         }
-        await this.deps.store.deleteOutbox(outboxKey(frame.documentId, frame.epoch, frame.clientOperationId));
         if (frame.reason === "stale-epoch") {
           this.events.onConflict?.("stale-epoch");
           await this.persist("conflict", "stale-epoch");
@@ -388,7 +493,9 @@ export class HotDocumentSession {
    * Persists one local edit and sends it.
    *
    * The outbox row is written first and deleted only on the acknowledgement, so the durable record
-   * always contains exactly what the server has not confirmed.
+   * always contains exactly what the server has not confirmed. If the durable write throws, the in-memory
+   * row is rolled back and the error is re-thrown: a caller that drops the promise would lose the edit
+   * outright, since `sendOperation` only sees what is in the map.
    */
   async applyLocalUpdate(update: string, clientOperationId: string): Promise<void> {
     const record = this.record;
@@ -405,7 +512,12 @@ export class HotDocumentSession {
       attempts: 0,
     };
     this.outbox.set(entry.key, entry);
-    await this.deps.store.putOutbox(entry);
+    try {
+      await this.deps.store.putOutbox(entry);
+    } catch (error) {
+      this.outbox.delete(entry.key);
+      throw error;
+    }
     this.sendOperation(entry);
   }
 
@@ -505,6 +617,7 @@ export class HotDocumentSession {
   abandon(): void {
     const socket = this.socket;
     this.socket = null;
+    this.cancelReconnect();
     if (socket) {
       try { socket.close(1000, "abandoned"); } catch { /* already closing */ }
     }
@@ -513,6 +626,8 @@ export class HotDocumentSession {
   async close(input: { checkpoint: boolean; localText: string; operationId: string }): Promise<HotCloseOutcome> {
     const record = this.record;
     if (!record) return { outcome: "not-hot" };
+    // The close is intentional; the reconnect loop must not resurrect the socket on the way out.
+    this.cancelReconnect();
     await this.drain();
     const current = this.record;
     if (!current) return { outcome: "not-hot" };

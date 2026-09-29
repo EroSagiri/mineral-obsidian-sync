@@ -83,13 +83,18 @@ export class MemoryHotStateStore implements HotStateStore {
   private sessions = new Map<string, HotSessionRecord>();
   private outbox = new Map<string, HotOutboxEntry>();
   private handoffs = new Map<string, HotHandoffRecord>();
+  /** Optional injection point for tests: when set, `putOutbox` rejects with this error. */
+  putOutboxFault: unknown = null;
 
   async loadSessions(): Promise<HotSessionRecord[]> { return [...this.sessions.values()]; }
   async putSession(record: HotSessionRecord): Promise<void> { this.sessions.set(record.canonicalPath, { ...record }); }
   async deleteSession(canonicalPath: string): Promise<void> { this.sessions.delete(canonicalPath); }
 
   async loadOutbox(): Promise<HotOutboxEntry[]> { return [...this.outbox.values()]; }
-  async putOutbox(entry: HotOutboxEntry): Promise<void> { this.outbox.set(entry.key, { ...entry }); }
+  async putOutbox(entry: HotOutboxEntry): Promise<void> {
+    if (this.putOutboxFault) throw this.putOutboxFault;
+    this.outbox.set(entry.key, { ...entry });
+  }
   async deleteOutbox(key: string): Promise<void> { this.outbox.delete(key); }
 
   async loadHandoffs(): Promise<HotHandoffRecord[]> { return [...this.handoffs.values()]; }

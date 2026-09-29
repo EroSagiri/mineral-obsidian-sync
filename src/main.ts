@@ -53,7 +53,10 @@ type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, R
 
 const ANDROID_LOCAL_DRIFT_INTERVAL_MS = 15_000;
 const ANDROID_EDITOR_SAVE_DEBOUNCE_MS = 500;
-const HOT_EXTERNAL_EDIT_GRACE_MS = 5_000;
+/** How long a buffer snapshot is kept for content-based external-edit identification. */
+const HOT_BUFFER_SNAPSHOT_RETENTION_MS = 10_000;
+/** Hard cap on the snapshot count per path so an idle session cannot grow unbounded memory. */
+const HOT_BUFFER_SNAPSHOT_MAX = 8;
 const INTEGRITY_RECONCILE_TICK_MS = 60_000;
 /**
  * Above this many drifted paths the drift is reported as it stands, without consulting the baseline:
@@ -99,8 +102,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly debugRing: string[] = [];
   /** The last disk content this plugin observed per hot path, so an unchanged file never looks external. */
   private readonly hotDiskText = new Map<string, string>();
-  /** When the buffer of a hot path last changed: autosaves land inside this window and are our own. */
-  private readonly hotLastEditAt = new Map<string, number>();
+  /**
+   * Recent buffer snapshots per hot path, kept briefly so a vault event that lands before the latest
+   * keystroke is still recognised as our own autosave rather than as a write from someone else.
+   *
+   * The old rule was a 5 second time window; a delayed autosave could exceed it (false positive) and a
+   * true external write inside it would be swallowed (false negative). Matching on the content identity
+   * of what this plugin last wrote removes both without picking a magic number.
+   */
+  private readonly hotRecentBuffers = new Map<string, { text: string; at: number }[]>();
   private gatewayConfig: GatewayConfigState = { kind: "disabled" };
   private androidLocalSnapshot?: Map<string, LocalEntry>;
   private androidLocalDriftPollRunning = false;
@@ -992,9 +1002,29 @@ export default class R2PersonalSyncPlugin extends Plugin {
     // A deleted folder cannot be reliably distinguished after removal; treating it as dirty is the safe side.
     this.registerEvent(this.app.vault.on("delete", (file) => {
       mark(file.path);
-      // A deleted file has no session to keep: end it, drop any conflict about it, and let the cold path
-      // record the deletion. A conflict about a file that no longer exists cannot be resolved by anyone.
-      if (file instanceof TFile) void this.hotCoordinator?.forget(file.path);
+      if (!(file instanceof TFile)) return;
+      // The hot session, the server binding, the R2 object and the tombstone must all agree that this
+      // file is gone. An earlier version only called `forget()`, which dropped the local record but
+      // never told the room: the binding stayed live, R2 kept the body, and another device could
+      // download the "deleted" content again. The namespace delete is the server's half of the truth;
+      // `forget()` then cleans up whatever the room refused to take.
+      const coordinator = this.hotCoordinator;
+      if (!coordinator) return;
+      void (async () => {
+        const path = file.path;
+        try {
+          const result = await coordinator.delete(path);
+          if (result.outcome !== "applied") {
+            this.debug(`hot delete not applied outcome=${result.outcome} reason=${result.reason ?? "-"} path-digest=${pathDigest(path)}`);
+          }
+        } catch (error) {
+          this.debug(`hot delete failed: ${error instanceof Error ? error.message : "unknown"}`);
+        } finally {
+          // Whatever the server answered, the local session cannot keep owning a path whose file no
+          // longer exists; a conflict about a missing file is a question with no answer.
+          await coordinator.forget(path).catch(() => undefined);
+        }
+      })();
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (file instanceof TFolder) return;
@@ -1054,7 +1084,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // editors when a workspace is restored or a tab moves. The diff is computed from the *bound* editor's
       // value, so without this the keystrokes land in a buffer nobody reads. "Adopt" because the editor that
       // just fired is the one being typed into.
-      this.hotLastEditAt.set(path, Date.now());
+      this.recordHotBufferSnapshot(path, editor.getValue());
       coordinator.rebind(path, editor, "adopt");
       void coordinator.handleEditorChange(path);
     }));
@@ -1123,11 +1153,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
   /**
    * Detects a write to a hot file that did not come from the buffer its session is bound to.
    *
-   * The comparison is against the **editor**, not against the CRDT: while the user is typing, the file
-   * on disk is legitimately behind the buffer for a moment, so comparing with the document would raise a
-   * conflict on every ordinary save. Disk versus buffer is the distinction that matters — anything else
-   * wrote this file underneath the editor, and the first version must surface that rather than let the
-   * next save overwrite it silently (the design's external-modification rule).
+   * Identification is *content-based*, not time-based. The vault modify handler fires for both Obsidian's
+   * own autosaves and for any other writer (a sync tool, another plugin, an external editor). The two
+   * cases are told apart by asking "could these bytes be the buffer at some moment this device owns?".
+   *
+   * The plugin keeps a short history of buffer snapshots on every editor-change; a vault event whose
+   * payload matches one of those snapshots is our own autosave even if it landed ten seconds after the
+   * keystroke. A payload that matches none of them — and is not the current buffer either — is external
+   * by definition, regardless of timing.
    *
    * Returns `true` when the modification was classified as external, so the caller stops before it
    * registers an ordinary cold change for the path.
@@ -1143,29 +1176,52 @@ export default class R2PersonalSyncPlugin extends Plugin {
     try { disk = await this.app.vault.adapter.read(path); }
     catch { return false; }
 
-    /**
-     * Obsidian writes the buffer to disk **itself**, whenever it feels like it, and this hook runs on that
-     * write like any other. So "the disk disagrees with the buffer" cannot mean "something else wrote this
-     * file": it is also exactly what an ordinary autosave looks like a moment after the user types one more
-     * character. Treating it as external raised a conflict on every keystroke — resolve, type, conflict
-     * again, forever — which is precisely what a user reported.
-     *
-     * Two cheap signals separate the cases, and both are needed:
-     *
-     * - the disk is compared against what this plugin last *saw* there, so an unchanged file never counts;
-     * - a change is only external when the buffer has been quiet for longer than an autosave takes, because
-     *   while the user is typing the disk is legitimately behind the buffer.
-     */
     const previous = this.hotDiskText.get(path);
     this.hotDiskText.set(path, disk);
     if (previous === undefined || previous === disk) return false;
-    if (disk === view.editor.getValue()) return false;
-    const lastEdit = this.hotLastEditAt.get(path) ?? 0;
-    if (Date.now() - lastEdit < HOT_EXTERNAL_EDIT_GRACE_MS) return false;
+    const buffer = view.editor.getValue();
+    // The disk is exactly what the buffer shows: this is an autosave that caught up (or no change at
+    // all, in the rare case the autosave reported the same bytes twice). Either way it is ours.
+    if (disk === buffer) return false;
+    // The disk matches one of the recent buffer snapshots: this plugin wrote it. Obsidian's autosave
+    // can land arbitrarily later than the keystroke (network, suspend, large file) — the snapshot
+    // window is what makes "late" writes still attributable to us.
+    if (this.isRecentHotBuffer(path, disk)) return false;
 
     if (!coordinator.flagExternalEdit(path)) return true;
     new Notice(`Mineral Sync：${path} 在热会话期间被外部修改，该文件的冷同步已暂停以避免覆盖。请确认磁盘内容后再决定保留哪一份。`);
     return true;
+  }
+
+  /**
+   * Records the buffer contents at the moment of an editor-change so a later vault event can be
+   * classified as our own autosave.
+   *
+   * Snapshots are kept in arrival order, deduplicated against their predecessor, and trimmed to a small
+   * window; the goal is "any plausible autosave delay", not "infinite history". The buffer can be a few
+   * megabytes and the vault fires often, so the cap is intentionally bounded.
+   */
+  private recordHotBufferSnapshot(path: string, text: string): void {
+    const history = this.hotRecentBuffers.get(path);
+    const last = history?.at(-1);
+    if (last && last.text === text) {
+      last.at = Date.now();
+      return;
+    }
+    const next = history ? [...history, { text, at: Date.now() }] : [{ text, at: Date.now() }];
+    const trimmed = HOT_BUFFER_SNAPSHOT_RETENTION_MS;
+    const cutoff = Date.now() - trimmed;
+    while (next.length > 1 && next[0].at < cutoff) next.shift();
+    while (next.length > HOT_BUFFER_SNAPSHOT_MAX) next.shift();
+    this.hotRecentBuffers.set(path, next);
+  }
+
+  /** True when the bytes on disk equal one of the recent buffer snapshots this plugin owns. */
+  private isRecentHotBuffer(path: string, text: string): boolean {
+    const history = this.hotRecentBuffers.get(path);
+    if (!history) return false;
+    for (const entry of history) if (entry.text === text) return true;
+    return false;
   }
 
   /** The MarkdownView showing a path, if any. A leaf can change files, so it is resolved on demand. */

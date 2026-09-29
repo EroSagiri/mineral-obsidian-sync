@@ -23,6 +23,15 @@ import type { HotDocumentPort } from "./session";
 export const HOT_EDITOR_ORIGIN = "mineral-hot";
 /** Marks an update that came *from* the server, which this bridge must write into the editor. */
 export const HOT_REMOTE_ORIGIN = "mineral-hot-remote";
+/**
+ * Marks the application of a full CRDT state (a `welcome`).
+ *
+ * The observer must skip this: a welcome lands on an empty Y.Doc and the delta it produces is the entire
+ * document text. Letting it run `applyDeltaToEditor` would re-insert text the editor already shows and is
+ * exactly how the desktop "string-loop" duplicate-content bug appeared after the mobile rollout. The
+ * editor is reconciled explicitly by `applyState`, not by the observer.
+ */
+export const HOT_WELCOME_ORIGIN = "mineral-hot-welcome";
 
 type Delta = Array<{ retain?: number; insert?: string | Uint8Array; delete?: number }>;
 
@@ -225,7 +234,10 @@ export class HotEditorBinding implements HotDocumentPort {
   attach(): void {
     if (this.attached) return;
     this.observer = (event, transaction) => {
-      if (transaction.origin === HOT_EDITOR_ORIGIN) return;
+      // Welcomes and bridge-produced edits never produce editor deltas. The welcome carries the whole
+      // document and would otherwise re-insert text the editor already shows; the local bridge already
+      // wrote whatever change it made, and reading it back would echo as a second operation.
+      if (transaction.origin === HOT_EDITOR_ORIGIN || transaction.origin === HOT_WELCOME_ORIGIN) return;
       this.applyDeltaToEditor(event.delta as Delta);
     };
     this.body.observe(this.observer);
@@ -270,9 +282,28 @@ export class HotEditorBinding implements HotDocumentPort {
   /** The editor this bridge is bound to, for callers that have to place it somewhere else. */
   editorInstance(): Editor { return this.deps.editor; }
 
-  /** Applies a full CRDT state (a `welcome`). */
+  /**
+   * Applies a full CRDT state (a `welcome`) and reconciles the editor with what is now in the document.
+   *
+   * The welcome is the *first* state the room sends, and a desktop pane that already shows the file's
+   * body must not have that body re-inserted: an earlier version applied the welcome's full-text insert
+   * delta on top of an editor that already displayed the same text, which is exactly how the mobile
+   * rollout started duplicating user content on every desktop open. The observer therefore skips this
+   * origin, and this method fills the editor from the document only when the two still differ — never
+   * as a delta.
+   */
   applyState(state: string): void {
+    const before = this.body.toString();
     this.applyEncoded(state, "state");
+    const after = this.body.toString();
+    if (after === before) return;
+    /**
+     * The editor must show what the document holds *after* the welcome, but only when the editor is not
+     * already showing it. A pane that already agrees needs no write at all; rewriting it would also move
+     * the viewport and is the jump-to-the-top that a reader reported. The recorded-write flag then makes
+     * the editor's own change event a no-op so the document does not echo back through `handleEditorChange`.
+     */
+    if (this.deps.editor.getValue() !== after) this.replaceEditorText(after);
   }
 
   /** Applies one remote update. */
@@ -294,8 +325,9 @@ export class HotEditorBinding implements HotDocumentPort {
       this.deps.debug?.(`hot ${what} was not decodable`);
       return;
     }
+    const origin = what === "state" ? HOT_WELCOME_ORIGIN : HOT_REMOTE_ORIGIN;
     try {
-      Y.applyUpdate(this.doc, bytes, HOT_REMOTE_ORIGIN);
+      Y.applyUpdate(this.doc, bytes, origin);
     } catch (error) {
       this.deps.debug?.(`hot ${what} could not be applied: ${error instanceof Error ? error.message : "unknown"}`);
     }
@@ -340,6 +372,21 @@ export class HotEditorBinding implements HotDocumentPort {
     return update.byteLength <= 2 ? null : encodeHotPayload(update);
   }
 
+  /**
+   * Translates a Yjs text delta into editor ranges.
+   *
+   * The deltas describe operations against the document's old text. Each part either:
+   *
+   * - **retain** `n`: skip `n` source characters (the document kept them, so the cursor moves on);
+   * - **insert** `s`: add `s` output characters, consuming **nothing** from the source;
+   * - **delete** `n`: drop `n` source characters, consuming them.
+   *
+   * The earlier version advanced `index` after an insert and forgot to advance after a delete, which
+   * broke composite transactions like `retain 1 + insert XY + retain 2 + delete 1`: the trailing delete
+   * landed on the wrong source range, the editor and the document forked, and the next correct remote
+   * edit produced a divergent state that the only honest repair — a handoff — refused. The index must
+   * follow the source cursor, not the output.
+   */
   private applyDeltaToEditor(delta: Delta): void {
     const before = this.deps.editor.getValue();
     const changes: Array<{ from: EditorPosition; to: EditorPosition; text: string }> = [];
@@ -352,11 +399,13 @@ export class HotEditorBinding implements HotDocumentPort {
       if (part.insert !== undefined) {
         const inserted = textOf(part.insert);
         changes.push({ from: this.positionAt(before, index), to: this.positionAt(before, index), text: inserted });
-        index += inserted.length;
+        // Insert writes into the output without consuming source characters; the cursor stays put.
         continue;
       }
       if (part.delete !== undefined) {
         changes.push({ from: this.positionAt(before, index), to: this.positionAt(before, index + part.delete), text: "" });
+        // Delete consumes `delete` characters from the source, so the cursor moves past them.
+        index += part.delete;
       }
     }
     if (changes.length === 0) return;

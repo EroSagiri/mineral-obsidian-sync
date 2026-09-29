@@ -106,6 +106,71 @@ describe("hot editor binding", () => {
     expect(change.to).toEqual({ line: 0, ch: 5 });
   });
 
+  it("does not duplicate content when a welcome lands on a pane that already shows the same text", () => {
+    /**
+     * The mobile-rollout regression: a desktop pane already shows the file's body, the server sends the
+     * same body as the welcome, and the bridge used to insert that body a second time. The welcome
+     * origin must therefore be invisible to the observer, and `applyState` reconciles by content rather
+     * than by re-applying the delta.
+     */
+    const editor = new FakeEditor("first revision\n");
+    const { binding, updates } = bindingFor(editor);
+
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "first revision\n");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+
+    expect(editor.value).toBe("first revision\n");
+    // A welcome must never become an outgoing operation; the document was set, not edited.
+    expect(updates).toHaveLength(0);
+    expect(binding.text()).toBe("first revision\n");
+    // No transaction was emitted by the bridge, because the editor was already correct.
+    expect(editor.transactions).toHaveLength(0);
+  });
+
+  it("fills an empty pane from a welcome that holds content", () => {
+    const editor = new FakeEditor("");
+    const { binding } = bindingFor(editor);
+
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "remote content\n");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+
+    expect(editor.value).toBe("remote content\n");
+    expect(binding.text()).toBe("remote content\n");
+  });
+
+  it("handles a composite remote delta without losing source-text cursor position", () => {
+    /**
+     * A composite transaction like `retain 1 + insert "XY" + retain 2 + delete 1` is exactly what a
+     * collaborating keystroke produces: keep the first character, insert two, keep the next two, delete
+     * one. The earlier implementation advanced `index` after `insert` and forgot to advance after
+     * `delete`, so the trailing delete landed on the wrong range and the editor forked from the
+     * document. The test pins the corrected semantics.
+     */
+    const editor = new FakeEditor("abXYZcd");
+    const { binding } = bindingFor(editor);
+
+    // Build a Y.Doc that holds "abXYZcd", then produce a delta equivalent to "delete the trailing 'd'".
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "abXYZcd");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+    expect(editor.value).toBe("abXYZcd");
+
+    const before = Y.encodeStateVector(room);
+    room.getText("markdown").delete(6, 1);
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before)));
+
+    expect(editor.value).toBe("abXYZc");
+    const transaction = editor.transactions.at(-1)!;
+    expect(transaction.changes).toHaveLength(1);
+    expect(transaction.changes![0]).toMatchObject({
+      from: { line: 0, ch: 6 },
+      to: { line: 0, ch: 7 },
+      text: "",
+    });
+  });
+
   it("turns a local edit into the smallest update and does not echo it back", async () => {
     const editor = new FakeEditor("");
     const { binding, updates } = bindingFor(editor);
