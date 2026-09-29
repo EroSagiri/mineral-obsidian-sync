@@ -38,7 +38,10 @@ const fakeEditor = (value: string) => ({
   transaction: () => {},
 }) as unknown as Editor;
 
-function harness(release: { outcome: string; remainingClients?: number } = { outcome: "released" }) {
+function harness(
+  release: { outcome: string; remainingClients?: number } = { outcome: "released" },
+  namespaceResult?: Record<string, unknown>,
+) {
   const sockets: FakeSocket[] = [];
   const transport = async (request: HotHttpRequest): Promise<HotHttpResponse> => {
     if (request.url.endsWith("/hot/acquire")) {
@@ -60,6 +63,9 @@ function harness(release: { outcome: string; remainingClients?: number } = { out
     }
     if (request.url.endsWith("/hot/release")) {
       return { status: 200, text: JSON.stringify({ protocol: 1, ...release }) };
+    }
+    if (request.url.endsWith("/hot/namespace")) {
+      return { status: 200, text: JSON.stringify(namespaceResult ?? {}) };
     }
     return { status: 200, text: "{}" };
   };
@@ -95,6 +101,52 @@ async function ackLastOperation(socket: FakeSocket, session: { handleFrame(frame
 }
 
 const welcome = (revision = 0) => ({ protocol: 1, type: "welcome", documentId: DOCUMENT, epoch: 1, canonicalPath: PATH, state: "active", serverRevision: revision, latestCheckpointedRevision: revision, crdtState: welcomeState(), pendingSave: false });
+
+describe("hot namespace deletion", () => {
+  it("keeps the local fence and session when the authority has not applied the delete", async () => {
+    const { coordinator, sockets } = harness({ outcome: "released" }, {
+      protocol: 1,
+      operationId: "delete-1",
+      type: "delete",
+      outcome: "rejected",
+      reason: "unavailable",
+      phase: "checkpointed",
+      canonicalPath: PATH,
+      binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "quiescing", updatedAt: 1 },
+    });
+    await coordinator.open({ canonicalPath: PATH, editor: fakeEditor(""), localText: "" });
+    sockets[0].emit(welcome());
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const result = await coordinator.delete(PATH);
+
+    expect(result.outcome).toBe("rejected");
+    expect(coordinator.isFenced(PATH)).toBe(true);
+    expect(coordinator.sessionFor(PATH)).toBeDefined();
+  });
+
+  it("forgets local ownership only after the authority applies the delete", async () => {
+    const { coordinator, sockets, store } = harness({ outcome: "released" }, {
+      protocol: 1,
+      operationId: "delete-2",
+      type: "delete",
+      outcome: "applied",
+      phase: "acked",
+      canonicalPath: PATH,
+      binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "deleted", updatedAt: 2 },
+    });
+    await coordinator.open({ canonicalPath: PATH, editor: fakeEditor(""), localText: "" });
+    sockets[0].emit(welcome());
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const result = await coordinator.delete(PATH);
+
+    expect(result.outcome).toBe("applied");
+    expect(coordinator.isFenced(PATH)).toBe(false);
+    expect(coordinator.sessionFor(PATH)).toBeUndefined();
+    expect((await store.loadSessions()).filter(record => record.canonicalPath === PATH)).toEqual([]);
+  });
+});
 
 
 describe("keep local means this device's bytes reach the document", () => {

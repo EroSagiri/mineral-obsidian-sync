@@ -218,8 +218,9 @@ export class HotSyncCoordinator implements HotPathFence {
          * silently leaving the Y.Doc ahead of the durable record. The session's own catch around
          * `putOutbox` is what protects against the inverse direction.
          */
-        session.applyLocalUpdate(update, operationId).catch(error => {
+        return session.applyLocalUpdate(update, operationId).catch(error => {
           this.deps.debug?.(`hot outbox write failed: ${error instanceof Error ? error.message : "unknown"}`);
+          throw error;
         });
       },
       debug: this.deps.debug,
@@ -314,6 +315,13 @@ export class HotSyncCoordinator implements HotPathFence {
         if (!mayHoldContent || await this.waitForSessionReady(session, 2_000)) await binding.seedFromTextIfEmpty(input.localText);
       }
     } catch (error) {
+      if (session.status === "conflict") {
+        // A failed outbox write already froze the session and retained the volatile operation. Keep the
+        // binding visible to the resolver; tearing it down here would drop the only remaining copy of
+        // the encoded edit while the server still owns the path.
+        this.conflicts.set(input.canonicalPath, "conflict");
+        return { outcome: "conflict", reason: "outbox-unavailable", binding: acquired.binding, remote: acquired.remote };
+      }
       // A half-open session is worse than none: the path would be fenced with nothing behind it.
       this.bindings.delete(input.canonicalPath);
       this.sessions.delete(input.canonicalPath);
@@ -813,14 +821,10 @@ export class HotSyncCoordinator implements HotPathFence {
       expectedRemoteETag: receipt?.r2ETag ?? null,
       expectedDocumentRevision: receipt?.documentRevision ?? null,
     });
-    if (result.outcome === "applied") {
-      this.sessions.delete(canonicalPath);
-      const binding = this.bindings.get(canonicalPath);
-      binding?.detach();
-      this.bindings.delete(canonicalPath);
-      this.hotPaths.delete(canonicalPath);
-      this.handoffPaths.delete(canonicalPath);
-    }
+    // Only the authority's applied verdict permits local ownership records to disappear. A rejected
+    // delete remains fenced: the local file is gone, but the room may still own content and its alarm
+    // may still be completing the namespace transition.
+    if (result.outcome === "applied") await this.forget(canonicalPath);
     return result;
   }
 
@@ -959,8 +963,6 @@ export class HotSyncCoordinator implements HotPathFence {
     return `${type}:${path}`;
   }
 }
-
-
 
 
 

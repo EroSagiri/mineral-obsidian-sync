@@ -513,6 +513,28 @@ describe("hot ownership from the cold path's point of view", () => {
     expect(env.marked).toEqual([]);
   });
 
+  it("does not let an expired buffer snapshot hide a later external write", async () => {
+    const env = harness({ buffer: "current buffer" });
+    const flagged: string[] = [];
+    const hot = hotStub(["note.md"]);
+    attach(env.plugin, { ...hot.stub, flagExternalEdit: (path: string) => { flagged.push(path); return true; } });
+    const pane = newView();
+    pane.file = { path: "note.md" } as never;
+    pane.editor = { getValue: () => "current buffer" } as never;
+    env.views.push(pane);
+    let disk = "baseline";
+    env.plugin.app.vault.adapter.read = async () => disk;
+
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+    (env.plugin as unknown as { hotRecentBuffers: Map<string, { text: string; at: number }[]> }).hotRecentBuffers.set("note.md", [
+      { text: "old editor state", at: Date.now() - 60_001 },
+    ]);
+    disk = "old editor state";
+    await env.plugin.markUnlessOwnEditorWrite("note.md");
+
+    expect(flagged).toEqual(["note.md"]);
+  });
+
   it("leaves the editor's own save alone while the buffer is merely ahead of the file", async () => {
     // The comparison is disk-versus-buffer on purpose. While the user types, the file is legitimately
     // behind the buffer for a moment; comparing with the CRDT instead would raise a conflict on every
@@ -1069,7 +1091,6 @@ describe("restoring an earlier version", () => {
     expect(opened).toBe(1);
   });
 });
-
 
 
 

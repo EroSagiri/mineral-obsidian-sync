@@ -48,18 +48,22 @@ class FakeDocument implements HotDocumentPort {
 function harness(options: {
   release?: (body: Record<string, unknown>) => { status: number; text: string };
   acquireBody?: Record<string, unknown>;
+  acquire?: (count: number) => Promise<HotHttpResponse>;
   storeFault?: unknown;
   reconnectInitialDelayMs?: number;
   reconnectMaxDelayMs?: number;
 } = {}) {
   const requests: HotHttpRequest[] = [];
   const sockets: FakeSocket[] = [];
+  let acquireCount = 0;
   const transport = async (request: HotHttpRequest): Promise<HotHttpResponse> => {
     requests.push(request);
     if (request.url.endsWith("/hot/release")) {
       return options.release?.(JSON.parse(request.body ?? "{}") as Record<string, unknown>) ?? { status: 200, text: JSON.stringify({ protocol: 1, outcome: "released", remainingClients: 0 }) };
     }
     if (request.url.endsWith("/hot/acquire")) {
+      acquireCount += 1;
+      if (options.acquire) return options.acquire(acquireCount);
       return {
         status: 200,
         text: JSON.stringify(options.acquireBody ?? {
@@ -153,7 +157,9 @@ describe("hot session durability", () => {
     await session.handleFrame({ protocol: 1, type: "reject", documentId: DOCUMENT, epoch: 1, clientOperationId: "op-1", reason: "stale-epoch" } as never);
     expect(session.status).toBe("conflict");
     expect(conflicts).toContain("stale-epoch");
-    expect(session.pending()).toHaveLength(0);
+    // A rejection is not an acknowledgement: the old-epoch operation remains as evidence for the
+    // conflict resolver instead of being silently discarded.
+    expect(session.pending().map(entry => entry.clientOperationId)).toEqual(["op-1"]);
   });
 
   it("applies remote updates verbatim and ignores its own acknowledgements' revisions", async () => {
@@ -190,7 +196,7 @@ describe("hot session durability", () => {
     expect((await restored.store.loadOutbox()).map(entry => entry.key)).toEqual([outboxKey(DOCUMENT, 1, "op-1")]);
   });
 
-  it("keeps the outbox row when a non-fatal reject lands, so the next resume replays the edit", async () => {
+  it("keeps an oversized edit and freezes the session instead of retrying a permanent rejection", async () => {
     /**
      * `too-large` is a verdict on the *packet*, not on the document identity. The edit still belongs
      * to the user, the Y.Doc has already absorbed it, and dropping the row here would leave the local
@@ -205,10 +211,10 @@ describe("hot session durability", () => {
 
     expect(session.pending().map(entry => entry.clientOperationId)).toEqual(["op-1"]);
     expect((await store.loadOutbox()).map(entry => entry.clientOperationId)).toEqual(["op-1"]);
-    expect(session.status).toBe("hot");
+    expect(session.status).toBe("conflict");
   });
 
-  it("rolls back the in-memory outbox when the durable write fails and surfaces the error", async () => {
+  it("keeps the volatile edit, freezes the path, and surfaces a durable-write failure", async () => {
     /**
      * The contract is "persist before send". A throw from `putOutbox` previously left the entry in the
      * map and silently failed the whole plugin: a transient IndexedDB hiccup sent a message the server
@@ -221,7 +227,9 @@ describe("hot session durability", () => {
     await new Promise(resolve => setTimeout(resolve, 0));
 
     await expect(session.applyLocalUpdate(encodeHotPayload(new Uint8Array([1])), "op-1")).rejects.toThrow("indexeddb-unavailable");
-    expect(session.pending()).toHaveLength(0);
+    expect(session.pending().map(entry => entry.clientOperationId)).toEqual(["op-1"]);
+    expect(session.status).toBe("conflict");
+    expect(sockets[0].frames().filter(frame => frame.type === "operation")).toEqual([]);
   });
 
   it("reconnects after the socket drops unexpectedly and replays pending work", async () => {
@@ -338,6 +346,44 @@ describe("hot session durability", () => {
     expect(session.status).toBe("conflict");
     expect(acquireCount).toBe(2);
   });
+
+  it("does not resurrect a session when abandon lands during an in-flight reconnect", async () => {
+    let releaseReconnect: (() => void) | undefined;
+    const acquireBody = {
+      protocol: 1,
+      outcome: "created",
+      canonicalPath: PATH,
+      binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 },
+      remote: null,
+      identity: { documentId: DOCUMENT, epoch: 1 },
+      serverRevision: 0,
+      latestCheckpointedRevision: 0,
+      roomState: "active",
+      sessionTicket: "ticket-1",
+    };
+    const { session, sockets, requests } = harness({
+      reconnectInitialDelayMs: 5,
+      reconnectMaxDelayMs: 5,
+      acquire: async count => {
+        if (count === 1) return { status: 200, text: JSON.stringify(acquireBody) };
+        await new Promise<void>(resolve => { releaseReconnect = resolve; });
+        return { status: 200, text: JSON.stringify({ ...acquireBody, outcome: "joined", sessionTicket: "ticket-2" }) };
+      },
+    });
+
+    await session.start({ local: null, operationId: "acquire-1" });
+    sockets[0].emit(welcomeFrame);
+    sockets[0].close();
+    for (let attempt = 0; attempt < 20 && !releaseReconnect; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+    expect(releaseReconnect).toBeTypeOf("function");
+
+    session.abandon();
+    releaseReconnect!();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(sockets).toHaveLength(1);
+    expect(requests.filter(request => request.url.endsWith("/hot/release"))).toHaveLength(1);
+  });
 });
 
 describe("hot handoff", () => {
@@ -431,4 +477,3 @@ describe("hot handoff", () => {
     expect((await session.close({ checkpoint: true, localText: "", operationId: "r" })).outcome).toBe("not-hot");
   });
 });
-

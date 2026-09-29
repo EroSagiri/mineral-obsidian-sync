@@ -148,27 +148,28 @@ describe("hot editor binding", () => {
      * `delete`, so the trailing delete landed on the wrong range and the editor forked from the
      * document. The test pins the corrected semantics.
      */
-    const editor = new FakeEditor("abXYZcd");
+    const editor = new FakeEditor("abcd");
     const { binding } = bindingFor(editor);
 
-    // Build a Y.Doc that holds "abXYZcd", then produce a delta equivalent to "delete the trailing 'd'".
+    // One Yjs transaction inserts in front of the retained middle and deletes the old trailing byte.
     const room = new Y.Doc();
-    room.getText("markdown").insert(0, "abXYZcd");
+    room.getText("markdown").insert(0, "abcd");
     binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
-    expect(editor.value).toBe("abXYZcd");
+    expect(editor.value).toBe("abcd");
 
     const before = Y.encodeStateVector(room);
-    room.getText("markdown").delete(6, 1);
+    room.transact(() => {
+      room.getText("markdown").insert(1, "XY");
+      room.getText("markdown").delete(5, 1);
+    });
     binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before)));
 
-    expect(editor.value).toBe("abXYZc");
+    expect(editor.value).toBe("aXYbc");
     const transaction = editor.transactions.at(-1)!;
-    expect(transaction.changes).toHaveLength(1);
-    expect(transaction.changes![0]).toMatchObject({
-      from: { line: 0, ch: 6 },
-      to: { line: 0, ch: 7 },
-      text: "",
-    });
+    expect(transaction.changes).toEqual([
+      { from: { line: 0, ch: 1 }, to: { line: 0, ch: 1 }, text: "XY" },
+      { from: { line: 0, ch: 3 }, to: { line: 0, ch: 4 }, text: "" },
+    ]);
   });
 
   it("turns a local edit into the smallest update and does not echo it back", async () => {
@@ -229,5 +230,4 @@ describe("hot editor binding", () => {
     expect(binding.text()).toBe("remote content\n");
   });
 });
-
 

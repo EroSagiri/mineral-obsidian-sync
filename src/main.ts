@@ -54,9 +54,9 @@ type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, R
 const ANDROID_LOCAL_DRIFT_INTERVAL_MS = 15_000;
 const ANDROID_EDITOR_SAVE_DEBOUNCE_MS = 500;
 /** How long a buffer snapshot is kept for content-based external-edit identification. */
-const HOT_BUFFER_SNAPSHOT_RETENTION_MS = 10_000;
+const HOT_BUFFER_SNAPSHOT_RETENTION_MS = 60_000;
 /** Hard cap on the snapshot count per path so an idle session cannot grow unbounded memory. */
-const HOT_BUFFER_SNAPSHOT_MAX = 8;
+const HOT_BUFFER_SNAPSHOT_MAX = 32;
 const INTEGRITY_RECONCILE_TICK_MS = 60_000;
 /**
  * Above this many drifted paths the drift is reported as it stands, without consulting the baseline:
@@ -1016,13 +1016,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
           const result = await coordinator.delete(path);
           if (result.outcome !== "applied") {
             this.debug(`hot delete not applied outcome=${result.outcome} reason=${result.reason ?? "-"} path-digest=${pathDigest(path)}`);
+            new Notice(`Mineral Sync：${path} 的删除尚未由服务器确认（${result.reason ?? result.outcome}）。该路径仍保持围栏，稍后会继续恢复，旧正文不会被静默复活。`);
+          } else {
+            this.hotRecentBuffers.delete(path);
+            this.hotDiskText.delete(path);
           }
         } catch (error) {
           this.debug(`hot delete failed: ${error instanceof Error ? error.message : "unknown"}`);
-        } finally {
-          // Whatever the server answered, the local session cannot keep owning a path whose file no
-          // longer exists; a conflict about a missing file is a question with no answer.
-          await coordinator.forget(path).catch(() => undefined);
+          new Notice(`Mineral Sync：${path} 的删除请求暂时失败。该路径仍保持热同步围栏，等待恢复。`);
         }
       })();
     }));
@@ -1086,7 +1087,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // just fired is the one being typed into.
       this.recordHotBufferSnapshot(path, editor.getValue());
       coordinator.rebind(path, editor, "adopt");
-      void coordinator.handleEditorChange(path);
+      void coordinator.handleEditorChange(path).catch(error => {
+        this.debug(`hot editor update failed path-digest=${pathDigest(path)} error=${error instanceof Error ? error.message : "unknown"}`);
+      });
     }));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
       // Moving to another pane changes which editor is on screen without changing the file. A session that
@@ -1220,8 +1223,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private isRecentHotBuffer(path: string, text: string): boolean {
     const history = this.hotRecentBuffers.get(path);
     if (!history) return false;
-    for (const entry of history) if (entry.text === text) return true;
-    return false;
+    const cutoff = Date.now() - HOT_BUFFER_SNAPSHOT_RETENTION_MS;
+    const current = history.filter(entry => entry.at >= cutoff);
+    if (current.length === 0) this.hotRecentBuffers.delete(path);
+    else if (current.length !== history.length) this.hotRecentBuffers.set(path, current);
+    return current.some(entry => entry.text === text);
   }
 
   /** The MarkdownView showing a path, if any. A leaf can change files, so it is resolved on demand. */
@@ -1766,7 +1772,6 @@ function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistory
     ...(facts.order === undefined ? {} : { order: facts.order }),
   };
 }
-
 
 
 

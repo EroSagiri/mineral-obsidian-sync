@@ -97,6 +97,8 @@ export class HotDocumentSession {
   /** The current backoff for the reconnect loop. Reset to the initial delay on a successful resume. */
   private reconnectDelay: number;
   private reconnectAttempts = 0;
+  /** Invalidates a reconnect that is already waiting on acquire when close/abandon begins. */
+  private lifecycleGeneration = 0;
   private readonly events: HotSessionEvents;
   private readonly now: () => number;
   private readonly receiptTimeoutMs: number;
@@ -214,7 +216,7 @@ export class HotDocumentSession {
   }
 
   /** Re-acquires after a disconnect or a restart, stating the identity this device already holds. */
-  async resume(operationId: string): Promise<HotAcquireResult> {
+  async resume(operationId: string, expectedGeneration?: number): Promise<HotAcquireResult> {
     const record = this.record;
     if (!record) throw new HotClientError({ kind: "misconfigured" }, "there is no hot session to resume");
     const localText = this.deps.doc.text();
@@ -226,6 +228,21 @@ export class HotDocumentSession {
       local: { contentHash: await hotContentHash(localText), size: localText.length },
       wantSession: true,
     });
+    if (expectedGeneration !== undefined && expectedGeneration !== this.lifecycleGeneration) {
+      // The user closed the document while acquire was in flight. Do not resurrect the local session;
+      // release the just-acquired server claim with the identity it returned.
+      if ((acquired.outcome === "joined" || acquired.outcome === "created") && acquired.identity) {
+        await this.deps.client.release({
+          operationId: `${operationId}-cancel`,
+          clientId: record.clientId,
+          documentId: acquired.identity.documentId,
+          epoch: acquired.identity.epoch,
+          checkpoint: false,
+          lastAcceptedRevision: record.lastAcceptedRevision,
+        }).catch(error => this.debug(`hot cancelled reconnect release failed: ${error instanceof Error ? error.message : "unknown"}`));
+      }
+      return acquired;
+    }
     return this.adopt(acquired, record);
   }
 
@@ -300,18 +317,22 @@ export class HotDocumentSession {
   }
 
   private cancelReconnect(): void {
-    if (this.reconnectTimer === null) return;
-    clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
+    this.lifecycleGeneration += 1;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
   }
 
   private async performReconnect(): Promise<void> {
     const record = this.record;
     if (!record) return;
     if (record.status === "closed" || record.status === "handoff-pending" || record.status === "conflict") return;
+    const generation = this.lifecycleGeneration;
     this.reconnectAttempts += 1;
     try {
-      const result = await this.resume(this.nextReconnectOperationId());
+      const result = await this.resume(this.nextReconnectOperationId(), generation);
+      if (generation !== this.lifecycleGeneration) return;
       if (result.outcome === "joined" || result.outcome === "created") {
         // A live socket means the loop is over. The next unexpected close starts backoff again from
         // the floor — a single failed handshake should not be remembered across hours of editing.
@@ -388,23 +409,19 @@ export class HotDocumentSession {
          * document kept the keystrokes, the server never did, and the next editor-change found nothing
          * to push.
          */
-        const fatal = frame.reason === "stale-epoch" || frame.reason === "unauthorized" || frame.reason === "unknown-document" || frame.reason === "quiescing";
-        if (fatal) {
-          for (const [key, entry] of this.outbox) {
-            if (entry.clientOperationId === frame.clientOperationId) this.outbox.delete(key);
-          }
-          await this.deps.store.deleteOutbox(outboxKey(frame.documentId, frame.epoch, frame.clientOperationId));
-        } else {
-          // Reset the attempt counter so a previously-failed send is retried with the backoff that the
-          // send loop already owns; the row stays put until an `ack` arrives or a fatal verdict lands.
-          this.debug(`hot operation kept in outbox after non-fatal reject reason=${frame.reason}`);
-        }
-        if (frame.reason === "stale-epoch") {
-          this.events.onConflict?.("stale-epoch");
-          await this.persist("conflict", "stale-epoch");
-        } else if (frame.reason === "quiescing") {
+        // A reject is not an acknowledgement. The row is the only durable evidence of the user's edit,
+        // so every rejection keeps it; identity/payload verdicts freeze the path for a decision, while
+        // the one transient verdict reconnects and retries the same operation id.
+        this.debug(`hot operation kept in outbox after reject reason=${frame.reason}`);
+        if (frame.reason === "quiescing") {
           await this.persist("handoff-pending", "quiescing");
-        } else if (frame.reason === "unauthorized" || frame.reason === "unknown-document") {
+        } else if (frame.reason === "unavailable") {
+          await this.persist("disconnected", "unavailable");
+          const socket = this.socket;
+          if (socket) {
+            try { socket.close(1012, "retry"); } catch { this.scheduleReconnect(); }
+          } else this.scheduleReconnect();
+        } else {
           this.events.onConflict?.(frame.reason);
           await this.persist("conflict", frame.reason);
         }
@@ -515,7 +532,14 @@ export class HotDocumentSession {
     try {
       await this.deps.store.putOutbox(entry);
     } catch (error) {
-      this.outbox.delete(entry.key);
+      // The editor and Y.Doc already contain this update. Keep the volatile copy, freeze the path, and
+      // surface the failure; deleting it here would make the next diff believe the edit was delivered.
+      this.events.onConflict?.("outbox-unavailable");
+      if (this.record) {
+        this.record = { ...this.record, status: "conflict", updatedAt: this.now() };
+        try { await this.deps.store.putSession(this.record); } catch { /* the in-memory fence still holds */ }
+        this.events.onStatus?.("conflict", "outbox-unavailable");
+      }
       throw error;
     }
     this.sendOperation(entry);
@@ -735,4 +759,3 @@ export class HotDocumentSession {
     };
   }
 }
-
