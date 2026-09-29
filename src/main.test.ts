@@ -313,6 +313,50 @@ describe("android editor save lifecycle", () => {
 });
 
 describe("hot ownership from the cold path's point of view", () => {
+  it("shuts down the hot coordinator before an unloaded plugin instance can echo events", () => {
+    const env = harness();
+    const calls: string[] = [];
+    const plugin = env.plugin as unknown as {
+      onunload(): void;
+      hotCoordinator?: { shutdown(): void };
+      hotOpenPath?: string;
+      scheduler?: { stop(): void };
+      gateway?: { stop(): void };
+    };
+    plugin.hotCoordinator = { shutdown: () => calls.push("hot-shutdown") };
+    plugin.hotOpenPath = "note.md";
+    plugin.scheduler = { stop: () => calls.push("scheduler-stop") };
+    plugin.gateway = { stop: () => calls.push("gateway-stop") };
+
+    plugin.onunload();
+
+    expect(calls).toContain("hot-shutdown");
+    expect(calls).toContain("gateway-stop");
+    expect(plugin.hotCoordinator).toBeUndefined();
+    expect(plugin.hotOpenPath).toBeUndefined();
+  });
+
+  it("shuts down a pending hot transport when hot sync is disabled", async () => {
+    const env = harness();
+    const calls: string[] = [];
+    env.attachHotSettings({ hotSyncEnabled: false, gatewayEnabled: true });
+    const plugin = env.plugin as unknown as {
+      refreshHotSync(): Promise<void>;
+      closeHotDocument(): Promise<void>;
+      hotCoordinator?: { shutdown(): void };
+      hotOpenPath?: string;
+    };
+    plugin.hotCoordinator = { shutdown: () => calls.push("hot-shutdown") };
+    plugin.hotOpenPath = "note.md";
+    plugin.closeHotDocument = async () => { calls.push("handoff-attempted"); };
+
+    await plugin.refreshHotSync();
+
+    expect(calls).toEqual(["handoff-attempted", "hot-shutdown"]);
+    expect(plugin.hotCoordinator).toBeUndefined();
+    expect(plugin.hotOpenPath).toBeUndefined();
+  });
+
   /**
    * A recording stand-in for the plugin's hot coordinator.
    *
@@ -1091,8 +1135,6 @@ describe("restoring an earlier version", () => {
     expect(opened).toBe(1);
   });
 });
-
-
 
 
 

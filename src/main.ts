@@ -297,6 +297,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
     for (const handle of this.androidEditorSaveTimers.values()) window.clearTimeout(handle);
     this.androidEditorSaveTimers.clear();
     // Closing the socket and cancelling reconnect timers happens before any further work can start.
+    this.hotCoordinator?.shutdown();
+    this.hotCoordinator = undefined;
+    this.hotOpenPath = undefined;
     this.gateway?.stop();
   }
 
@@ -322,8 +325,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const wanted = Boolean(this.settings.hotSyncEnabled && this.settings.gatewayEnabled);
     if (!wanted) {
       // Turning it off must finish the handoff for anything still open, not abandon it mid-session.
+      const coordinator = this.hotCoordinator;
       await this.closeHotDocument();
+      // A handoff may legitimately stay pending when the network is down. The durable record keeps
+      // that debt, but the disabled plugin instance must never leave its raw socket or reconnect loop
+      // alive: a later enable would otherwise create a second socket with the same client identity.
+      coordinator?.shutdown();
       this.hotCoordinator = undefined;
+      this.hotOpenPath = undefined;
       this.scheduler?.refreshStatus();
       return;
     }
@@ -1772,8 +1781,6 @@ function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistory
     ...(facts.order === undefined ? {} : { order: facts.order }),
   };
 }
-
-
 
 
 

@@ -507,6 +507,24 @@ export class HotDocumentSession {
   }
 
   /**
+   * Stops the in-process transport without changing the durable session lifecycle.
+   *
+   * Plugin unload is not a handoff: Obsidian may reload the plugin a moment later and the persisted
+   * session is what lets that new instance resume. It is, however, a hard ownership boundary for the
+   * old JavaScript instance. Leaving its raw WebSocket alive lets the room relay the new instance's
+   * operations back through the old socket, producing a same-device event echo.
+   */
+  shutdown(): void {
+    this.cancelReconnect();
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      try { socket.close(1000, "plugin-unload"); } catch { /* the process is already tearing down */ }
+    }
+    this.resolveWaiters({ failure: "plugin-unload" });
+  }
+
+  /**
    * Persists one local edit and sends it.
    *
    * The outbox row is written first and deleted only on the acknowledgement, so the durable record

@@ -23,8 +23,9 @@ class FakeSocket implements HotSocket {
   readonly sent: string[] = [];
   private messageHandler: ((data: string) => void) | null = null;
   private closeHandler: (() => void) | null = null;
+  closed = false;
   send(data: string): void { this.sent.push(data); }
-  close(): void { this.closeHandler?.(); }
+  close(): void { this.closed = true; this.closeHandler?.(); }
   onMessage(handler: (data: string) => void): void { this.messageHandler = handler; }
   onClose(handler: () => void): void { this.closeHandler = handler; }
   emit(frame: Record<string, unknown>): void { this.messageHandler?.(JSON.stringify(frame)); }
@@ -115,6 +116,19 @@ async function ackLastOperation(socket: FakeSocket, session: { handleFrame(frame
 const welcome = (revision = 0) => ({ protocol: 1, type: "welcome", documentId: DOCUMENT, epoch: 1, canonicalPath: PATH, state: "active", serverRevision: revision, latestCheckpointedRevision: revision, crdtState: welcomeState(), pendingSave: false });
 
 describe("hot namespace deletion", () => {
+  it("shuts down every session transport and drops every editor binding on plugin unload", async () => {
+    const { coordinator, sockets } = harness();
+    await coordinator.open({ canonicalPath: PATH, editor: fakeEditor(""), localText: "" });
+    expect(coordinator.bindingFor(PATH)).toBeDefined();
+
+    coordinator.shutdown();
+
+    expect(coordinator.bindingFor(PATH)).toBeUndefined();
+    expect(coordinator.sessionFor(PATH)).toBeUndefined();
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].closed).toBe(true);
+  });
+
   it("keeps the local fence and session when the authority has not applied the delete", async () => {
     const { coordinator, sockets } = harness({ outcome: "released" }, {
       protocol: 1,

@@ -173,6 +173,14 @@ export class HotSyncCoordinator implements HotPathFence {
     return { paths: this.deferred.size, operations: [...this.deferred.values()].reduce((total, count) => total + count, 0) };
   }
 
+  /** Terminates every live in-process bridge and socket when the plugin instance is unloaded. */
+  shutdown(): void {
+    for (const binding of this.bindings.values()) binding.detach();
+    for (const session of this.sessions.values()) session.shutdown();
+    this.bindings.clear();
+    this.sessions.clear();
+  }
+
   /* --------------------------------------------------------------------------------------------
    * Document lifecycle
    * ------------------------------------------------------------------------------------------ */
@@ -991,7 +999,6 @@ export class HotSyncCoordinator implements HotPathFence {
     return `${type}:${path}`;
   }
 }
-
 
 
 

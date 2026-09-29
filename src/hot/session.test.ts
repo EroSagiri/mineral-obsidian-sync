@@ -128,6 +128,19 @@ const welcomeFrame = { protocol: 1, type: "welcome", documentId: DOCUMENT, epoch
 const ackFrame = (revision: number, id: string, duplicate = false) => ({ protocol: 1, type: "ack", documentId: DOCUMENT, epoch: 1, clientOperationId: id, serverRevision: revision, duplicate });
 
 describe("hot session durability", () => {
+  it("closes the raw socket on plugin shutdown without deleting the resumable record", async () => {
+    const { session, store, sockets } = harness({ reconnectInitialDelayMs: 1 });
+    await session.start({ local: null, operationId: "acquire-1" });
+    expect(sockets).toHaveLength(1);
+
+    session.shutdown();
+
+    expect(sockets[0].closed).toBe(true);
+    expect(await store.loadSessions()).toHaveLength(1);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(sockets, "an unloaded plugin instance must never reconnect").toHaveLength(1);
+  });
+
   it("persists an edit before sending it, and clears it only on the acknowledgement", async () => {
     const { session, store, sockets } = harness();
     await session.start({ local: null, operationId: "acquire-1" });
