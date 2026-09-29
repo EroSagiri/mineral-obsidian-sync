@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Editor } from "obsidian";
+import type { Editor, EditorPosition, EditorTransaction } from "obsidian";
 import * as Y from "yjs";
 import { encodeHotPayload, hotContentHash } from "@mineral/sync-core/hot-protocol";
 import { HotGatewayClient, type HotHttpRequest, type HotHttpResponse, type HotSocket } from "./client";
@@ -30,13 +30,25 @@ class FakeSocket implements HotSocket {
   emit(frame: Record<string, unknown>): void { this.messageHandler?.(JSON.stringify(frame)); }
 }
 
-const fakeEditor = (value: string) => ({
-  getValue: () => value,
-  // A double without `setValue` cannot be re-bound or filled, and every "the pane was replaced" test needs
-  // exactly that.
-  setValue: (next: string) => { value = next; },
-  transaction: () => {},
-}) as unknown as Editor;
+const fakeEditor = (value: string) => {
+  let current = value;
+  return {
+    getValue: () => current,
+    // A double without `setValue` cannot be re-bound or filled, and every "the pane was replaced" test needs
+    // exactly that.
+    setValue: (next: string) => { current = next; },
+    transaction: (transaction: EditorTransaction) => {
+      const applied = [...(transaction.changes ?? [])]
+        .map(change => ({ from: change.from!, to: change.to!, text: change.text ?? "" }))
+        .sort((left, right) => right.from.ch - left.from.ch || right.from.line - left.from.line);
+      for (const change of applied) {
+        const fromOffset = current.split("\n").slice(0, change.from.line).reduce((acc, line) => acc + line.length + 1, 0) + change.from.ch;
+        const toOffset = current.split("\n").slice(0, change.to.line).reduce((acc, line) => acc + line.length + 1, 0) + change.to.ch;
+        current = current.slice(0, fromOffset) + change.text + current.slice(toOffset);
+      }
+    },
+  } as unknown as Editor;
+};
 
 function harness(
   release: { outcome: string; remainingClients?: number } = { outcome: "released" },

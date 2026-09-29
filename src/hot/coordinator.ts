@@ -7,6 +7,7 @@ import { HeadlessEditor, asEditor } from "./headless-editor";
 import type { HotStateStore } from "./store";
 import { HotDocumentSession, type HotCloseOutcome } from "./session";
 import { sessionStatusFencesCold, type HotBaseline, type HotSessionRecord, type HotSessionStatus } from "./types";
+import { pathDigest } from "../sync/path";
 
 /**
  * The plugin's hot-path owner: which paths are hot, what the cold path may touch, and how a document
@@ -222,6 +223,21 @@ export class HotSyncCoordinator implements HotPathFence {
           this.deps.debug?.(`hot outbox write failed: ${error instanceof Error ? error.message : "unknown"}`);
           throw error;
         });
+      },
+      /**
+       * A frozen bridge means the editor and the Y.Doc cannot be reconciled by a regular editor
+       * transaction. Continuing to translate further updates would extend the divergence forever, and
+       * the next user keystroke would push the wrong content out to the room. The honest answer is a
+       * conflict the user can act on: we mark the path conflicted, surface the freeze reason in the
+       * diagnostics, and refuse to generate further operations until the user resolves it.
+       */
+      onFreeze: (reason) => {
+        this.conflicts.set(input.canonicalPath, "conflict");
+        this.conflictOrigins.set(input.canonicalPath, "mismatch");
+        this.hotPaths.delete(input.canonicalPath);
+        this.handoffPaths.add(input.canonicalPath);
+        this.deps.debug?.(`hot freeze path-digest=${pathDigest(input.canonicalPath)} reason=${reason}`);
+        this.deps.onConflict?.(input.canonicalPath, "editor-document-divergence");
       },
       debug: this.deps.debug,
     });
