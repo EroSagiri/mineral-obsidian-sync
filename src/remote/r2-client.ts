@@ -25,6 +25,17 @@ export interface R2Client {
 }
 export { RemoteHttpError, RemoteObjectChangedError } from "./errors";
 
+/** Keeps Android's native request bridge below the fan-out at which one stalled GET can wedge a scan. */
+const TOMBSTONE_READ_CONCURRENCY = 8;
+
+async function mapInBatches<T, U>(items: readonly T[], size: number, map: (item: T) => Promise<U>): Promise<U[]> {
+  const output: U[] = [];
+  for (let offset = 0; offset < items.length; offset += size) {
+    output.push(...await Promise.all(items.slice(offset, offset + size).map(map)));
+  }
+  return output;
+}
+
 function xmlText(parent: Element, name: string): string | undefined { return parent.getElementsByTagName(name).item(0)?.textContent ?? undefined; }
 function xmlEntries(xml: string, prefix: string): { entries: RemoteEntry[]; next?: string; truncated: boolean } {
   const document = new DOMParser().parseFromString(xml, "application/xml"); if (document.querySelector("parsererror")) throw new Error("R2 returned an invalid ListObjectsV2 response");
@@ -101,9 +112,11 @@ export class SignedR2ListClient implements R2Client {
   }
   async listTombstones(): Promise<RemoteDeletion[]> {
     const prefix = `${normalizePrefix(this.config.remotePrefix)}${TOMBSTONE_NAMESPACE}`;
-    // These immutable metadata reads are independent. Keep their original listing order in the
-    // returned array, but do not make one slow R2 GET delay every other tombstone verification.
-    const resolved = await Promise.all((await this.listRaw(prefix)).map(async (entry): Promise<RemoteDeletion | undefined> => {
+    // These immutable metadata reads are independent, but an unbounded Promise.all can overwhelm
+    // Android's native requestUrl bridge. Preserve list order while keeping only a small batch in
+    // flight; the transport timeout then guarantees that one wedged GET cannot freeze every later
+    // foreground/manual cold-sync cycle forever.
+    const resolved = await mapInBatches(await this.listRaw(prefix), TOMBSTONE_READ_CONCURRENCY, async (entry): Promise<RemoteDeletion | undefined> => {
       const key = vaultKeyFromRemote(this.config.remotePrefix, entry.key);
       if (!key || !isInternalRemoteKey(key) || !entry.etag) throw new Error("Tombstone metadata key is invalid");
       let body: ArrayBuffer;
@@ -120,7 +133,7 @@ export class SignedR2ListClient implements R2Client {
       if (key !== expectedKey) throw new Error("Tombstone metadata key does not match its record");
       // The listing's own timestamp is R2's clock, which is what retention compares against the object's.
       return { tombstone: record, metadataETag: entry.etag, metadataLastModified: entry.lastModified };
-    }));
+    });
     return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }

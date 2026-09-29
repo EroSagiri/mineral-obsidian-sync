@@ -34,12 +34,22 @@ export interface HttpTransport { send(request: SignedRequest): Promise<HttpRespo
  * never gates a write — see `docs/development.md`.
  */
 export class RequestUrlTransport implements HttpTransport {
+  constructor(private readonly timeoutMs = 30_000) {}
+
   async send(request: SignedRequest): Promise<HttpResponse> {
     let response: RequestUrlResponse;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      response = await requestUrl({ url: request.url, method: request.method, headers: request.headers, body: request.body, throw: false });
+      response = await Promise.race([
+        requestUrl({ url: request.url, method: request.method, headers: request.headers, body: request.body, throw: false }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`requestUrl timed out after ${this.timeoutMs}ms`)), this.timeoutMs);
+        }),
+      ]);
     } catch (error) {
       throw new RemoteTransportError(request.method, error);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
     return { status: response.status, headers: response.headers, text: response.text, arrayBuffer: response.arrayBuffer };
   }

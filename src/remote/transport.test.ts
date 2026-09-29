@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteTransportError } from "./errors";
 import { setRequestUrlHandler } from "../../test/obsidian";
 import type { MockRequestUrlRequest } from "../../test/obsidian";
@@ -17,6 +17,7 @@ function respondWith(status: number): { received: () => MockRequestUrlRequest | 
 }
 
 describe("transport and credentials", () => {
+  afterEach(() => vi.useRealTimers());
   it("exposes settings credentials without inventing a session token", async () => {
     await expect(new SettingsCredentialProvider({ accessKeyId: "id", secretAccessKey: "secret" }).getCredentials()).resolves.toEqual({ accessKeyId: "id", secretAccessKey: "secret" });
   });
@@ -51,5 +52,13 @@ describe("transport and credentials", () => {
     const send = new RequestUrlTransport().send({ method: "HEAD", url: RESPONSE_URL, headers: {} });
     await expect(send).rejects.toBeInstanceOf(RemoteTransportError);
     await expect(send).rejects.toMatchObject({ name: "RemoteTransportError", operation: "HEAD" });
+  });
+
+  it("times out a requestUrl call that never settles so a cold-sync cycle can retry", async () => {
+    vi.useFakeTimers();
+    setRequestUrlHandler(() => new Promise(() => {}));
+    const send = new RequestUrlTransport(250).send({ method: "GET", url: RESPONSE_URL, headers: {} }).catch(error => error);
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(send).resolves.toMatchObject({ name: "RemoteTransportError", operation: "GET" });
   });
 });

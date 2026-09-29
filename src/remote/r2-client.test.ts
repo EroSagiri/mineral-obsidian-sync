@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { setRequestUrlHandler } from "../../test/obsidian";
 import { RemoteHttpError, RemoteObjectChangedError, SignedR2ListClient } from "./r2-client";
 import { encodeTombstone, tombstoneKey } from "./tombstones";
@@ -85,6 +85,43 @@ describe("SignedR2ListClient.listTombstones", () => {
     expect(getCalls).toBe(2);
     releaseReads?.();
     await expect(pending).resolves.toMatchObject([{ tombstone: first }, { tombstone: second }]);
+  });
+
+  it("bounds tombstone GET fan-out while preserving the listed order", async () => {
+    const records = Array.from({ length: 17 }, (_, index) => ({
+      protocol: 1 as const,
+      path: `note-${index}.md`,
+      deletedRemoteETag: `etag-${index}`,
+      createdAt: "2026-09-22T00:00:00.000Z",
+    }));
+    const keys = await Promise.all(records.map(record => tombstoneKey(record.path, record.deletedRemoteETag)));
+    let active = 0;
+    let maximum = 0;
+    const releases: Array<() => void> = [];
+    const subject = client() as unknown as {
+      listRaw(prefix: string): Promise<Array<{ key: string; size: number; etag?: string; lastModified: number }>>;
+      getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
+      listTombstones(): ReturnType<SignedR2ListClient["listTombstones"]>;
+    };
+    subject.listRaw = async () => keys.map((key, index) => ({ key: `sync/${key}`, size: 1, etag: `meta-${index}`, lastModified: index }));
+    subject.getObject = async (key) => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await new Promise<void>(resolve => releases.push(resolve));
+      active--;
+      return encodeTombstone(records[keys.indexOf(key)]!);
+    };
+
+    const pending = subject.listTombstones();
+    await vi.waitFor(() => expect(releases).toHaveLength(8));
+    expect(maximum).toBe(8);
+    releases.splice(0).forEach(release => release());
+    await vi.waitFor(() => expect(releases).toHaveLength(8));
+    releases.splice(0).forEach(release => release());
+    await vi.waitFor(() => expect(releases).toHaveLength(1));
+    releases.splice(0).forEach(release => release());
+    await expect(pending).resolves.toMatchObject(records.map(tombstone => ({ tombstone })));
+    expect(maximum).toBe(8);
   });
 
   it("skips a record that retention removed between the listing and the read", async () => {
