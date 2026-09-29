@@ -67,6 +67,28 @@ describe("SyncScheduler", () => {
     expect(events).toEqual(["authorize:shared.md", "execute", "settle:shared.md"]);
   });
 
+  it("does not ask the Gateway for noop or conflict observations", async () => {
+    const authorized: string[] = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({
+      captureCycle: () => base([
+        { type: "noop", key: "same.md", reason: "unchanged" },
+        { type: "conflict", key: "conflict.md", conflict: "both-modified", reason: "test" },
+      ]),
+      visible: () => true,
+      timers,
+      hotAuthority: {
+        authorize: async (key) => { authorized.push(key); return "unreachable"; },
+        settle: async () => {},
+      },
+    });
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    expect(authorized).toEqual([]);
+    expect(scheduler.diagnostics().lastResultCounts).toMatchObject({ noop: 1, conflict: 1 });
+  });
+
   it("proceeds when the authority cannot be asked, and defers when it answers no", async () => {
     const executed: string[] = [];
     const run = async (verdict: "unreachable" | "deferred") => {

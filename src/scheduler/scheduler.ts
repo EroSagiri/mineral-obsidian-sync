@@ -211,7 +211,12 @@ export class SyncScheduler {
             // The authority is asked before the mutation and released after it: a lease that was
             // released before the write would guard nothing.
             let authority: HotAuthorityVerdict | undefined;
-            if (this.dependencies.hotAuthority) {
+            // The cross-device lease protects mutations, not observations. Asking the Gateway for
+            // hundreds of `noop`/`conflict` rows turns a control-plane outage into a multi-minute cold
+            // scan even though those rows cannot write either side. Keep the authority boundary exactly
+            // around operations that can reach the executor.
+            const mutates = operation.type !== "noop" && operation.type !== "conflict";
+            if (mutates && this.dependencies.hotAuthority) {
               authority = await this.dependencies.hotAuthority.authorize(operation.key);
               if (authority === "deferred") {
                 counts.deferred++;
