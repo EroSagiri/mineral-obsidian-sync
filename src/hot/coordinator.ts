@@ -200,7 +200,7 @@ export class HotSyncCoordinator implements HotPathFence {
    * a local file whose content is not a version the room knows must *not* be merged in. That decision
    * belongs to the server, and `conflict` is its answer.
    */
-  async open(input: { canonicalPath: string; editor: Editor; localText: string; adoptRemote?: boolean }): Promise<HotOpenOutcome> {
+  async open(input: { canonicalPath: string; editor: Editor; localText: string; adoptRemote?: boolean; isCurrent?: () => boolean }): Promise<HotOpenOutcome> {
     const existing = this.sessions.get(input.canonicalPath);
     if (existing) return { outcome: "hot", session: existing };
 
@@ -321,6 +321,20 @@ export class HotSyncCoordinator implements HotPathFence {
       // resolution from applying the wrong remedy — which is the loop a real device hit.
       this.conflictOrigins.set(input.canonicalPath, acquired.reason === "local-remote-mismatch" ? "mismatch" : "room");
       return { outcome: "conflict", ...(acquired.reason ? { reason: acquired.reason } : {}), binding: acquired.binding, remote: acquired.remote };
+    }
+    /**
+     * Acquiring a room is asynchronous, while Obsidian can switch the pane and reuse its Editor object.
+     * The caller owns that UI identity and gets the last word immediately before this binding becomes
+     * capable of writing. A superseded acquire is abandoned without ever attaching its observer.
+     */
+    if (input.isCurrent && !input.isCurrent()) {
+      session.abandon();
+      this.hotPaths.delete(input.canonicalPath);
+      this.handoffPaths.delete(input.canonicalPath);
+      this.conflicts.delete(input.canonicalPath);
+      this.conflictOrigins.delete(input.canonicalPath);
+      await this.deps.store.deleteSession(input.canonicalPath).catch(() => undefined);
+      return { outcome: "rejected", reason: "superseded", binding: acquired.binding, remote: acquired.remote };
     }
     this.unavailable.delete(input.canonicalPath);
     // Registered *before* the seed, because the seed is an edit that has to travel through the session.
@@ -999,7 +1013,6 @@ export class HotSyncCoordinator implements HotPathFence {
     return `${type}:${path}`;
   }
 }
-
 
 
 

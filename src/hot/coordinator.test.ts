@@ -116,6 +116,19 @@ async function ackLastOperation(socket: FakeSocket, session: { handleFrame(frame
 const welcome = (revision = 0) => ({ protocol: 1, type: "welcome", documentId: DOCUMENT, epoch: 1, canonicalPath: PATH, state: "active", serverRevision: revision, latestCheckpointedRevision: revision, crdtState: welcomeState(), pendingSave: false });
 
 describe("hot namespace deletion", () => {
+  it("abandons a superseded acquire before its binding can write to a reused editor", async () => {
+    const { coordinator, sockets, store } = harness();
+
+    const result = await coordinator.open({ canonicalPath: PATH, editor: fakeEditor("local"), localText: "local", isCurrent: () => false });
+
+    expect(result).toMatchObject({ outcome: "rejected", reason: "superseded" });
+    expect(coordinator.bindingFor(PATH)).toBeUndefined();
+    expect(coordinator.sessionFor(PATH)).toBeUndefined();
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].closed).toBe(true);
+    expect((await store.loadSessions()).filter(record => record.canonicalPath === PATH)).toEqual([]);
+  });
+
   it("shuts down every session transport and drops every editor binding on plugin unload", async () => {
     const { coordinator, sockets } = harness();
     await coordinator.open({ canonicalPath: PATH, editor: fakeEditor(""), localText: "" });

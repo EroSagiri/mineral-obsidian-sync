@@ -97,6 +97,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly hotStore = new IndexedDbHotStateStore();
   /** The one path this device currently holds open hot, if any. */
   private hotOpenPath?: string;
+  /**
+   * File-open events are not a document lifecycle by themselves: Obsidian can emit the next one while
+   * the previous hot acquire is still waiting on HTTP/WebSocket state, and it may reuse the same Editor
+   * object for the new file. Serialize those transitions and invalidate the older request immediately.
+   * Without both halves, an old room can attach to the editor now showing a different note and project
+   * its remote text into that note.
+   */
+  private hotDocumentTransition: Promise<void> = Promise.resolve();
+  private hotDocumentRequest = 0;
   private hotLastError?: string;
   /** Development only: the recent debug lines, so a device can report its own reasoning. */
   private readonly debugRing: string[] = [];
@@ -499,15 +508,35 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
 
   /** Opens the hot session for the file the user just brought into focus. */
-  private async openHotDocument(file: TFile): Promise<void> {
+  private openHotDocument(file: TFile): Promise<void> {
+    const request = ++this.hotDocumentRequest;
+    const transition = this.hotDocumentTransition
+      .catch(() => undefined)
+      .then(() => this.openHotDocumentNow(file, request));
+    this.hotDocumentTransition = transition;
+    return transition;
+  }
+
+  /** Performs one serialized file transition, provided no newer file-open request superseded it. */
+  private async openHotDocumentNow(file: TFile, request: number): Promise<void> {
     const coordinator = this.hotCoordinator;
-    if (!coordinator || file.extension !== "md") return;
-    if (createVaultPathFilter(this.settings).ignores(file.path)) return;
+    if (request !== this.hotDocumentRequest || !coordinator) return;
+    // The latest file-open is also a close request when the new target cannot be hot. Leaving the previous
+    // Markdown binding alive here is especially dangerous for ignored notes because Obsidian may reuse its
+    // Editor object for the ignored file.
+    if (file.extension !== "md") {
+      await this.closeHotDocumentNow();
+      return;
+    }
     // Resolve the pane *before* giving up the current session. A file-open event can arrive for a file
     // whose view is not the active one yet — mobile fires these more freely than desktop does — and
     // closing first turned a spurious event into "the document I was editing quietly stopped being hot".
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view || view.file?.path !== file.path) return;
+    if (createVaultPathFilter(this.settings).ignores(file.path)) {
+      await this.closeHotDocumentNow();
+      return;
+    }
     if (this.hotOpenPath === file.path) {
       // The file is already hot, but the *pane* may have been rebuilt since (restoring the workspace,
       // switching modes, moving the tab), and the session would then be observing an editor nobody types
@@ -515,18 +544,29 @@ export default class R2PersonalSyncPlugin extends Plugin {
       coordinator.rebind(file.path, view.editor);
       return;
     }
-    await this.closeHotDocument();
+    await this.closeHotDocumentNow();
+    if (request !== this.hotDocumentRequest || this.hotCoordinator !== coordinator) return;
     try {
       // The editor is the right source when the user has been typing, but a mobile pane can still be
       // showing an unloaded buffer when `file-open` fires. The file is the truth then, and taking it
       // matters: a session seeded with nothing would leave the note with no revision at all until
       // somebody happened to type into it.
-      let localText = view.editor.getValue();
+      const currentView = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (!currentView || currentView.file?.path !== file.path) return;
+      const editor = currentView.editor;
+      let localText = editor.getValue();
       if (localText.length === 0) {
         try { localText = await this.app.vault.read(file); }
         catch { /* an unreadable file leaves the session to adopt content later */ }
       }
-      const outcome = await coordinator.open({ canonicalPath: file.path, editor: view.editor, localText });
+      if (request !== this.hotDocumentRequest || this.hotCoordinator !== coordinator) return;
+      const isCurrent = () => {
+        if (request !== this.hotDocumentRequest || this.hotCoordinator !== coordinator) return false;
+        const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+        return active?.file?.path === file.path && active.editor === editor;
+      };
+      const outcome = await coordinator.open({ canonicalPath: file.path, editor, localText, isCurrent });
+      if (!isCurrent()) return;
       if (outcome.outcome === "hot") {
         this.hotOpenPath = file.path;
         this.debug(`hot opened path-digest=${pathDigest(file.path)} epoch=${outcome.identity?.epoch ?? 0}`);
@@ -550,7 +590,17 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * file: the disk may not have been written yet, and comparing the wrong half would either report a
    * false mismatch or, worse, a false match.
    */
-  private async closeHotDocument(): Promise<void> {
+  private closeHotDocument(): Promise<void> {
+    ++this.hotDocumentRequest;
+    const transition = this.hotDocumentTransition
+      .catch(() => undefined)
+      .then(() => this.closeHotDocumentNow());
+    this.hotDocumentTransition = transition;
+    return transition;
+  }
+
+  /** Closes the current session from inside the serialized transition queue. */
+  private async closeHotDocumentNow(): Promise<void> {
     const coordinator = this.hotCoordinator;
     const path = this.hotOpenPath;
     if (!coordinator || !path) return;
@@ -1781,8 +1831,6 @@ function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistory
     ...(facts.order === undefined ? {} : { order: facts.order }),
   };
 }
-
-
 
 
 

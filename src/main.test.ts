@@ -423,6 +423,42 @@ describe("hot ownership from the cold path's point of view", () => {
     expect(opened).toEqual(["note.md"]);
   });
 
+  it("serializes rapid file switches and never accepts the old room for a reused editor", async () => {
+    const env = harness({ buffer: "local" });
+    const opened: string[] = [];
+    const guards: Array<() => boolean> = [];
+    let releaseFirst!: () => void;
+    const firstAcquire = new Promise<void>(resolve => { releaseFirst = resolve; });
+    attach(env.plugin, {
+      open: async (input: { canonicalPath: string; isCurrent?: () => boolean }) => {
+        opened.push(input.canonicalPath);
+        guards.push(input.isCurrent!);
+        if (input.canonicalPath === "note.md") await firstAcquire;
+        return { outcome: "hot" };
+      },
+      close: async () => ({ outcome: "handed-off" }),
+      rebind: () => undefined,
+    });
+    const plugin = env.plugin as unknown as {
+      openHotDocument(file: { path: string; extension: string }): Promise<void>;
+      hotOpenPath?: string;
+    };
+
+    const first = plugin.openHotDocument({ path: "note.md", extension: "md" });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    // Obsidian reuses the pane and its Editor instance while the first acquire is still in flight.
+    env.view.file = { path: "other.md", extension: "md" };
+    const second = plugin.openHotDocument({ path: "other.md", extension: "md" });
+
+    expect(guards[0]()).toBe(false);
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(opened).toEqual(["note.md", "other.md"]);
+    expect(guards[1]()).toBe(true);
+    expect(plugin.hotOpenPath).toBe("other.md");
+  });
+
   it("does not register a cold change for a path a hot session owns", async () => {
     const env = harness();
     const hot = hotStub(["hot.md"]);
@@ -1135,7 +1171,6 @@ describe("restoring an earlier version", () => {
     expect(opened).toBe(1);
   });
 });
-
 
 
 
