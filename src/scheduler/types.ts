@@ -35,7 +35,12 @@ export interface CycleDependencies {
   localIncrementalObservations?(keys: string[]): Promise<{ local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> }>;
   loadPrevious(): Promise<Map<string, PreviousEntry>>;
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
-  buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
+  /**
+   * Planning may first verify an identical local/remote pair that has no baseline yet. This happens
+   * after a hot handoff or an interrupted first download and is the only safe way to turn that pair
+   * into a cold-sync noop without asking the user to resolve a conflict.
+   */
+  buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan | Promise<SyncPlan>;
   execute(operation: SyncOperation): Promise<OperationResult>;
   /** Confirms an executor-originated Vault write has not been changed again before its event is ignored. */
   localWriteStillMatches?(entry: LocalEntry): Promise<boolean>;

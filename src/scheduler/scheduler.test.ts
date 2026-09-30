@@ -28,6 +28,27 @@ function setup(capture: () => CycleDependencies, debug?: (message: string) => vo
 }
 
 describe("SyncScheduler", () => {
+  it("awaits baseline verification before executing the resulting plan", async () => {
+    const executed: string[] = [];
+    let release!: () => void;
+    const verified = new Promise<void>((resolve) => { release = resolve; });
+    const { scheduler, timers } = setup(() => ({
+      ...base([]),
+      buildPlan: async () => {
+        await verified;
+        return { operations: [{ type: "prune-baseline", key: "verified.md", reason: "verified" }] };
+      },
+      execute: async (operation) => { executed.push(operation.key); return { status: "applied", key: operation.key }; },
+    }));
+
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    expect(executed).toEqual([]);
+    release();
+    await flush();
+    expect(executed).toEqual(["verified.md"]);
+  });
   it("defers an operation whose path a hot session owns, without executing it", async () => {
     // The fence is asked at the mutation boundary: a plan may be built while a path is cold and reach
     // the executor after it became hot, and that window is the whole reason the check is here.

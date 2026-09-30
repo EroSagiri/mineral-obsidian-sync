@@ -191,7 +191,7 @@ export class SyncScheduler {
         if (this.shouldStop(generation)) halted = true;
         if (!halted) {
           const observations = { local, remote, previous: useRemoteIncremental || useLocalIncremental ? stored : cycle.filterPrevious(stored) };
-          const plan = cycle.buildPlan(local, remote, observations.previous);
+          const plan = await cycle.buildPlan(local, remote, observations.previous);
           if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict"), observations));
           const planCounts = new Map<string, number>();
           for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);

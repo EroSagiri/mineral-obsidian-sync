@@ -1528,11 +1528,26 @@ export default class R2PersonalSyncPlugin extends Plugin {
       }),
       loadPrevious: () => this.stateStore.loadAll(),
       filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
-      buildPlan: (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => buildSyncPlan(local, remote, previous, this.coordinator?.resolutions(), {
-        // Ownership is a plan input, not only an execution check: a hot path must never be described as
-        // an upload, a download, or a deletion inference that some later stage has to remember to skip.
-        deferPath: (key) => this.hotCoordinator?.isFenced(key) ?? false,
-      }),
+      buildPlan: async (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => {
+        // A completed hot handoff, an interrupted first download, or an older client can leave the same
+        // bytes on both sides without a cold baseline. Treating that pair as `both-created-different`
+        // permanently strands the file: the conflict coordinator intentionally cannot resolve a
+        // conflict that has no ancestor. Verify the bytes here, in the real scheduler path, and persist
+        // only proven-identical pairs before the deterministic planner runs.
+        const bootstrap = await buildBootstrapResult(local, remote, previous, {
+          readLocal: (_key, expected) => readStableLocalBytes(this.app.vault, expected),
+          readRemote: (key, expected) => client.getObject(key, { ifMatch: expected.etag }),
+        }, undefined, identity, ignorePolicy);
+        await this.stateStore.saveVerified(bootstrap.baselineCandidates);
+        if (bootstrap.baselineCandidates.size) this.debug(`cycle bootstrap verified=${bootstrap.baselineCandidates.size}`);
+        const verifiedPrevious = new Map(previous);
+        for (const [key, entry] of bootstrap.baselineCandidates) verifiedPrevious.set(key, entry);
+        return buildSyncPlan(local, remote, verifiedPrevious, this.coordinator?.resolutions(), {
+          // Ownership is a plan input, not only an execution check: a hot path must never be described as
+          // an upload, a download, or a deletion inference that some later stage has to remember to skip.
+          deferPath: (key) => this.hotCoordinator?.isFenced(key) ?? false,
+        });
+      },
       execute: (operation: Parameters<SafeExecutor["execute"]>[0]) => executor.execute(operation),
       localWriteStillMatches: async (entry: LocalEntry) => {
         const observed = await this.app.vault.adapter.stat(entry.key);
@@ -1831,7 +1846,6 @@ function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistory
     ...(facts.order === undefined ? {} : { order: facts.order }),
   };
 }
-
 
 
 
