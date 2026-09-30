@@ -115,7 +115,14 @@ export function buildSyncPlan(
       const changedLocal = localChanged(here, before), changedRemote = remoteChanged(there, before);
       if (!changedLocal && !changedRemote) operations.push(operation("noop", key, "unchanged since previous successful sync"));
       else if (changedLocal && !changedRemote) operations.push({ type: "upload", key, reason: "local changed since previous successful sync", expectedLocal: here, expectedRemote: { kind: "etag", value: there.etag } });
-      else if (!changedLocal && changedRemote && there.size === 0 && here.size > 0) operations.push(operation("conflict", key, "the remote revision is empty while the local file is not", "remote-emptied"));
+      else if (!changedLocal && changedRemote && there.size === 0 && here.size > 0) {
+        // An unexplained empty remote revision is a conflict, never an automatic download. Once the
+        // coordinator has inspected that exact local version + empty ETag and produced a valid intent,
+        // however, this branch must let the resolution run. Ignoring it here left the intent active but
+        // emitted the same conflict forever, so `conflict-auto-merge` continuously restarted cold sync.
+        operations.push(resolutionOperation(resolutions?.get(key), key, here, there)
+          ?? operation("conflict", key, "the remote revision is empty while the local file is not", "remote-emptied"));
+      }
       else if (!changedLocal && changedRemote) operations.push({ type: "download", key, reason: "remote changed since previous successful sync", expectedLocal: here, expectedRemote: there });
       else operations.push(resolutionOperation(resolutions?.get(key), key, here, there) ?? operation("conflict", key, "both sides changed since previous successful sync", "both-modified"));
     } else if (!here && !there) {

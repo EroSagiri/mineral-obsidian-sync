@@ -152,6 +152,29 @@ describe("an emptied remote revision is a question, not a download", () => {
     );
     expect(emptyLocal.operations[0]).toMatchObject({ type: "download" });
   });
+
+  it("executes a validated merge intent instead of rediscovering the empty-remote conflict forever", () => {
+    const here = local("note.md", 120, 100);
+    const there = remote("note.md", 0, "etag-empty", 2000);
+    const merged = { content: "local survives\n", sha256: "merged-sha", encoding: { bom: false, eol: "lf" as const, trailingNewline: true } };
+
+    const planned = buildSyncPlan(
+      new Map([["note.md", here]]),
+      new Map([["note.md", there]]),
+      new Map([["note.md", previous("note.md", 120, 100, "etag-a", 1000)]]),
+      new Map([["note.md", { intent: { conflictId: "empty-remote-conflict", type: "merged", merged } }]]),
+    );
+
+    expect(planned.operations).toEqual([{
+      type: "resolve-merged",
+      key: "note.md",
+      reason: expect.any(String),
+      conflictId: "empty-remote-conflict",
+      expectedLocal: here,
+      expectedRemoteETag: "etag-empty",
+      merged,
+    }]);
+  });
 });
 
 describe("hot ownership is a plan input, not only an execution check", () => {
@@ -208,4 +231,3 @@ describe("path normalization", () => {
   });
   it.each(["/../note.md", "folder/../note.md", "", "folder//note.md"])("rejects non-canonical traversal or empty paths: %s", (value) => expect(() => canonicalKey(value)).toThrow());
 });
-
