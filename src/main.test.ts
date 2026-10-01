@@ -423,6 +423,25 @@ describe("hot ownership from the cold path's point of view", () => {
     expect(opened).toEqual(["note.md"]);
   });
 
+  it("does not let a hot room fence the cold executor that must apply a pending conflict decision", async () => {
+    const env = harness({ buffer: "local" });
+    const opened: string[] = [];
+    attach(env.plugin, {
+      open: async (input: { canonicalPath: string }) => { opened.push(input.canonicalPath); return { outcome: "hot" }; },
+      close: async () => ({ outcome: "handed-off" }),
+      rebind: () => undefined,
+    });
+    (env.plugin as unknown as { coordinator: { list(): Promise<Array<{ path: string }>> } }).coordinator = {
+      list: async () => [{ path: "note.md" }],
+    };
+
+    await (env.plugin as unknown as { openHotDocument(file: { path: string; extension: string }): Promise<void> })
+      .openHotDocument({ path: "note.md", extension: "md" });
+
+    expect(opened).toEqual([]);
+    expect(env.notices.some(line => line.includes("reason=cold-conflict"))).toBe(true);
+  });
+
   it("serializes rapid file switches and never accepts the old room for a reused editor", async () => {
     const env = harness({ buffer: "local" });
     const opened: string[] = [];
@@ -993,6 +1012,18 @@ describe("history records what a resolution actually did", () => {
     expect(entry.result.content).toBe("kept\n");
     expect(entry.localBefore?.content).toBe("kept\n");
     expect(entry.metadata.resolutionType).toBe("keep-local");
+  });
+
+  it("records the applied Vault bytes when an older conflict has no text snapshot", async () => {
+    const env = historyEnv({ file: "kept from disk\n" });
+    env.records.push(conflictRecord("manual-old", "base-unavailable", {
+      snapshot: { baseAvailable: false },
+    }));
+    env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "manual-old", channel: "channel-1", path: "note.md", type: "keep-local", createdAt: 2, origin: "manual" });
+
+    await env.plugin.clearResolution("manual-old", "note.md");
+
+    expect(env.history.entries[0]?.result.content).toBe("kept from disk\n");
   });
 
   it("records an automatic handoff merge as a merge event, with the evidence behind it", async () => {

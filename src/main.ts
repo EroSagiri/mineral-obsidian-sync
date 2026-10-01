@@ -540,6 +540,17 @@ export default class R2PersonalSyncPlugin extends Plugin {
       await this.closeHotDocumentNow();
       return;
     }
+    // A durable cold conflict owns this path until its version-bound decision has actually landed.
+    // Taking the same path hot here creates a lock inversion: the hot room fences the cold executor,
+    // while only that executor can apply and retire the conflict. The resolver then appears to accept
+    // every click but can never finish. Keep the path cold until `clearResolution` removes the record;
+    // that method re-opens the still-active file afterwards.
+    if (await this.hasColdConflict(file.path)) {
+      await this.closeHotDocumentNow();
+      this.debug(`hot open deferred path-digest=${pathDigest(file.path)} reason=cold-conflict`);
+      this.scheduler?.refreshStatus();
+      return;
+    }
     if (this.hotOpenPath === file.path) {
       // The file is already hot, but the *pane* may have been rebuilt since (restoring the workspace,
       // switching modes, moving the tab), and the session would then be observing an editor nobody types
@@ -584,6 +595,17 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.debug(`hot open failed path-digest=${pathDigest(file.path)} error=${error instanceof Error ? error.message : "unknown"}`);
     }
     this.scheduler?.refreshStatus();
+  }
+
+  /** Fail closed when the durable conflict store cannot be read: hot ownership must not hide a decision. */
+  private async hasColdConflict(path: string): Promise<boolean> {
+    const coordinator = this.coordinator;
+    if (!coordinator) return false;
+    try { return (await coordinator.list()).some(record => record.path === path); }
+    catch {
+      this.debug(`hot open deferred path-digest=${pathDigest(path)} reason=conflict-store-unavailable`);
+      return true;
+    }
   }
 
   /**
@@ -1730,6 +1752,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
     await this.recordResolutionHistory(channel, conflictId, path);
     await this.coordinator?.clear(conflictId, path);
     await this.refreshConflictStatus();
+    // The cold conflict was the only reason this path was not allowed to become hot. If it is still the
+    // active note, hand it back to the hot layer now rather than requiring a tab switch or app restart.
+    if (this.app.workspace.getActiveFile?.()?.path === path) this.openActiveFileHot();
   }
 
   /**
@@ -1745,7 +1770,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
       if (!record) return;
       const intent = await this.coordinator?.intentFor(path);
       const resolutionType = intent?.conflictId === conflictId ? intent.type : "unknown";
-      const result = this.resolutionResultText(record, intent);
+      let result = this.resolutionResultText(record, intent);
+      // Older/base-unavailable conflict records may have no text snapshot. An applied keep decision did
+      // not produce an empty file: the executor read or wrote the real Vault bytes. Record those current
+      // bytes instead of fabricating an empty result that the History screen could later restore.
+      if (result === undefined && (intent?.type === "keep-local" || intent?.type === "keep-remote")) {
+        const file = this.app.vault.getFileByPath(path);
+        if (file) result = await this.app.vault.read(file);
+      }
       if (result === undefined) return;
 
       const base = record.snapshot.baseAvailable && record.snapshot.base !== undefined ? await snapshotOf(record.snapshot.base) : undefined;
@@ -1771,8 +1803,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private resolutionResultText(record: ConflictRecord, intent: ResolutionIntent | undefined): string | undefined {
     if (intent?.merged) return intent.merged.content;
     switch (intent?.type) {
-      case "keep-local": return record.snapshot.local ?? "";
-      case "keep-remote": return record.snapshot.remote ?? "";
+      case "keep-local": return record.snapshot.local;
+      case "keep-remote": return record.snapshot.remote;
       case "accept-remote-delete":
       case "accept-local-delete": return "";
       default: return record.snapshot.draft ?? record.snapshot.local;
