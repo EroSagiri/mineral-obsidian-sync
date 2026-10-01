@@ -48,6 +48,7 @@ import { HotSyncCoordinator } from "./hot/coordinator";
 import { IndexedDbHotStateStore } from "./hot/store";
 import type { HotBaseline } from "./hot/types";
 import { hotContentHash } from "@mineral/sync-core/hot-protocol";
+import { DebugLogger } from "./logging/debug-logger";
 
 type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
 
@@ -107,8 +108,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private hotDocumentTransition: Promise<void> = Promise.resolve();
   private hotDocumentRequest = 0;
   private hotLastError?: string;
-  /** Development only: the recent debug lines, so a device can report its own reasoning. */
-  private readonly debugRing: string[] = [];
+  /**
+   * The plugin's debug logger. The plugin itself owns the lifecycle and feeds its settings in; all
+   * modules receive a `tag(name)` closure that emits under their module tag.
+   */
+  private logger!: DebugLogger;
   /** The last disk content this plugin observed per hot path, so an unchanged file never looks external. */
   private readonly hotDiskText = new Map<string, string>();
   /**
@@ -168,7 +172,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     }),
     transport: new RequestUrlGatewayTransport(),
     now: () => Date.now(),
-    debug: (message) => this.debug(message),
+    debug: this.taggedDebug("mutation-ingress"),
   });
   /** The derived channel for the current settings, refreshed once per cycle. */
   private resolvedChannel?: string;
@@ -186,6 +190,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
       ...current,
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
+    this.logger = new DebugLogger(this.app, {
+      getSettings: () => this.settings,
+      pluginDir: this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+    });
+    if (this.settings.persistDebugLog) void this.logger.restoreFromDisk();
     this.addSettingTab(new R2SyncSettingTab(this.app, this));
     this.addCommand({ id: "r2-sync-inspect-state", name: "Mineral Sync: Inspect Sync State", callback: () => this.inspectSyncState() });
     this.addCommand({ id: "r2-sync-test-connection", name: "R2 Sync: Test Connection", callback: () => this.testConnection() });
@@ -194,6 +203,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.addCommand({ id: "r2-sync-resolve-conflicts", name: "Mineral Sync: Resolve Conflicts", callback: () => this.openConflictResolver() });
     this.addCommand({ id: "r2-sync-resolve-hot-conflicts", name: "Mineral Sync: Resolve Hot Sync Conflicts", callback: () => this.openHotConflictResolver() });
     this.addCommand({ id: "r2-sync-history", name: "Mineral Sync: Open Sync History", callback: () => this.openSyncHistory() });
+    this.addCommand({ id: "r2-sync-show-debug-log", name: "Mineral Sync: Show Debug Log", callback: () => this.showDebugLog() });
+    this.addCommand({ id: "r2-sync-capture-debug-slice", name: "Mineral Sync: Capture Debug Slice", callback: () => this.captureDebugSlice() });
     // Development-only diagnostics: never registered, and not even bundled, in production.
     if (__DEV__) {
       registerDevelopmentSelfTests({
@@ -235,7 +246,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
         },
         onStatusChanged: () => this.scheduler?.refreshStatus(),
       },
-      { openSocket: (url) => new WebSocket(url), now: () => Date.now(), timerSet: (delay, callback) => window.setTimeout(callback, delay), timerClear: (handle) => window.clearTimeout(handle as number), debug: (message) => this.debug(message) },
+      { openSocket: (url) => new WebSocket(url), now: () => Date.now(), timerSet: (delay, callback) => window.setTimeout(callback, delay), timerClear: (handle) => window.clearTimeout(handle as number), debug: this.taggedDebug("gateway") },
     );
     this.coordinator = new ConflictCoordinator({
       vault: this.app.vault,
@@ -247,13 +258,13 @@ export default class R2PersonalSyncPlugin extends Plugin {
       conflicts: this.conflictStores,
       intents: this.conflictStores,
       requestReconcile: (reason) => this.scheduler?.requestReconcile(reason),
-      debug: (message) => this.debug(message),
+      debug: this.taggedDebug("conflict"),
     });
     this.scheduler = new SyncScheduler({
       visible: () => typeof document === "undefined" || document.visibilityState !== "hidden",
       captureCycle: (reason) => this.captureSchedulerCycle(reason),
       onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
-      debug: (message) => this.debug(message),
+      debug: this.taggedDebug("scheduler"),
       onConflicts: (conflicts) => this.handleConflicts(conflicts),
       // A second control-plane port, for the service that owns the *facts* rather than the wake-up. It is
       // handed only what this device observed a write to leave in R2, and its answer is never read: the
@@ -312,6 +323,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.hotCoordinator = undefined;
     this.hotOpenPath = undefined;
     this.gateway?.stop();
+    // The disk sink is serialised; flush so a settings toggle or log line right before close is not lost.
+    void this.logger.flush();
   }
 
   async saveSettings(): Promise<void> {
@@ -397,7 +410,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
           // version that won, or to reconcile the local file against whatever R2 holds.
           this.scheduler?.requestReconcile("hot-resolution");
         },
-        debug: (message) => this.debug(message),
+        debug: this.taggedDebug("hot.coordinator"),
       });
       const restored = await coordinator.restore();
       this.hotCoordinator = coordinator;
@@ -904,11 +917,16 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * next to `data.json`, which is the only way to see *which* gate refused the decision on that device.
    */
   private debug(message: string): void {
-    if (this.settings.debugLogging) console.log(`[Mineral Obsidian Sync] ${message}`);
-    if (__DEV__) {
-      this.debugRing.push(`${new Date().toISOString()} ${message}`);
-      if (this.debugRing.length > 200) this.debugRing.splice(0, this.debugRing.length - 200);
-    }
+    this.logger.log("main", message);
+  }
+
+  /**
+   * Returns a closure tagged with `tag`. The logger itself is read lazily, so it is safe to call this
+   * from field initialisers that run before `onload` has wired the logger in: the returned function
+   * reads `this.logger` at call time, which is always after construction.
+   */
+  private taggedDebug(tag: string): (message: string) => void {
+    return (message) => { this.logger?.log(tag, message); };
   }
 
   /**
@@ -984,13 +1002,13 @@ export default class R2PersonalSyncPlugin extends Plugin {
     if (!this.settings.endpoint.trim() || !this.settings.bucket.trim()) return;
     try {
       const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
-      const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
+      const client = new SignedR2ListClient(settings, undefined, undefined, undefined, this.taggedDebug("r2"));
       await pruneExpiredTombstones(client, {
         now: Date.now(),
         // The compactor itself now requires proof of supersession from R2. Local state cannot make a
         // current deletion safe to erase, and cannot make an already-superseded record unsafe.
         protect: () => false,
-        debug: (message) => this.debug(message),
+        debug: this.taggedDebug("tombstone"),
       });
     } catch (error) {
       this.debug(`tombstone cleanup skipped class=${error instanceof Error ? error.name : "unknown"}`);
@@ -1058,7 +1076,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
             `decision: ${decision}`,
             `status: ${this.hotSyncStatusText()}`,
             "",
-            ...this.debugRing.slice(-60),
+            ...this.logger.read(60),
             "",
           ].join("\n");
           void this.app.vault.adapter.write("private/mineral-sync-hot-selftest/resolve-failure.txt", report).catch(() => undefined);
@@ -1094,7 +1112,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     new SyncHistoryModal(this.app, {
       list: () => this.history.list(channel),
       restore: (input) => this.restoreFromHistory(input),
-      debug: (message) => this.debug(message),
+      debug: this.taggedDebug("history"),
     }).open();
   }
 
@@ -1564,9 +1582,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const filter = createVaultPathFilter(settings);
     const ignorePolicy = ignorePolicyFingerprint(settings);
     const identity = remoteIdentity(settings);
-    const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
+    const client = new SignedR2ListClient(settings, undefined, undefined, undefined, this.taggedDebug("r2"));
     const channel = this.currentChannel();
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message));
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, this.taggedDebug("executor"));
     // One definition of a usable baseline, shared by every observation path in the cycle: a baseline from
     // another namespace, or one invalidated by an ignore-policy change, must never decide anything.
     const acceptsBaseline = (key: string, entry: PreviousEntry): boolean =>
@@ -1577,7 +1595,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
-      scanRemote: () => scanRemote(client, filter, (message) => this.debug(message), reason === "integrity-check" || !settings.gatewayEnabled || !settings.gatewayEndpoint || !settings.gatewayToken || !this.gateway?.currentChannel()
+      scanRemote: () => scanRemote(client, filter, this.taggedDebug("scan-remote"), reason === "integrity-check" || !settings.gatewayEnabled || !settings.gatewayEndpoint || !settings.gatewayToken || !this.gateway?.currentChannel()
         ? undefined
         : async () => {
           try {
@@ -1703,7 +1721,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // interruption this behaviour exists to remove.
       list: () => this.pendingConflicts(),
       propose: (intent) => coordinator.propose(intent),
-      debug: (message) => this.debug(message),
+      debug: this.taggedDebug("conflict"),
     }).open();
   }
 
@@ -1918,6 +1936,44 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.showErrorStatus("Sync inspection failed");
       new Notice("Sync inspection failed. Check settings, network, and R2 access.");
     } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; this.scheduler?.refreshStatus(); }
+  }
+
+  /**
+   * Renders the last 60 in-memory log lines into a Notice.
+   *
+   * The on-disk log at `<pluginDir>/debug.log` is the canonical artefact, but it is not always
+   * readable from a phone, and reading it back through Obsidian's adapter would surface binary noise.
+   * A notice keeps the ring viewable from the menu without forcing a file write.
+   */
+  showDebugLog(): void {
+    const lines = this.logger.read(60);
+    if (lines.length === 0) {
+      new Notice("Mineral Sync debug log is empty. Run a sync cycle first, or turn on Debug Logging in settings.");
+      return;
+    }
+    const chunkSize = 30;
+    for (let offset = 0; offset < lines.length; offset += chunkSize) {
+      const chunk = lines.slice(offset, offset + chunkSize).join("\n");
+      new Notice(chunk, 8000);
+    }
+    new Notice(`Mineral Sync debug log: ${lines.length} in ring. Persist at: ${this.logger.diskPath()}`, 12_000);
+  }
+
+  /**
+   * Writes the line containing ring slice since the last `mark()` to `<pluginDir>/debug-slices/...`.
+   *
+   * The label includes a short timestamp by default; the user can extend it by setting a manual
+   * marker through the future `mark("label")` API. Without an explicit label, the slice file is
+   * named `manual-<iso>.log`.
+   */
+  async captureDebugSlice(): Promise<void> {
+    const path = await this.logger.captureSlice("manual");
+    if (path === undefined) {
+      new Notice("Mineral Sync: debug slice capture failed (adapter error).");
+      return;
+    }
+    new Notice(`Mineral Sync: debug slice written to ${path}`, 10_000);
+    this.debug(`captured debug slice path=${path}`);
   }
 }
 

@@ -4,8 +4,42 @@ import { R2Configuration } from "./remote/r2-client";
 import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings } from "./gateway/types";
 import { DEFAULT_MUTATION_INGRESS_SETTINGS, type MutationIngressSettingsFields } from "./gateway/mutation-ingress";
 
+/**
+ * The tags a user can choose to keep. The legacy `"main"` tag is the one the plugin's own
+ * `this.debug()` façade emits under; it is always-on regardless of the filter, so a setting
+ * change can never silence the plugin itself. The synthetic `"mark"` tag is also always-on
+ * so a manual `mark()` always shows up.
+ */
+export const AVAILABLE_LOG_TAGS = [
+  "main",
+  "hot.coordinator",
+  "hot.session",
+  "hot.editor",
+  "scheduler",
+  "executor",
+  "gateway",
+  "mutation-ingress",
+  "conflict",
+  "tombstone",
+  "r2",
+  "scan-remote",
+  "android",
+  "mark",
+] as const;
+
+export type LogTag = (typeof AVAILABLE_LOG_TAGS)[number] | string;
+
 export interface R2SyncSettings extends R2Configuration, GatewaySettings, MutationIngressSettingsFields {
   debugLogging: boolean;
+  /** Append the log to `<pluginDir>/debug.log`; the sink that survives a restart and an `adb pull`. */
+  persistDebugLog: boolean;
+  /** Max lines kept on disk before rotation kicks in. */
+  persistDebugLogMaxLines: number;
+  /**
+   * `"*"` allows every tag. An array restricts to those (the legacy `"main"` tag stays on regardless).
+   * Empty array disables all module-tagged output but keeps the plugin's own `this.debug()` working.
+   */
+  enabledLogTags: string[] | "*";
   ignoredPaths: string[];
   integrityReconcileIntervalMinutes: number;
   /** This device's hot-session identity; minted once, never shown to the user. */
@@ -22,7 +56,14 @@ export interface R2SyncSettings extends R2Configuration, GatewaySettings, Mutati
 export const DEFAULT_SETTINGS: R2SyncSettings = {
   ...DEFAULT_GATEWAY_SETTINGS, ...DEFAULT_MUTATION_INGRESS_SETTINGS,
   endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "",
-  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20, hotSyncEnabled: false, hotClientId: "",
+  debugLogging: false,
+  persistDebugLog: false,
+  persistDebugLogMaxLines: 2000,
+  enabledLogTags: "*",
+  ignoredPaths: [],
+  integrityReconcileIntervalMinutes: 20,
+  hotSyncEnabled: false,
+  hotClientId: "",
 };
 
 export class R2SyncSettingTab extends PluginSettingTab {
@@ -71,6 +112,45 @@ export class R2SyncSettingTab extends PluginSettingTab {
     });
     new Setting(containerEl).setName("Test Connection").setDesc("Runs a read-only R2 ListObjectsV2 request.").addButton((button) => button.setButtonText("Test Connection").onClick(async () => this.plugin.testConnection()));
     new Setting(containerEl).setName("Inspect Sync State").setDesc("Scans metadata, safely verifies ambiguous equal-size pairs, and records only verified-identical initial baselines. It never writes local files or R2 objects.").addButton((button) => button.setButtonText("Inspect").setCta().onClick(async () => this.plugin.inspectSyncState()));
+    containerEl.createEl("h3", { text: "Debug logging" });
+    containerEl.createEl("p", { text: "Output lands in three places at once: the WebView console (when Debug Logging is on); an in-memory ring of the last 200 lines (always on, used by the resolve-failure report); and the on-disk log at <pluginDir>/debug.log (when Persist Debug Log is on). Use the command palette's `Mineral Sync: Capture Debug Slice` to dump everything since a `mark()` to a separate file." });
+    new Setting(containerEl).setName("Debug logging (console)").setDesc("Echo every log line to the WebView developer tools. Off by default; turning it on does not change what's recorded.").addToggle((toggle) => toggle.setValue(this.plugin.settings.debugLogging).onChange(async (value) => { this.plugin.settings.debugLogging = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Persist debug log (debug.log)").setDesc("Append every log line to <pluginDir>/debug.log, rotated to the last N lines. This is the sink a phone user can pull with `adb`, and the only one that survives an Obsidian restart.").addToggle((toggle) => toggle.setValue(this.plugin.settings.persistDebugLog).onChange(async (value) => { this.plugin.settings.persistDebugLog = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Disk log line cap").setDesc("How many lines the on-disk log keeps before rotation drops the oldest. Larger values mean a longer history on device, at the cost of disk and re-read time.").addText((input) => {
+      input.setValue(String(this.plugin.settings.persistDebugLogMaxLines)).setPlaceholder("2000");
+      input.inputEl.type = "number";
+      input.onChange(async (value) => { this.plugin.settings.persistDebugLogMaxLines = Math.max(200, Math.min(50_000, Number.parseInt(value, 10) || 2000)); await this.plugin.saveSettings(); });
+    });
+    containerEl.createEl("h4", { text: "Module tags" });
+    containerEl.createEl("p", { text: "Each log line is tagged with the module that produced it. Leave on `All tags` to keep everything; switch to `Only these tags` and list one or more to narrow what is recorded. The legacy `main` tag is always on so its own output is never silenced by accident." });
+    new Setting(containerEl).setName("Tag filter").addDropdown((dropdown) => {
+      const enabled = this.plugin.settings.enabledLogTags;
+      dropdown.addOption("*", "All tags");
+      dropdown.addOption("list", "Only these tags");
+      dropdown.setValue(enabled === "*" ? "*" : "list");
+      dropdown.onChange(async (value) => {
+        if (value === "*") this.plugin.settings.enabledLogTags = "*";
+        else if (this.plugin.settings.enabledLogTags === "*") this.plugin.settings.enabledLogTags = ["main"];
+        await this.plugin.saveSettings();
+        this.display();
+      });
+    });
+    if (this.plugin.settings.enabledLogTags !== "*") {
+      const tagsContainer = containerEl.createDiv({ cls: "mineral-sync-tag-list" });
+      for (const tag of AVAILABLE_LOG_TAGS) {
+        if (tag === "main" || tag === "mark") continue;
+        const isOn = (this.plugin.settings.enabledLogTags as string[]).includes(tag);
+        new Setting(tagsContainer).setName(tag).addToggle((toggle) => toggle.setValue(isOn).onChange(async (value) => {
+          const list = new Set(this.plugin.settings.enabledLogTags as string[]);
+          if (value) list.add(tag);
+          else list.delete(tag);
+          this.plugin.settings.enabledLogTags = Array.from(list);
+          await this.plugin.saveSettings();
+        }));
+      }
+    }
+    new Setting(containerEl).setName("Show debug log").setDesc("Open the last 60 in-memory log lines in a modal. For the on-disk log, use the file at <pluginDir>/debug.log directly.").addButton((button) => button.setButtonText("Show log").onClick(() => this.plugin.showDebugLog()));
+    new Setting(containerEl).setName("Capture debug slice").setDesc("Write everything since the most recent `mark()` (or the whole ring if none) to <pluginDir>/debug-slices/<iso>-<label>.log. Add a label like `investigation-20260524`.").addButton((button) => button.setButtonText("Capture…").setCta().onClick(() => this.plugin.captureDebugSlice()));
   }
 }
 

@@ -1,7 +1,7 @@
 {
   "id": "mineral-obsidian-sync",
   "name": "Mineral Obsidian Sync",
-  "version": "0.4.15",
+  "version": "0.4.16",
   "minAppVersion": "1.5.0",
   "description": "R2-only personal sync planner with a safe dry run.",
   "author": "",

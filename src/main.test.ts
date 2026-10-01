@@ -12,6 +12,7 @@ import type { SyncHistoryEntry } from "./history/types";
 import type { R2SyncSettings } from "./settings";
 import type { FailureClass, ResultCounts, SchedulerState } from "./scheduler/types";
 import type { LocalEntry, PreviousEntry, RemoteEntry, SyncOperation } from "./sync/types";
+import { DebugLogger } from "./logging/debug-logger";
 
 /**
  * The Android editor-save path, driven directly.
@@ -94,7 +95,21 @@ function harness(options: { buffer?: string; before?: Stamp | null; after?: Stam
   plugin.settings = settings;
   plugin.scheduler = { markLocalPaths: (paths, _ignores, reason) => { for (const path of paths) marked.push({ path, reason }); return true; }, refreshStatus: () => undefined };
   plugin.stateStore = { loadAll: async () => new Map() };
-  (plugin as unknown as { debug(message: string): void }).debug = (message) => { notices.push(message); };
+  // The plugin's own debug() fan-out needs the logger to be present even in tests; a stub adapter
+  // is enough because these specs read the captured 'notices', not the disk file.
+  const stubAdapter = {
+    exists: async () => false,
+    read: async () => "",
+    write: async () => undefined,
+    append: async () => undefined,
+    mkdir: async () => undefined,
+  };
+  const logger = new DebugLogger({ vault: { adapter: stubAdapter } } as unknown as ConstructorParameters<typeof DebugLogger>[0], {
+    getSettings: () => settings,
+    pluginDir: "/test-plugin",
+  });
+  (plugin as unknown as { logger: DebugLogger }).logger = logger;
+  (plugin as unknown as { debug(message: string): void }).debug = (message) => { notices.push(message); logger.log("main", message); };
   return {
     plugin, view, views, marked, notices, handlers, settings, state,
     /** Set the hot layer's switches on the plugin's own settings object, before wiring decisions read it. */
