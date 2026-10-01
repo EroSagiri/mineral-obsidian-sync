@@ -14,6 +14,8 @@ export interface R2Client {
   listTombstones?(): Promise<RemoteDeletion[]>;
   /** Used for capability probing and diagnostics; the execution path never issues a HEAD. */
   headObject(key: string, options?: { ifMatch?: string }): Promise<RemoteEntry>;
+  /** Proves one exact object revision without requiring response metadata that the caller will not use. */
+  verifyObjectVersion?(key: string, etag: string): Promise<void>;
   getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
   putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion>;
   /** Immutable conditional create. A duplicate of the same path/version is an equivalent success. */
@@ -137,6 +139,11 @@ export class SignedR2ListClient implements R2Client {
     return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
+  async verifyObjectVersion(key: string, etag: string): Promise<void> {
+    const response = await this.send("VerifyObjectVersion", "HEAD", this.objectUrl(key), { "if-match": `"${etag}"` });
+    if (response.status === 412) throw new RemoteObjectChangedError();
+    if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("VerifyObjectVersion", response.status);
+  }
   async getObject(key: string, options: { ifMatch?: string } = {}): Promise<ArrayBuffer> { const response = await this.send("GetObject", "GET", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("GetObject", response.status); return response.arrayBuffer; }
   /**
    * Conditional write, recorded **from its own response**.

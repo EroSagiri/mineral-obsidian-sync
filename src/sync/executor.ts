@@ -206,7 +206,7 @@ export class SafeExecutor {
     if (!etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     if (!this.r2.putTombstone) return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
     try {
-      await this.r2.headObject(operation.key, { ifMatch: etag });
+      await this.verifyRemoteVersion(operation.key, etag);
     } catch (error) {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
       return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
@@ -323,7 +323,7 @@ export class SafeExecutor {
   private async acceptRemoteDelete(operation: Extract<SyncOperation, { type: "resolve-accept-remote-delete" }>): Promise<OperationResult> {
     // Reconfirm the physical object still is the version named by the tombstone. A later B object
     // survives tombstone(A), and must also stop an old "accept delete" click from trashing local B.
-    if (operation.expectedDeletion.objectPresent) try { await this.r2.headObject(operation.key, { ifMatch: operation.expectedDeletion.deletedRemoteETag }); }
+    if (operation.expectedDeletion.objectPresent) try { await this.verifyRemoteVersion(operation.key, operation.expectedDeletion.deletedRemoteETag); }
     catch (error) {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "conflict-superseded" };
       return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
@@ -378,6 +378,12 @@ export class SafeExecutor {
    */
   private landed(result: Extract<OperationResult, { status: "unresolved" | "partial" }>, remote: RemoteVersion): OperationResult {
     return { ...result, remote };
+  }
+
+  /** A delete needs only the conditional verdict; object metadata belongs to observation, not mutation. */
+  private async verifyRemoteVersion(key: string, etag: string): Promise<void> {
+    if (this.r2.verifyObjectVersion) return this.r2.verifyObjectVersion(key, etag);
+    await this.r2.headObject(key, { ifMatch: etag });
   }
 
   private async commit(entry: PreviousEntry): Promise<Extract<OperationResult, { status: "unresolved" }> | undefined> {

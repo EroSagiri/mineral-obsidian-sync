@@ -30,6 +30,25 @@ describe("SignedR2ListClient.getObject", () => {
   });
 });
 
+describe("SignedR2ListClient.verifyObjectVersion", () => {
+  it("accepts a successful conditional HEAD even when R2 omits object metadata", async () => {
+    let request: { method?: string; headers?: Record<string, string> } | undefined;
+    setRequestUrlHandler(async (value) => {
+      request = value;
+      return { status: 200, arrayBuffer: new ArrayBuffer(0), text: "", headers: {}, json: {} };
+    });
+
+    await expect(client().verifyObjectVersion("deleted.md", "etag-a")).resolves.toBeUndefined();
+    expect(request?.method).toBe("HEAD");
+    expect(request?.headers?.["if-match"]).toBe('"etag-a"');
+  });
+
+  it("still treats a failed precondition as a changed object", async () => {
+    setRequestUrlHandler(async () => ({ status: 412, arrayBuffer: new ArrayBuffer(0), text: "", headers: {}, json: {} }));
+    await expect(client().verifyObjectVersion("deleted.md", "etag-a")).rejects.toBeInstanceOf(RemoteObjectChangedError);
+  });
+});
+
 describe("SignedR2ListClient.putObject", () => {
   it("records the baseline from the PUT response itself, with no confirmation HEAD", async () => {
     const methods: string[] = [];
