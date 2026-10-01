@@ -49,6 +49,7 @@ import { IndexedDbHotStateStore } from "./hot/store";
 import type { HotBaseline } from "./hot/types";
 import { hotContentHash } from "@mineral/sync-core/hot-protocol";
 import { DebugLogger } from "./logging/debug-logger";
+import { pickLocaleFromMoment, setLocale as setLangLocale, t } from "./lang";
 
 type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
 
@@ -190,21 +191,31 @@ export default class R2PersonalSyncPlugin extends Plugin {
       ...current,
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
+    // Pick the active UI locale from Obsidian's moment — Obsidian sets it from the user's
+    // language preference, so this matches what the rest of the app does. Falling back to
+    // Chinese is intentional: the canonical copy lives there, and `t()` itself falls back to
+    // English when a translation is missing.
+    try {
+      const momentLocale = (this.app as unknown as { moment?: { locale: () => string } }).moment?.locale?.();
+      setLangLocale(pickLocaleFromMoment(momentLocale));
+    } catch {
+      /* the default is fine */
+    }
     this.logger = new DebugLogger(this.app, {
       getSettings: () => this.settings,
       pluginDir: this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
     });
     if (this.settings.persistDebugLog) void this.logger.restoreFromDisk();
     this.addSettingTab(new R2SyncSettingTab(this.app, this));
-    this.addCommand({ id: "r2-sync-inspect-state", name: "Mineral Sync: Inspect Sync State", callback: () => this.inspectSyncState() });
-    this.addCommand({ id: "r2-sync-test-connection", name: "R2 Sync: Test Connection", callback: () => this.testConnection() });
-    this.addCommand({ id: "r2-sync-now", name: "Mineral Sync: Sync Now", callback: () => this.scheduler?.requestReconcile("manual") });
-    this.addCommand({ id: "r2-sync-gateway-status", name: "Mineral Sync: Gateway Status", callback: () => this.reportGatewayStatus() });
-    this.addCommand({ id: "r2-sync-resolve-conflicts", name: "Mineral Sync: Resolve Conflicts", callback: () => this.openConflictResolver() });
-    this.addCommand({ id: "r2-sync-resolve-hot-conflicts", name: "Mineral Sync: Resolve Hot Sync Conflicts", callback: () => this.openHotConflictResolver() });
-    this.addCommand({ id: "r2-sync-history", name: "Mineral Sync: Open Sync History", callback: () => this.openSyncHistory() });
-    this.addCommand({ id: "r2-sync-show-debug-log", name: "Mineral Sync: Show Debug Log", callback: () => this.showDebugLog() });
-    this.addCommand({ id: "r2-sync-capture-debug-slice", name: "Mineral Sync: Capture Debug Slice", callback: () => this.captureDebugSlice() });
+    this.addCommand({ id: "r2-sync-inspect-state", name: t("command.inspect"), callback: () => this.inspectSyncState() });
+    this.addCommand({ id: "r2-sync-test-connection", name: t("command.testConnection"), callback: () => this.testConnection() });
+    this.addCommand({ id: "r2-sync-now", name: t("command.syncNow"), callback: () => this.scheduler?.requestReconcile("manual") });
+    this.addCommand({ id: "r2-sync-gateway-status", name: t("command.gatewayStatus"), callback: () => this.reportGatewayStatus() });
+    this.addCommand({ id: "r2-sync-resolve-conflicts", name: t("command.resolveConflicts"), callback: () => this.openConflictResolver() });
+    this.addCommand({ id: "r2-sync-resolve-hot-conflicts", name: t("command.resolveHotConflicts"), callback: () => this.openHotConflictResolver() });
+    this.addCommand({ id: "r2-sync-history", name: t("command.openHistory"), callback: () => this.openSyncHistory() });
+    this.addCommand({ id: "r2-sync-show-debug-log", name: t("command.showDebugLog"), callback: () => this.showDebugLog() });
+    this.addCommand({ id: "r2-sync-capture-debug-slice", name: t("command.captureDebugSlice"), callback: () => this.captureDebugSlice() });
     // Development-only diagnostics: never registered, and not even bundled, in production.
     if (__DEV__) {
       registerDevelopmentSelfTests({
@@ -384,7 +395,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
         onStatus: (path, status, detail) => this.debug(`hot status path-digest=${pathDigest(path)} status=${status}${detail ? ` detail=${detail}` : ""}`),
         onConflict: (path, reason) => {
           this.debug(`hot conflict path-digest=${pathDigest(path)} reason=${reason}`);
-          new Notice(`Mineral Sync：${path} 的热同步进入冲突状态（${reason}），冷同步已暂停该路径，内容未被覆盖。点击状态栏可决定保留哪一份。`);
+          new Notice(t("notice.hotConflict", { path, reason }));
           this.scheduler?.refreshStatus();
         },
         // A resolution needs the *disk* bytes: for an external edit that is the version this device did
@@ -416,7 +427,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.hotCoordinator = coordinator;
       this.hotLastError = undefined;
       this.debug(`hot ready channel=${channel.slice(0, 6)}… sessions=${restored.sessions.length} handoffs=${restored.handoffs}`);
-      if (restored.handoffs > 0) new Notice(`Mineral Sync：${restored.handoffs} 个文件的交接尚未完成，将在打开时继续。`);
+      if (restored.handoffs > 0) new Notice(t("notice.hotRestoredHandoffs", { count: restored.handoffs }));
       // Enabling the feature is itself a reason to take the current document hot: the user just asked for
       // it, and the file they are looking at is the one they mean.
       this.openActiveFileHot();
@@ -599,10 +610,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
         this.debug(`hot opened path-digest=${pathDigest(file.path)} epoch=${outcome.identity?.epoch ?? 0}`);
       } else {
         this.debug(`hot not opened path-digest=${pathDigest(file.path)} outcome=${outcome.outcome} reason=${outcome.reason ?? "n/a"}`);
-        if (outcome.outcome === "conflict") new Notice(`Mineral Sync：${file.path} 与服务器版本不一致，已保持冷同步。没有任何内容被覆盖。`);
+        if (outcome.outcome === "conflict") new Notice(t("notice.openConflictWithRemote", { path: file.path }));
         // "Unavailable" is not a conflict and no choice can settle it, so it says what actually happened
         // instead of offering a resolution that cannot work.
-        else if (outcome.outcome === "rejected") new Notice(`Mineral Sync：服务器暂时无法提供 ${file.path}（${outcome.reason ?? "unavailable"}），热同步没有启动，冷同步不受影响。稍后重新打开该文件即可重试。`);
+        else if (outcome.outcome === "rejected") new Notice(t("notice.openUnavailable", { path: file.path, reason: outcome.reason ?? "unavailable" }));
       }
     } catch (error) {
       this.debug(`hot open failed path-digest=${pathDigest(file.path)} error=${error instanceof Error ? error.message : "unknown"}`);
@@ -648,7 +659,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       const outcome = await coordinator.close({ canonicalPath: path, localText });
       this.debug(`hot close path-digest=${pathDigest(path)} outcome=${outcome.outcome}${outcome.detail ? ` detail=${outcome.detail}` : ""}`);
       if (outcome.outcome === "handoff-pending") {
-        new Notice(`Mineral Sync：${path} 的热会话交接尚未完成，交接期间该文件不会被冷同步覆盖。`);
+        new Notice(t("notice.handoffPending", { path }));
       }
     } catch (error) {
       this.debug(`hot close failed path-digest=${pathDigest(path)} error=${error instanceof Error ? error.message : "unknown"}`);
@@ -758,13 +769,13 @@ export default class R2PersonalSyncPlugin extends Plugin {
     if (!source && !target) return;
     if (!(source instanceof TFile) || target) {
       this.hotCoordinator?.flagExternalEdit(toPath);
-      new Notice(`Mineral Sync：服务器已将 ${fromPath} 重命名为 ${toPath}，但本地目标路径被占用。该路径已暂停同步，请先处理本地文件。`);
+      new Notice(t("notice.renameTargetTaken", { fromPath, toPath }));
       return;
     }
     const parents = await ensureParentFolders(this.app.vault, toPath);
     if (!parents.ok) {
       this.hotCoordinator?.flagExternalEdit(toPath);
-      new Notice(`Mineral Sync：无法在本地创建 ${toPath} 的父目录，热同步已暂停该路径。`);
+      new Notice(t("notice.renameParentMissing", { toPath }));
       return;
     }
     const echoKey = `${fromPath}\u0000${toPath}`;
@@ -775,7 +786,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.hotRenameEchoes.delete(echoKey);
       this.hotCoordinator?.flagExternalEdit(toPath);
       this.debug(`hot remote rename failed path-digest=${pathDigest(toPath)} error=${error instanceof Error ? error.message : "unknown"}`);
-      new Notice(`Mineral Sync：服务器重命名已完成，但本地文件无法移动到 ${toPath}；该路径已暂停同步。`);
+      new Notice(t("notice.renameMoveFailed", { toPath }));
     }
   }
 
@@ -797,7 +808,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
         return true;
       }
       this.debug(`hot rename refused path-digest=${pathDigest(fromPath)} reason=${result.reason ?? result.outcome}`);
-      if (result.outcome === "conflict") new Notice(`Mineral Sync：${fromPath} 的重命名未同步到热会话（${result.reason ?? "conflict"}）。该文件已按普通本地变更进入冷同步，热会话仍持有原路径。`);
+      if (result.outcome === "conflict") new Notice(t("notice.renameRefused", { fromPath, reason: result.reason ?? "conflict" }));
       return false;
     } catch (error) {
       this.debug(`hot rename failed path-digest=${pathDigest(fromPath)} error=${error instanceof Error ? error.message : "unknown"}`);
@@ -872,9 +883,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   async reportGatewayStatus(): Promise<void> {
     const { config, connection } = this.gatewayDiagnostics();
-    if (config.kind === "disabled") { new Notice("Mineral Sync: Sync Gateway is disabled. Cold sync is unaffected."); return; }
-    if (config.kind === "misconfigured") { new Notice(`Mineral Sync: Sync Gateway is misconfigured (${config.reason}). Cold sync is unaffected.`); return; }
-    if (!connection) { new Notice("Mineral Sync: Sync Gateway has not started yet."); return; }
+    if (config.kind === "disabled") { new Notice(t("notice.gatewayDisabled")); return; }
+    if (config.kind === "misconfigured") { new Notice(t("notice.gatewayMisconfigured", { reason: config.reason })); return; }
+    if (!connection) { new Notice(t("notice.gatewayNotStarted")); return; }
     const lines = [
       `channel ${connection.channelFingerprint ?? "n/a"}`,
       `state ${connection.state}`,
@@ -884,7 +895,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     ];
     if (connection.lastErrorKind) lines.push(`last error ${connection.lastErrorKind}${connection.lastStatus ? ` (HTTP ${connection.lastStatus})` : ""}`);
     this.debug(`gateway status ${lines.join(" · ")}`);
-    new Notice(`Mineral Sync Gateway — ${lines.join(" · ")}`);
+    new Notice(t("notice.gatewayReport", { lines: lines.join(" · ") }));
   }
 
   private onVisibilityChanged(visible: boolean): void {
@@ -1045,12 +1056,12 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private openHotConflictResolver(): void {
     const coordinator = this.hotCoordinator;
     if (!coordinator) {
-      new Notice("Mineral Sync：热同步当前没有运行。");
+      new Notice(t("notice.noHotRunning"));
       return;
     }
     const conflicts = coordinator.hotConflicts();
     if (conflicts.length === 0) {
-      new Notice("Mineral Sync：没有需要处理的热同步冲突。");
+      new Notice(t("notice.noHotConflicts"));
       return;
     }
     // What each side holds is part of the question, so it is gathered before the user is asked. A blind
@@ -1093,8 +1104,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   private openStatusMenu(event: MouseEvent): void {
     const menu = new Menu();
-    menu.addItem((item) => item.setTitle("Sync history").setIcon("history").onClick(() => void this.openSyncHistory()));
-    menu.addItem((item) => item.setTitle("Status details").setIcon("info").onClick(() => this.reportStatusDetails()));
+    menu.addItem((item) => item.setTitle(t("statusMenu.history")).setIcon("history").onClick(() => void this.openSyncHistory()));
+    menu.addItem((item) => item.setTitle(t("statusMenu.details")).setIcon("info").onClick(() => this.reportStatusDetails()));
     menu.showAtMouseEvent(event);
   }
 
@@ -1108,7 +1119,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   private async openSyncHistory(): Promise<void> {
     const channel = this.currentChannel() ?? await this.resolveChannel();
-    if (!channel) { new Notice("Mineral Sync: sync history needs a configured endpoint and bucket."); return; }
+    if (!channel) { new Notice(t("notice.historyNeedsConfig")); return; }
     new SyncHistoryModal(this.app, {
       list: () => this.history.list(channel),
       restore: (input) => this.restoreFromHistory(input),
@@ -1133,7 +1144,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     // The hot layer's own state, so "syncing" is never a single word covering four different situations.
     if (this.settings.hotSyncEnabled) lines.push(this.hotSyncStatusText());
     this.debug(`status details ${lines.join(" · ")}`);
-    new Notice(`Mineral Sync — ${lines.join("\n")}`);
+    new Notice(t("notice.statusDetails", { lines: lines.join("\n") }));
   }
   private registerVaultListeners(): void {
     // A hot path is not a cold candidate. Every local event funnels through this guard, so a hot
@@ -1162,14 +1173,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
           const result = await coordinator.delete(path);
           if (result.outcome !== "applied") {
             this.debug(`hot delete not applied outcome=${result.outcome} reason=${result.reason ?? "-"} path-digest=${pathDigest(path)}`);
-            new Notice(`Mineral Sync：${path} 的删除尚未由服务器确认（${result.reason ?? result.outcome}）。该路径仍保持围栏，稍后会继续恢复，旧正文不会被静默复活。`);
+            new Notice(t("notice.deleteNotConfirmed", { path, reason: result.reason ?? result.outcome }));
           } else {
             this.hotRecentBuffers.delete(path);
             this.hotDiskText.delete(path);
           }
         } catch (error) {
           this.debug(`hot delete failed: ${error instanceof Error ? error.message : "unknown"}`);
-          new Notice(`Mineral Sync：${path} 的删除请求暂时失败。该路径仍保持热同步围栏，等待恢复。`);
+          new Notice(t("notice.deleteRetry", { path }));
         }
       })();
     }));
@@ -1338,7 +1349,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     if (this.isRecentHotBuffer(path, disk)) return false;
 
     if (!coordinator.flagExternalEdit(path)) return true;
-    new Notice(`Mineral Sync：${path} 在热会话期间被外部修改，该文件的冷同步已暂停以避免覆盖。请确认磁盘内容后再决定保留哪一份。`);
+    new Notice(t("notice.externalEditWhileHot", { path }));
     return true;
   }
 
@@ -1899,11 +1910,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
 
   async testConnection(): Promise<void> {
-    try { const remote = await scanRemote(this.client(), createVaultPathFilter(this.settings)); new Notice(`R2 connection succeeded: ${remote.size} sync-eligible object(s) visible.`); }
+    try { const remote = await scanRemote(this.client(), createVaultPathFilter(this.settings)); new Notice(t("notice.r2ConnectionOk", { count: remote.size })); }
     catch (error) {
       const diagnostic = this.safeConnectionDiagnostic(error);
       console.error("[Mineral Obsidian Sync] R2 connection failed", diagnostic);
-      new Notice(`R2 connection failed: ${diagnostic}`);
+      new Notice(t("notice.r2ConnectionFailed", { diagnostic }));
     }
   }
 
@@ -1934,7 +1945,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     } catch (error) {
       console.error("[Mineral Obsidian Sync] sync inspection failed", error instanceof Error ? error.message : "unknown error");
       this.showErrorStatus("Sync inspection failed");
-      new Notice("Sync inspection failed. Check settings, network, and R2 access.");
+      new Notice(t("notice.inspectFailed"));
     } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; this.scheduler?.refreshStatus(); }
   }
 
@@ -1948,7 +1959,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   showDebugLog(): void {
     const lines = this.logger.read(60);
     if (lines.length === 0) {
-      new Notice("Mineral Sync debug log is empty. Run a sync cycle first, or turn on Debug Logging in settings.");
+      new Notice(t("notice.debugLogEmpty"));
       return;
     }
     const chunkSize = 30;
@@ -1956,7 +1967,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       const chunk = lines.slice(offset, offset + chunkSize).join("\n");
       new Notice(chunk, 8000);
     }
-    new Notice(`Mineral Sync debug log: ${lines.length} in ring. Persist at: ${this.logger.diskPath()}`, 12_000);
+    new Notice(t("notice.debugLogChunk", { count: lines.length, path: this.logger.diskPath() }), 12_000);
   }
 
   /**
@@ -1969,10 +1980,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
   async captureDebugSlice(): Promise<void> {
     const path = await this.logger.captureSlice("manual");
     if (path === undefined) {
-      new Notice("Mineral Sync: debug slice capture failed (adapter error).");
+      new Notice(t("notice.debugSliceFailed"));
       return;
     }
-    new Notice(`Mineral Sync: debug slice written to ${path}`, 10_000);
+    new Notice(t("notice.debugSliceWritten", { path }), 10_000);
     this.debug(`captured debug slice path=${path}`);
   }
 }

@@ -1244,7 +1244,7 @@ describe("restoring an earlier version", () => {
 
     await env.plugin.openSyncHistory();
 
-    expect((Notice as unknown as { shown: string[] }).shown.join("\n")).toContain("sync history needs");
+    expect((Notice as unknown as { shown: string[] }).shown.join("\n")).toContain("endpoint 与 bucket");
   });
 
   it("is reachable from the status bar's secondary click", async () => {
@@ -1257,7 +1257,7 @@ describe("restoring an earlier version", () => {
     env.plugin.openStatusMenu({ preventDefault: () => {} } as unknown as MouseEvent);
 
     const items = menus.shown[menus.shown.length - 1]!.items;
-    expect(items.map((item) => item.title)).toEqual(["Sync history", "Status details"]);
+    expect(items.map((item) => item.title)).toEqual(["同步历史", "状态详情"]);
     items[0]!.callback();
     expect(opened).toBe(1);
   });
