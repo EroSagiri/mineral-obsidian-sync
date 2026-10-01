@@ -8,7 +8,9 @@
     "build": "tsc --noEmit && node esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "verify:ingress": "node scripts/verify-mutation-ingress.mjs"
+    "verify:ingress": "node scripts/verify-mutation-ingress.mjs",
+    "sync-core:link": "node scripts/vendor-sync-core.mjs",
+    "sync-core:link:dry-run": "node scripts/vendor-sync-core.mjs --dry-run"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
