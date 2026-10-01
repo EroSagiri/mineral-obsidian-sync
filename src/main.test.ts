@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MarkdownView, Menu, Notice, Platform } from "obsidian";
+import { MarkdownView, Menu, Notice, Platform, TFile } from "obsidian";
 import { FakeElement, flush } from "../test/dom";
 import R2PersonalSyncPlugin from "./main";
 import { DEFAULT_SETTINGS } from "./settings";
@@ -366,14 +366,20 @@ describe("hot ownership from the cold path's point of view", () => {
   function hotStub(fenced: string[], renameOutcome: "applied" | "conflict" = "applied") {
     const deferred: string[] = [];
     const renamed: Array<{ from: string; to: string }> = [];
+    const deleted: string[] = [];
     return {
       deferred,
       renamed,
+      deleted,
       stub: {
         isFenced: (key: string) => fenced.includes(key),
         noteDeferred: (key: string) => { deferred.push(key); },
         // Deleting a file ends its hot state; the tests exercise that handler, so the stub answers it.
         forget: async (key: string) => { void key; },
+        delete: async (key: string) => {
+          deleted.push(key);
+          return { protocol: 1, operationId: "d", type: "delete" as const, outcome: "applied" as const, phase: "acked" as const, canonicalPath: key, binding: null };
+        },
         rename: async (from: string, to: string) => {
           renamed.push({ from, to });
           return renameOutcome === "applied"
@@ -505,6 +511,23 @@ describe("hot ownership from the cold path's point of view", () => {
 
     (env.handlers.get("vault:create") as unknown as (file: { path: string }) => void)({ path: "cold.md" });
     expect(env.marked).toEqual([{ path: "cold.md", reason: undefined }]);
+  });
+
+  it("calls the hot namespace delete only for a path that was hot when Vault removed it", async () => {
+    const env = harness();
+    const hot = hotStub(["hot.md"]);
+    attach(env.plugin, hot.stub);
+    env.plugin.registerVaultListeners();
+    const remove = env.handlers.get("vault:delete") as unknown as (file: TFile) => void;
+    const hotFile = new TFile(); hotFile.path = "hot.md";
+    const coldFile = new TFile(); coldFile.path = "cold.md";
+
+    remove(hotFile);
+    remove(coldFile);
+    await settleHotRename();
+
+    expect(hot.deleted).toEqual(["hot.md"]);
+    expect(env.marked.map(entry => entry.path)).toEqual(["cold.md"]);
   });
 
   it("turns a hot rename into a namespace operation and marks nothing", async () => {

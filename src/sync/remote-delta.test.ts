@@ -17,13 +17,16 @@ import type { PreviousEntry, RemoteEntry } from "./types";
 
 type Calls = string[];
 
-function client(options: { head?: (key: string) => Promise<RemoteEntry>; calls: Calls }): R2Client {
+function client(options: { head?: (key: string) => Promise<RemoteEntry>; get?: (key: string) => Promise<ArrayBuffer>; calls: Calls }): R2Client {
   return {
     listObjects: async () => { options.calls.push("listObjects"); throw new Error("a delta must never list objects"); },
     listTombstones: async () => { options.calls.push("listTombstones"); throw new Error("a delta must never list tombstones"); },
     headObject: async (key: string) => { options.calls.push(`head:${key}`); return options.head ? options.head(key) : { key, size: 3, etag: "E", lastModified: 1_000 }; },
-    getObject: async () => {
-      options.calls.push("get:tombstone");
+    verifyObjectVersion: async (key: string) => { options.calls.push(`verify:${key}`); },
+    getObject: async (key) => {
+      options.calls.push(key === "foo.md" ? `get:${key}` : "get:tombstone");
+      if (options.get) return options.get(key);
+      if (key === "foo.md") return new Uint8Array([1, 2, 3]).buffer;
       return encodeTombstone({ protocol: 1, path: "foo.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" });
     },
     putObject: async () => { options.calls.push("putObject"); throw new Error("a delta never writes"); },
@@ -32,9 +35,9 @@ function client(options: { head?: (key: string) => Promise<RemoteEntry>; calls: 
 
 const previous = (key: string, etag = "E"): PreviousEntry => ({ key, local: { size: 3, mtime: 10 }, remote: { size: 3, etag, lastModified: 900 }, syncedAt: 500 });
 
-function dependencies(calls: Calls, options: { head?: (key: string) => Promise<RemoteEntry>; local?: Map<string, { size: number; mtime: number }>; stored?: Map<string, PreviousEntry> } = {}) {
+function dependencies(calls: Calls, options: { head?: (key: string) => Promise<RemoteEntry>; get?: (key: string) => Promise<ArrayBuffer>; local?: Map<string, { size: number; mtime: number }>; stored?: Map<string, PreviousEntry> } = {}) {
   return {
-    client: client({ head: options.head, calls }),
+    client: client({ head: options.head, get: options.get, calls }),
     ignores: () => false,
     loadPrevious: async () => options.stored ?? new Map([[  "foo.md", previous("foo.md")]]),
     statLocal: async (key: string) => options.local?.get(key) ?? null,
@@ -104,28 +107,40 @@ describe("a Gateway delete reads only its exact tombstone", () => {
 describe("put and rename deltas keep their exact-path shape", () => {
   it("takes a complete put fact without any request at all", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls));
+    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls, { local: new Map([["foo.md", { size: 5, mtime: 1 }]]) }));
 
     expect(calls).toEqual([]);
     expect(observed.remote.get("foo.md")).toMatchObject({ etag: "N", size: 5, lastModified: Date.parse("2026-09-22T00:00:00.000Z") });
   });
 
-  it("heads an incomplete put fact, and asserts the ETag the event claimed", async () => {
+  it("gets an incomplete put fact conditionally, without requiring HEAD metadata", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N" }], dependencies(calls));
+    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N" }], dependencies(calls, { local: new Map([["foo.md", { size: 3, mtime: 1 }]]) }));
 
-    expect(calls).toEqual(["head:foo.md"]);
-    expect(observed.remote.get("foo.md")).toMatchObject({ etag: "E" });
+    expect(calls).toEqual(["get:foo.md"]);
+    expect(observed.remote.get("foo.md")).toMatchObject({ etag: "N", size: 3, lastModified: 900 });
   });
 
   it("treats both halves of a rename as their own exact path", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "rename", from: "old.md", to: "new.md" }], dependencies(calls));
+    const observed = await observeRemoteDelta([{ op: "rename", from: "old.md", to: "new.md" }], dependencies(calls, { local: new Map([["new.md", { size: 3, mtime: 1 }]]) }));
 
     expect(calls).toEqual(["head:new.md"]);
     // The removed side carries no identity, exactly like a deletion whose object is gone.
     expect(observed.remote.has("old.md")).toBe(false);
     expect(observed.remote.get("new.md")).toMatchObject({ key: "new.md" });
+  });
+
+  it("does not resurrect a locally absent note when a delayed put names a tombstoned revision", async () => {
+    const calls: Calls = [];
+    const tombstone = encodeTombstone({ protocol: 1, path: "foo.md", deletedRemoteETag: "N", createdAt: "2026-09-22T00:00:00.000Z" });
+    const observed = await observeRemoteDelta(
+      [{ op: "put", path: "foo.md", etag: "N", size: 3 }],
+      dependencies(calls, { get: async (key) => key === "foo.md" ? new Uint8Array([1, 2, 3]).buffer : tombstone }),
+    );
+
+    expect(calls).toEqual(["verify:foo.md", "get:tombstone"]);
+    expect(observed.remote.get("foo.md")).toMatchObject({ deleted: { deletedRemoteETag: "N", objectPresent: true } });
   });
 });
 
@@ -133,11 +148,11 @@ describe("a delta observes only the paths it names", () => {
   it("filters the baseline to those paths and keeps the namespace rules", async () => {
     const calls: Calls = [];
     const stored = new Map([["foo.md", previous("foo.md")], ["other.md", previous("other.md")]]);
-    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls, { stored }));
+    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls, { stored, local: new Map([["foo.md", { size: 5, mtime: 1 }]]) }));
 
     expect([...observed.previous.keys()]).toEqual(["foo.md"]);
-    // A baseline for a path outside the delta is never touched, and never even loaded twice.
-    expect(observed.local.size).toBe(0);
+    // A baseline for a path outside the delta is never touched; the one named path keeps its local fact.
+    expect([...observed.local.keys()]).toEqual(["foo.md"]);
   });
 
   it("drops a baseline the current namespace does not accept", async () => {

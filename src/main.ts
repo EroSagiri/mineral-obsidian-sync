@@ -1126,6 +1126,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => { if (!(file instanceof TFolder)) void this.markUnlessOwnEditorWrite(file.path); }));
     // A deleted folder cannot be reliably distinguished after removal; treating it as dirty is the safe side.
     this.registerEvent(this.app.vault.on("delete", (file) => {
+      const coordinator = this.hotCoordinator;
+      const wasHot = coordinator?.isFenced(file.path) ?? false;
       mark(file.path);
       if (!(file instanceof TFile)) return;
       // The hot session, the server binding, the R2 object and the tombstone must all agree that this
@@ -1133,8 +1135,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // never told the room: the binding stayed live, R2 kept the body, and another device could
       // download the "deleted" content again. The namespace delete is the server's half of the truth;
       // `forget()` then cleans up whatever the room refused to take.
-      const coordinator = this.hotCoordinator;
-      if (!coordinator) return;
+      // Ordinary cold files are deliberately left to the cold planner. Calling the hot namespace API
+      // for every Vault deletion produces an `unknown-document` error for files no room ever owned.
+      if (!coordinator || !wasHot) return;
       void (async () => {
         const path = file.path;
         try {
