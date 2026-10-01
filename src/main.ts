@@ -4,7 +4,7 @@ import { readStableLocalBytes } from "./local/read-local";
 import { flushAction, isOwnWrite, writeChangedFile, type FileStamp } from "./local/android-editor-save";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
 import { scanRemote } from "./remote/scan-remote";
-import { pruneExpiredTombstones, protectedFromCleanup } from "./remote/tombstone-retention";
+import { pruneExpiredTombstones } from "./remote/tombstone-retention";
 import { DEFAULT_SETTINGS, R2SyncSettingTab, type R2SyncSettings } from "./settings";
 import { IndexedDbStateStore } from "./state/state-store";
 import { buildBootstrapResult } from "./bootstrap/bootstrap";
@@ -42,7 +42,7 @@ import { SYNC_HISTORY_CSS } from "./ui/history-styles";
 import { HotConflictModal } from "./ui/hot-conflict-modal";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type HotStatusInput, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
-import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
+import type { ConflictObservation, ReconcileReason, ResultCounts, SchedulerState } from "./scheduler/types";
 import { HotGatewayClient, type HotHttpRequest, type HotHttpResponse, type HotSocket } from "./hot/client";
 import { HotSyncCoordinator } from "./hot/coordinator";
 import { IndexedDbHotStateStore } from "./hot/store";
@@ -148,7 +148,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly history: SyncHistoryStore = new IndexedDbSyncHistoryStore();
   private lastConflictCount = 0;
   /** Retention is a once-per-session pass, held back until a reconciliation has finished. */
-  private tombstoneCleanup: "waiting" | "ready" | "done" = "waiting";
+  private tombstoneCleanup: "waiting" | "done" = "waiting";
   /**
    * The mutation journal, as this device writes to it.
    *
@@ -249,7 +249,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     });
     this.scheduler = new SyncScheduler({
       visible: () => typeof document === "undefined" || document.visibilityState !== "hidden",
-      captureCycle: () => this.captureSchedulerCycle(),
+      captureCycle: (reason) => this.captureSchedulerCycle(reason),
       onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
       debug: (message) => this.debug(message),
       onConflicts: (conflicts) => this.handleConflicts(conflicts),
@@ -877,30 +877,23 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
 
   /**
-   * Tombstone retention runs once per session, and only once a reconciliation has finished.
+   * Tombstone compaction runs once per session, only after a background integrity check.
    *
    * Deliberately not at load time. Reading the tombstone namespace is the same work a full reconcile
-   * already does, so doing it while a cycle is in flight would double that work and could interleave a
-   * removal with the scan reading the same records. Waiting for the first cycle costs nothing: the
-   * retention window is measured in weeks, so a few seconds either way cannot matter.
+   * already does, so an ordinary startup, manual or foreground sync must never pay it a second time.
    */
   private maybePruneTombstones(state: SchedulerState): void {
-    if (this.tombstoneCleanup === "done") return;
-    if (state === "running") { this.tombstoneCleanup = "ready"; return; }
-    if (this.tombstoneCleanup !== "ready") return;
+    if (this.tombstoneCleanup === "done" || state !== "idle") return;
+    if (this.scheduler?.diagnostics().lastCycleReason !== "integrity-check") return;
     this.tombstoneCleanup = "done";
     void this.pruneTombstones();
   }
 
   /**
-   * Removes tombstones that are old *and* that this device provably no longer needs.
+   * Removes old tombstone history only when R2 proves it has been superseded by a live revision.
    *
-   * There is no cluster-wide acknowledgement that every device has seen a deletion, so age alone is
-   * never sufficient. The protections below are the concrete evidence this device has: an unresolved
-   * conflict (which is where a pending decision lives, since a decision can only be authored against a
-   * detected conflict), a baseline that still describes the path, or a local file that is still here.
-   * All three mean "this deletion has not finished happening on this device", and until it has, the
-   * record that names the deleted version is still load-bearing.
+   * There is no cluster-wide acknowledgement that every device has seen a deletion, so age or this
+   * device's baseline can never authorize deleting the current record or its hidden bytes.
    *
    * Best effort and silent: this is metadata housekeeping on a path that has nothing to do with the
    * sync decision, so a failure is a debug line and nothing else.
@@ -908,22 +901,13 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private async pruneTombstones(): Promise<void> {
     if (!this.settings.endpoint.trim() || !this.settings.bucket.trim()) return;
     try {
-      const channel = await this.resolveChannel();
-      if (!channel) return;
-      this.coordinator?.setChannel(channel);
       const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
-      const filter = createVaultPathFilter(settings);
       const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
-      const [baselines, records] = await Promise.all([this.stateStore.loadAll(), this.coordinator?.list() ?? Promise.resolve([])]);
-      const protections = {
-        conflicted: new Set(records.map((record) => record.path)),
-        baselines: new Set(baselines.keys()),
-        ignored: (key: string) => filter.ignores(key),
-        localFilePresent: (key: string) => this.app.vault.getFileByPath(key) !== null,
-      };
       await pruneExpiredTombstones(client, {
         now: Date.now(),
-        protect: (path) => protectedFromCleanup(protections, path),
+        // The compactor itself now requires proof of supersession from R2. Local state cannot make a
+        // current deletion safe to erase, and cannot make an already-superseded record unsafe.
+        protect: () => false,
         debug: (message) => this.debug(message),
       });
     } catch (error) {
@@ -1490,7 +1474,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     // No recovery-capable API exists, so no destructive action is permitted at all.
     return { trash: async () => { throw new Error("this Obsidian version exposes no trash API"); } };
   }
-  private captureSchedulerCycle() {
+  private captureSchedulerCycle(reason: ReconcileReason) {
     const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
     const filter = createVaultPathFilter(settings);
     const ignorePolicy = ignorePolicyFingerprint(settings);
@@ -1508,7 +1492,21 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
-      scanRemote: () => scanRemote(client, filter, (message) => this.debug(message)),
+      scanRemote: () => scanRemote(client, filter, (message) => this.debug(message), reason === "integrity-check" || !settings.gatewayEnabled || !settings.gatewayEndpoint || !settings.gatewayToken || !this.gateway?.currentChannel()
+        ? undefined
+        : async () => {
+          try {
+            return (await this.gateway!.listDeletions()).map(entry => ({
+              tombstone: { protocol: 1 as const, path: entry.path, deletedRemoteETag: entry.deletedRemoteETag, createdAt: new Date(entry.committedAt).toISOString() },
+              authoritativeLatest: true as const,
+            }));
+          } catch (error) {
+            // The Gateway is an acceleration layer. If its read path is unavailable, retain the old
+            // R2 audit as a correctness-preserving fallback instead of disabling cold sync.
+            this.debug(`deletion index unavailable; falling back to tombstone audit kind=${error instanceof Error ? error.name : "unknown"}`);
+            return client.listTombstones ? client.listTombstones() : [];
+          }
+        }),
       // A Gateway delta is answered path by path: what the event omits is filled in by one exact
       // request, never by a listing. The rules live in `sync/remote-delta` so that they can be tested
       // against the request pattern they are supposed to have.
@@ -1846,5 +1844,3 @@ function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistory
     ...(facts.order === undefined ? {} : { order: facts.order }),
   };
 }
-
-

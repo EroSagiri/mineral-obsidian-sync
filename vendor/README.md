@@ -10,11 +10,11 @@ would make a fresh clone unbuildable on any other machine.
 | Package | `@mineral/sync-core` |
 | Version | `0.2.0` |
 | Source repository | `bedrock-mcp` (`packages/sync-core`) |
-| Source commit | working tree — repacked for the hot conflict-resolution protocol and the coordinator's bounded resume |
+| Source commit | working tree — repacked for deletion-index paging and version-bound delete events |
 | Artifact | `vendor/mineral-sync-core-0.2.0.tgz` |
-| SHA-256 (tarball) | `E78AE67ED14F66F7418CF89293175FBA0FA8BDC8A53485986BFEB0A5FD78FE85` |
-| npm shasum | `bcec7811e4576746fb2d98392a47f7b4ee8788c2` |
-| npm integrity | `sha512-rZqXWgAY8Ie9LmF+a4KCuyB+bzXnLU40NJ7twDIFphrLGs93qnUYyb1UR+v3b41f+H1A5972z3R64d3k2FniRw==` |
+| SHA-256 (tarball) | `F9A2D779E86530F0C7FF10963555BAD263BE36B96DD77A3B0D7F481F6BF16DC2` |
+| npm shasum | `c7e43e9a8f1cf528181493d8cded9a359e07fd75` |
+| npm integrity | `sha512-XcjsfwtDV/4/y25lipsJamKyfRpgSf5px9KopA9sltbmwulJc1Iiy6PGVQlnGuzdedPQkQ6OWSIW8ePMeU2loA==` |
 | Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.2.0.tgz"` |
 
 This revision carries the mutation contract the plugin reports against (`RemoteChangeHint.mutationId`
@@ -23,6 +23,8 @@ and the `RemoteChange[]` hint `/dirty` accepts) **and** the hot-sync protocol: `
 acquisition, cold-mutation authority, session tickets), `namespace-protocol` (create/delete/rename),
 `tombstones` and `paths`. The tombstone derivation moved here so the plugin and the Vault compute the
 same key for the same deletion — a second implementation would be a silent correctness bug.
+It also carries the stable deletion-index page contract and the optional deleted-version ETag on
+Gateway delete events, so clients can verify one immutable tombstone without listing the namespace.
 
 ## Rebuilding this artifact
 

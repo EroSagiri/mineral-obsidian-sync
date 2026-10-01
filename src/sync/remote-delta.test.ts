@@ -22,7 +22,10 @@ function client(options: { head?: (key: string) => Promise<RemoteEntry>; calls: 
     listObjects: async () => { options.calls.push("listObjects"); throw new Error("a delta must never list objects"); },
     listTombstones: async () => { options.calls.push("listTombstones"); throw new Error("a delta must never list tombstones"); },
     headObject: async (key: string) => { options.calls.push(`head:${key}`); return options.head ? options.head(key) : { key, size: 3, etag: "E", lastModified: 1_000 }; },
-    getObject: async () => { options.calls.push("getObject"); throw new Error("a delta must never read an object body"); },
+    getObject: async () => {
+      options.calls.push("get:tombstone");
+      return encodeTombstone({ protocol: 1, path: "foo.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" });
+    },
     putObject: async () => { options.calls.push("putObject"); throw new Error("a delta never writes"); },
   };
 }
@@ -39,15 +42,15 @@ function dependencies(calls: Calls, options: { head?: (key: string) => Promise<R
   };
 }
 
-describe("a Gateway delete is answered with one HEAD", () => {
+describe("a Gateway delete reads only its exact tombstone", () => {
   it("names the deleted version from the object that is still there", async () => {
     const calls: Calls = [];
-    const changes: RemoteChange[] = [{ op: "delete", path: "foo.md" }];
+    const changes: RemoteChange[] = [{ op: "delete", path: "foo.md", etag: "E" }];
 
     const observed = await observeRemoteDelta(changes, dependencies(calls));
 
-    // One exact request for the one path, and no listing of any kind.
-    expect(calls).toEqual(["head:foo.md"]);
+    // The event already names the version, so there is no HEAD and no listing: one exact metadata GET.
+    expect(calls).toEqual(["get:tombstone"]);
     // The tombstone is written without removing the object, so the deleted version is the object's own
     // ETag — and it lives *only* in the deletion identity. Nothing that describes a live object is left
     // on the entry, because a full scan produces exactly these fields and the conflict identity is
@@ -62,9 +65,9 @@ describe("a Gateway delete is answered with one HEAD", () => {
 
   it("reads the local file as well when this device still has it", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md" }], dependencies(calls, { local: new Map([["foo.md", { size: 9, mtime: 42 }]]) }));
+    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md", etag: "E" }], dependencies(calls, { local: new Map([["foo.md", { size: 9, mtime: 42 }]]) }));
 
-    expect(calls).toEqual(["head:foo.md"]);
+    expect(calls).toEqual(["get:tombstone"]);
     expect(observed.local.get("foo.md")).toEqual({ key: "foo.md", size: 9, mtime: 42 });
   });
 
@@ -139,7 +142,7 @@ describe("a delta observes only the paths it names", () => {
 
   it("drops a baseline the current namespace does not accept", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md" }], { ...dependencies(calls), acceptsBaseline: () => false });
+    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md", etag: "E" }], { ...dependencies(calls), acceptsBaseline: () => false });
 
     expect(observed.previous.size).toBe(0);
     // The observation itself is unaffected: a decision never depends on a baseline being usable.

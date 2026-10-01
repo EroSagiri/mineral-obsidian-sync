@@ -821,7 +821,7 @@ interface HistoryInternals extends Internals {
   restoreFromHistory(input: { path: string; content: string; sourceHistoryId: string }): Promise<void>;
   openSyncHistory(): Promise<void>;
   openStatusMenu(event: MouseEvent): void;
-  tombstoneCleanup: "waiting" | "ready" | "done";
+  tombstoneCleanup: "waiting" | "done";
   maybePruneTombstones(state: SchedulerState): void;
   pruneTombstones(): Promise<void>;
   conflictObservations(conflicts: Array<Extract<SyncOperation, { type: "conflict" }>>, local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): Array<Record<string, unknown>>;
@@ -873,6 +873,7 @@ function historyEnv(options: { file?: string | null } = {}) {
     markLocalPaths: (paths: string[]) => { marked.push(...paths); return true; },
     refreshStatus: () => {},
     requestReconcile: (reason: string) => { reconciles.push(reason); },
+    diagnostics: () => ({ lastCycleReason: "integrity-check" }),
   };
   // A state-store write here would mean a restore had moved the baseline, which is exactly what it must
   // never do: the baseline is what makes the next cycle compare the restored text as a local change.
@@ -954,7 +955,7 @@ describe("history records what a resolution actually did", () => {
     const env = historyEnv();
     env.records.push(conflictRecord("manual-delete", "manual-required", {
       reason: "remote logical deletion conflicts with a local modification",
-      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", objectPresent: true },
+      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z", objectPresent: true },
       // The other device deleted it, so there is no remote content to record — only the local edit that
       // is about to be given up.
       snapshot: { local: "edited while away\n", base: "base\n", baseAvailable: true },
@@ -978,7 +979,7 @@ describe("history records what a resolution actually did", () => {
   it("records the note the user kept when a deletion was refused", async () => {
     const env = historyEnv();
     env.records.push(conflictRecord("manual-revive", "manual-required", {
-      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", objectPresent: true },
+      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z", objectPresent: true },
       snapshot: { local: "kept\n", baseAvailable: true },
     }));
     env.intents.set("note.md", { protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId: "manual-revive", channel: "channel-1", path: "note.md", type: "keep-local", createdAt: 2, origin: "manual" });
@@ -1036,11 +1037,11 @@ describe("a Gateway delete reaches the resolver as a deletion", () => {
       listObjects: async () => { throw new Error("a delta must never list objects"); },
       listTombstones: async () => { throw new Error("a delta must never list tombstones"); },
       headObject: async (key: string) => ({ key, size: 3, etag: "E", lastModified: 1_000 }),
-      getObject: async () => { throw new Error("unused"); },
+      getObject: async () => new TextEncoder().encode(JSON.stringify({ protocol: 1, path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" })).buffer,
       putObject: async () => { throw new Error("a delta does not write"); },
     };
     const previousEntry: PreviousEntry = { key: "note.md", local: { size: 3, mtime: 10 }, remote: { size: 3, etag: "E" }, syncedAt: 1 };
-    const observed = await observeRemoteDelta([{ op: "delete", path: "note.md" }], {
+    const observed = await observeRemoteDelta([{ op: "delete", path: "note.md", etag: "E" }], {
       client, ignores: () => false,
       loadPrevious: async () => new Map([["note.md", previousEntry]]),
       statLocal: async () => ({ size: 9, mtime: 42 }),
@@ -1056,7 +1057,12 @@ describe("a Gateway delete reaches the resolver as a deletion", () => {
       key: "note.md",
       previous: previousEntry,
       observedLocal: { key: "note.md", size: 9, mtime: 42 },
-      observedRemoteDeletion: { path: "note.md", deletedRemoteETag: "E", objectPresent: true },
+      observedRemoteDeletion: {
+        path: "note.md",
+        deletedRemoteETag: "E",
+        createdAt: "2026-09-22T00:00:00.000Z",
+        objectPresent: true,
+      },
     }]);
     // Which is what makes the resolver offer "Keep note" and "Delete note" rather than a text editor.
     const record = { ...conflictRecord("manual-1", "manual-required"), ...conflicts[0]!, snapshot: { local: "kept\n", baseAvailable: true } } as ConflictRecord;
@@ -1090,7 +1096,7 @@ describe("tombstone retention is a once-per-session pass", () => {  /** The pass
     env.plugin.maybePruneTombstones("debouncing");
     expect(env.plugin.tombstoneCleanup).toBe("waiting");
     env.plugin.maybePruneTombstones("running");
-    expect(env.plugin.tombstoneCleanup).toBe("ready");
+    expect(env.plugin.tombstoneCleanup).toBe("waiting");
     expect(skipped()).toBe(0);
 
     env.plugin.maybePruneTombstones("idle");
@@ -1186,7 +1192,3 @@ describe("restoring an earlier version", () => {
     expect(opened).toBe(1);
   });
 });
-
-
-
-

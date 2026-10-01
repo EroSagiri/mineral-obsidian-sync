@@ -37,6 +37,14 @@ function client(options: { objects?: Array<{ key: string; size: number; etag?: s
 }
 
 describe("a tombstone makes a deletion legible to a full scan", () => {
+  it("uses the pageable deletion index without listing the tombstone namespace", async () => {
+    const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: OBJECT_WRITTEN_AT }] });
+    const remote = await scanRemote(subject.client, filter, undefined, async () => [{ ...tombstone("note.md", "E"), authoritativeLatest: true }]);
+
+    expect(subject.calls).toEqual(["listObjects"]);
+    expect(isRemoteDeleted(remote.get("note.md"))).toBe(true);
+  });
+
   it("reports the path as deleted, bound to the exact version it names", async () => {
     const subject = client({ objects: [{ key: "note.md", size: 5, etag: "E", lastModified: OBJECT_WRITTEN_AT }], tombstones: [tombstone("note.md", "E")] });
 

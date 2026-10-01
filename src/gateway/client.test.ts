@@ -84,6 +84,26 @@ describe("gateway client lifecycle and cursors", () => {
     expect(transport.requests[0].token).toBe(settings().gatewayToken);
   });
 
+  it("reads every deletion page from one stable snapshot", async () => {
+    const { client, transport } = setup();
+    transport.respond(async (request) => {
+      if (request.url.endsWith("/ticket")) return { status: 200, text: JSON.stringify({ protocol: 1, ticket: "ticket-1", expiresAt: Date.now() + 60_000 }) };
+      const url = new URL(request.url);
+      return url.searchParams.has("cursor")
+        ? { status: 200, text: JSON.stringify({ protocol: 1, snapshotSeq: "12", entries: [{ path: "b.md", deletedRemoteETag: "B", committedAt: 2, mutationSeq: 12 }] }) }
+        : { status: 200, text: JSON.stringify({ protocol: 1, snapshotSeq: "12", entries: [{ path: "a.md", deletedRemoteETag: "A", committedAt: 1, mutationSeq: 11 }], nextCursor: "a.md" }) };
+    });
+    await client.start("A".repeat(43));
+
+    await expect(client.listDeletions()).resolves.toEqual([
+      { path: "a.md", deletedRemoteETag: "A", committedAt: 1, mutationSeq: 11 },
+      { path: "b.md", deletedRemoteETag: "B", committedAt: 2, mutationSeq: 12 },
+    ]);
+    const deletionRequests = transport.requests.filter(request => request.url.includes("/deletions?"));
+    expect(deletionRequests).toHaveLength(2);
+    expect(new URL(deletionRequests[1].url).searchParams.get("snapshot")).toBe("12");
+  });
+
   it("does not request reconciliation for an unchanged snapshot, and does for a newer one", async () => {
     const cursor = createMemoryGatewayCursorStore({ ["A".repeat(43)]: { highestAnnouncedGeneration: "10", lastReconciledGeneration: "10" } });
     const { client, sockets } = setup(cursor);

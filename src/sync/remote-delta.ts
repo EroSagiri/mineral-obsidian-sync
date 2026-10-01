@@ -166,9 +166,26 @@ export async function observeRemoteDelta(changes: readonly RemoteChange[], depen
     if (dependencies.ignores(key)) continue;
     if (change.op === "delete") {
       let present: RemoteEntry | undefined;
-      try { present = await dependencies.client.headObject(key); }
-      catch (error) { if (!(error instanceof RemoteHttpError && error.status === 404)) throw error; }
-      remote.set(key, deletedObservation(key, present?.etag, present?.lastModified, all.get(key)?.remote?.lastModified));
+      if (!change.etag) {
+        try { present = await dependencies.client.headObject(key); }
+        catch (error) { if (!(error instanceof RemoteHttpError && error.status === 404)) throw error; }
+      }
+      const deletedETag = change.etag ?? present?.etag;
+      if (!deletedETag) {
+        remote.set(key, deletedObservation(key, undefined, present?.lastModified, all.get(key)?.remote?.lastModified));
+        continue;
+      }
+      // A logical delete is accepted only when its immutable record names the exact version carried
+      // by the event (or by the one exact HEAD used for legacy events). Missing/malformed metadata
+      // makes this incremental observation incomplete, so the scheduler falls back to reconciliation.
+      const deletion = await findLogicallyDeleted(dependencies.client, key, deletedETag);
+      if (!deletion) throw new Error("Delete event has no matching tombstone");
+      remote.set(key, {
+        key,
+        size: 0,
+        lastModified: Date.parse(deletion.createdAt ?? "") || all.get(key)?.remote?.lastModified || present?.lastModified || 0,
+        deleted: deletion,
+      });
       continue;
     }
     // A complete put fact avoids another request. Any omitted field is filled by one exact HEAD, and

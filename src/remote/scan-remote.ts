@@ -25,10 +25,10 @@ async function measure<T>(phase: string, work: () => Promise<T>, count: (value: 
  * object that R2 accepted a write for *after* it accepted the tombstone. Both timestamps come from R2, so
  * no device's clock is involved, and a genuine deletion never has a later write to compare against.
  */
-export async function scanRemote(client: R2Client, filter: VaultPathFilter, debug?: RemoteScanDebugLogger): Promise<Map<string, RemoteEntry>> {
+export async function scanRemote(client: R2Client, filter: VaultPathFilter, debug?: RemoteScanDebugLogger, indexedDeletions?: () => Promise<import("./tombstones").RemoteDeletion[]>): Promise<Map<string, RemoteEntry>> {
   const [objects, tombstones] = await Promise.all([
     measure("objects-list", () => client.listObjects(), (entries) => entries.length, debug),
-    measure("tombstones", () => client.listTombstones ? client.listTombstones() : Promise.resolve([]), (entries) => entries.length, debug),
+    measure(indexedDeletions ? "deletion-index" : "tombstones", () => indexedDeletions ? indexedDeletions() : client.listTombstones ? client.listTombstones() : Promise.resolve([]), (entries) => entries.length, debug),
   ]);
   const output = new Map(objects.filter((entry) => !filter.ignores(entry.key)).map((entry) => [entry.key, entry]));
   for (const deletion of tombstones) {
@@ -39,7 +39,7 @@ export async function scanRemote(client: R2Client, filter: VaultPathFilter, debu
     if (object && object.etag !== deletion.tombstone.deletedRemoteETag) continue;
     // Nor content that was written after the deletion was recorded. An unknown record timestamp keeps the
     // tombstone's full authority, which is the conservative reading of "we cannot prove it was revived".
-    if (object && deletion.metadataLastModified !== undefined && object.lastModified > deletion.metadataLastModified) continue;
+    if (!deletion.authoritativeLatest && object && deletion.metadataLastModified !== undefined && object.lastModified > deletion.metadataLastModified) continue;
     output.set(path, {
       key: path,
       size: 0,

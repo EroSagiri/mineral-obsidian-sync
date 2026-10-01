@@ -36,6 +36,8 @@ export interface RemoteDeletion {
    * keeps out of its decisions. Absent when the record was not read from a listing.
    */
   metadataLastModified?: number;
+  /** The journal proved this is the latest mutation for the path; no R2 timestamp heuristic applies. */
+  authoritativeLatest?: boolean;
 }
 
 export function isInternalRemoteKey(key: string): boolean {

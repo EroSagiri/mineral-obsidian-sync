@@ -162,7 +162,7 @@ export class SyncScheduler {
     const cycleMode = useRemoteIncremental ? "incremental" : useLocalIncremental ? "local-incremental" : "full-reconcile";
     this.dependencies.debug?.(`cycle start reason=${reason} mode=${cycleMode} remoteGeneration=${incremental?.generation ?? "n/a"} localPaths=${localIncrementalKeys.length} incrementalStateTrusted=${this.incrementalStateTrusted}`);
     try {
-      cycle = this.dependencies.captureCycle();
+      cycle = this.dependencies.captureCycle(reason);
       if (this.shouldStop(generation)) halted = true;
       if (!halted) {
         // The opening generation boundary is captured before any complete remote observation. It is only
@@ -501,12 +501,15 @@ export class SyncScheduler {
  * The change one operation implies for the remote control plane, with the revision it left behind.
  *
  * The Gateway accepts `etag`/`size` as optional hints and validates them. This is the *hint* shape: a
- * delete carries no revision here, because the Gateway's vocabulary forbids one — the fact that names the
- * retired revision is built separately, for the journal that can verify it.
+ * delete carries the retired revision when the executor proved one, so another client can read the one
+ * immutable tombstone directly instead of first issuing a HEAD.
  */
 function remoteChangeForOperation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): RemoteChange | undefined {
   const revision = "remote" in result ? result.remote : undefined;
-  if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") return { op: "delete", path: operation.key };
+  if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") {
+    const retired = "retired" in result ? result.retired : undefined;
+    return { op: "delete", path: operation.key, ...(retired ? { etag: retired } : {}) };
+  }
   if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") {
     return { op: "put", path: operation.key, ...(revision?.etag ? { etag: revision.etag } : {}), ...(typeof revision?.size === "number" ? { size: revision.size } : {}) };
   }

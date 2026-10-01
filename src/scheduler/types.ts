@@ -105,7 +105,7 @@ export interface SchedulerMutationIngress {
 }
 
 export interface SchedulerDependencies {
-  captureCycle(): CycleDependencies;
+  captureCycle(reason: ReconcileReason): CycleDependencies;
   visible(): boolean;
   remoteChange?: SchedulerRemoteChange;
   /** The journal that owns the truth about writes this device performed. */

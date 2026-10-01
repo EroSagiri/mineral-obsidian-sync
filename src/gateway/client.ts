@@ -15,6 +15,7 @@ import {
 } from "@mineral/sync-core/sync-change";
 import type { RemoteGeneration, RemoteGenerationCursor } from "@mineral/sync-core/sync-change";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
+import { isDeletionIndexPage, type IndexedDeletion } from "@mineral/sync-core/deletion-index";
 import { GatewayRequestError } from "./errors";
 import type { GatewayErrorKind } from "./errors";
 import type { GatewayCursorStore, GatewayConnectionConfig } from "./types";
@@ -139,6 +140,30 @@ export class GatewayClient {
     } catch (error) {
       return { ok: false, kind: this.fail(error instanceof GatewayRequestError ? error.kind : "transport") };
     }
+  }
+
+  /** Reads one stable journal snapshot page by page; any incomplete snapshot fails the whole call. */
+  async listDeletions(): Promise<IndexedDeletion[]> {
+    const channel = this.channel;
+    if (!channel) throw new Error("gateway deletion index is not configured");
+    const output: IndexedDeletion[] = [];
+    let snapshot: string | undefined;
+    let cursor: string | undefined;
+    do {
+      const query = new URLSearchParams({ limit: "200", ...(snapshot ? { snapshot } : {}), ...(cursor ? { cursor } : {}) });
+      const response = await this.transport.send({
+        url: `${baseUrl(this.settings().endpoint)}/v1/channels/${channel}/deletions?${query}`,
+        method: "GET", headers: {}, token: this.settings().token, timeoutMs: 15000,
+      });
+      this.lastStatus = response.status;
+      if (response.status < 200 || response.status >= 300) throw new GatewayRequestError(response.status === 401 || response.status === 403 ? "auth" : response.status >= 500 ? "server" : "client");
+      const page = parseJson(response.text);
+      if (!isDeletionIndexPage(page) || snapshot !== undefined && page.snapshotSeq !== snapshot) throw new GatewayRequestError("malformed");
+      snapshot = page.snapshotSeq;
+      output.push(...page.entries);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return output;
   }
 
   /**
