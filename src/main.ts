@@ -120,6 +120,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * of what this plugin last wrote removes both without picking a magic number.
    */
   private readonly hotRecentBuffers = new Map<string, { text: string; at: number }[]>();
+  /** Vault rename events produced while applying a room-originated rename; consumed exactly once. */
+  private readonly hotRenameEchoes = new Set<string>();
   private gatewayConfig: GatewayConfigState = { kind: "disabled" };
   private androidLocalSnapshot?: Map<string, LocalEntry>;
   private androidLocalDriftPollRunning = false;
@@ -388,6 +390,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
         // viewport. The pane's place is captured first and put back afterwards, so a syncing note does not
         // drag the reader's view around — the complaint this exists for.
         preserveViewport: (path) => this.preserveViewportFor(path),
+        onRenamed: (fromPath, toPath) => this.applyHotNamespaceRename(fromPath, toPath),
         onResolved: (path, decision) => {
           this.debug(`hot resolved path-digest=${pathDigest(path)} decision=${decision}`);
           // Whatever was decided, the cold path has to look at the file again: either to publish the
@@ -674,6 +677,20 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * the new path really is a local change the cold path has to reconcile.
    */
   private async handleVaultRename(oldPath: string, newPath: string): Promise<void> {
+    const transition = this.hotDocumentTransition
+      .catch(() => undefined)
+      .then(() => this.handleVaultRenameNow(oldPath, newPath));
+    this.hotDocumentTransition = transition;
+    return transition;
+  }
+
+  /** Runs inside the same queue as file-open/close, so a pane switch cannot overtake its rename. */
+  private async handleVaultRenameNow(oldPath: string, newPath: string): Promise<void> {
+    const echoKey = `${oldPath}\u0000${newPath}`;
+    if (this.hotRenameEchoes.delete(echoKey)) {
+      this.debug(`hot rename local echo suppressed path-digest=${pathDigest(newPath)}`);
+      return;
+    }
     const coordinator = this.hotCoordinator;
     const hot = Boolean(coordinator) && (this.hotOpenPath === oldPath || coordinator!.isFenced(oldPath));
     if (!hot) {
@@ -682,6 +699,49 @@ export default class R2PersonalSyncPlugin extends Plugin {
     }
     const applied = await this.renameHotDocument(oldPath, newPath);
     if (!applied) this.markLocalPathsUnlessHot([oldPath, newPath]);
+  }
+
+  /**
+   * Projects a room-originated namespace rename into this Vault.
+   *
+   * The Gateway owns the document/path decision, while Obsidian owns the local filesystem mutation.
+   * The resulting Vault `rename` event is tagged and consumed above so it cannot start a second
+   * namespace operation or leak into the cold planner.
+   */
+  private async applyHotNamespaceRename(fromPath: string, toPath: string): Promise<void> {
+    if (this.hotOpenPath === fromPath) this.hotOpenPath = toPath;
+    const recent = this.hotRecentBuffers.get(fromPath);
+    if (recent) { this.hotRecentBuffers.delete(fromPath); this.hotRecentBuffers.set(toPath, recent); }
+    const disk = this.hotDiskText.get(fromPath);
+    if (disk !== undefined) { this.hotDiskText.delete(fromPath); this.hotDiskText.set(toPath, disk); }
+
+    const source = this.app.vault.getAbstractFileByPath(fromPath);
+    const target = this.app.vault.getAbstractFileByPath(toPath);
+    // The initiating device has already moved the file before its Vault event reaches us. A peer has
+    // an old source and no target; every other shape is a local namespace collision and must freeze.
+    if (!source && target) return;
+    if (!source && !target) return;
+    if (!(source instanceof TFile) || target) {
+      this.hotCoordinator?.flagExternalEdit(toPath);
+      new Notice(`Mineral Sync：服务器已将 ${fromPath} 重命名为 ${toPath}，但本地目标路径被占用。该路径已暂停同步，请先处理本地文件。`);
+      return;
+    }
+    const parents = await ensureParentFolders(this.app.vault, toPath);
+    if (!parents.ok) {
+      this.hotCoordinator?.flagExternalEdit(toPath);
+      new Notice(`Mineral Sync：无法在本地创建 ${toPath} 的父目录，热同步已暂停该路径。`);
+      return;
+    }
+    const echoKey = `${fromPath}\u0000${toPath}`;
+    this.hotRenameEchoes.add(echoKey);
+    try {
+      await this.app.fileManager.renameFile(source, toPath);
+    } catch (error) {
+      this.hotRenameEchoes.delete(echoKey);
+      this.hotCoordinator?.flagExternalEdit(toPath);
+      this.debug(`hot remote rename failed path-digest=${pathDigest(toPath)} error=${error instanceof Error ? error.message : "unknown"}`);
+      new Notice(`Mineral Sync：服务器重命名已完成，但本地文件无法移动到 ${toPath}；该路径已暂停同步。`);
+    }
   }
 
   /**

@@ -116,6 +116,39 @@ async function ackLastOperation(socket: FakeSocket, session: { handleFrame(frame
 const welcome = (revision = 0) => ({ protocol: 1, type: "welcome", documentId: DOCUMENT, epoch: 1, canonicalPath: PATH, state: "active", serverRevision: revision, latestCheckpointedRevision: revision, crdtState: welcomeState(), pendingSave: false });
 
 describe("hot namespace deletion", () => {
+  it("moves the live bridge, epoch, and durable record when a hot file is renamed", async () => {
+    const toPath = "notes/renamed.md";
+    const renameResult = {
+      protocol: 1,
+      operationId: "server-result",
+      type: "rename",
+      outcome: "applied",
+      phase: "acked",
+      canonicalPath: toPath,
+      fromPath: PATH,
+      binding: { canonicalPath: toPath, documentId: DOCUMENT, epoch: 2, state: "active", updatedAt: 2 },
+      identity: { documentId: DOCUMENT, epoch: 2 },
+    };
+    const { coordinator, sockets, store } = harness({ outcome: "released" }, renameResult);
+    const editor = fakeEditor("");
+    await coordinator.open({ canonicalPath: PATH, editor, localText: "" });
+    sockets[0].emit(welcome());
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const renamed = await coordinator.rename(PATH, toPath);
+
+    expect(renamed.outcome).toBe("applied");
+    expect(coordinator.bindingFor(PATH)).toBeUndefined();
+    expect(coordinator.bindingFor(toPath)).toBeDefined();
+    expect(coordinator.sessionFor(toPath)?.session).toMatchObject({ canonicalPath: toPath, epoch: 2 });
+    expect((await store.loadSessions()).map(record => ({ path: record.canonicalPath, epoch: record.epoch }))).toEqual([{ path: toPath, epoch: 2 }]);
+
+    editor.setValue("after rename");
+    await coordinator.handleEditorChange(toPath);
+    const operation = sockets[0].sent.map(frame => JSON.parse(frame) as Record<string, unknown>).reverse().find(frame => frame.type === "operation");
+    expect(operation).toMatchObject({ epoch: 2, clientId: "device-a" });
+  });
+
   it("abandons a superseded acquire before its binding can write to a reused editor", async () => {
     const { coordinator, sockets, store } = harness();
 

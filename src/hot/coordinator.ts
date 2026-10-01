@@ -54,6 +54,8 @@ export interface HotCoordinatorDependencies {
    * without this the reader's place is lost every time somebody else types.
    */
   preserveViewport?(canonicalPath: string): (() => void) | undefined;
+  /** Applies a room-originated namespace rename to the local Vault/UI owner. */
+  onRenamed?(fromPath: string, toPath: string): void | Promise<void>;
   /** A human decision landed; the caller asks the cold path to look at the path again. */
   onResolved?(canonicalPath: string, decision: "keep-local" | "accept-remote"): void;
   debug?(message: string): void;
@@ -193,6 +195,30 @@ export class HotSyncCoordinator implements HotPathFence {
     return this.bindings.get(canonicalPath);
   }
 
+  /** Moves every client-side responsibility for one document to its authoritative new path. */
+  private async relocateSession(
+    session: HotDocumentSession,
+    binding: HotEditorBinding,
+    route: { canonicalPath: string },
+    toPath: string,
+  ): Promise<void> {
+    const fromPath = route.canonicalPath;
+    if (fromPath === toPath) return;
+    route.canonicalPath = toPath;
+    if (this.bindings.get(fromPath) === binding) this.bindings.delete(fromPath);
+    this.bindings.set(toPath, binding);
+    if (this.sessions.get(fromPath) === session) this.sessions.delete(fromPath);
+    this.sessions.set(toPath, session);
+    this.hotPaths.delete(fromPath);
+    this.hotPaths.add(toPath);
+    if (this.handoffPaths.delete(fromPath)) this.handoffPaths.add(toPath);
+    const conflict = this.conflicts.get(fromPath);
+    if (conflict) { this.conflicts.delete(fromPath); this.conflicts.set(toPath, conflict); }
+    const origin = this.conflictOrigins.get(fromPath);
+    if (origin) { this.conflictOrigins.delete(fromPath); this.conflictOrigins.set(toPath, origin); }
+    await this.deps.onRenamed?.(fromPath, toPath);
+  }
+
   /**
    * Opens a document for hot editing.
    *
@@ -207,15 +233,16 @@ export class HotSyncCoordinator implements HotPathFence {
     // `adoptRemote` claims nothing about local content: the server then hands over the document instead of
     // refusing a join it cannot verify, which is the first half of every mismatch resolution.
     const local = input.adoptRemote ? null : { contentHash: await hotContentHash(input.localText), size: input.localText.length };
+    const route = { canonicalPath: input.canonicalPath };
+    let session!: HotDocumentSession;
     const binding = new HotEditorBinding({
       editor: input.editor,
-      ...(this.deps.preserveViewport ? { preserveViewport: () => this.deps.preserveViewport!(input.canonicalPath) } : {}),
+      ...(this.deps.preserveViewport ? { preserveViewport: () => this.deps.preserveViewport!(route.canonicalPath) } : {}),
       // The session is registered before anything can edit through the binding (see below), so this
       // lookup is what delivers the seed. It used to be registered *after* the seed, which quietly threw
       // the first content of every brand-new hot note away: the binding inserted it into the document,
       // found no session to send it to, and the note reached R2 only if somebody later happened to type.
       onLocalUpdate: (update, operationId) => {
-        const session = this.sessions.get(input.canonicalPath);
         if (!session) {
           this.deps.debug?.("hot local update dropped: the session is not registered yet");
           return;
@@ -244,15 +271,15 @@ export class HotSyncCoordinator implements HotPathFence {
        * the user's content.
        */
       onFreeze: (reason) => {
-        this.conflicts.set(input.canonicalPath, "conflict");
-        this.conflictOrigins.set(input.canonicalPath, "mismatch");
-        this.hotPaths.delete(input.canonicalPath);
-        this.handoffPaths.add(input.canonicalPath);
-        this.deps.debug?.(`hot freeze path-digest=${pathDigest(input.canonicalPath)} reason=${reason}`);
-        this.deps.onConflict?.(input.canonicalPath, "editor-document-divergence");
+        const path = route.canonicalPath;
+        this.conflicts.set(path, "conflict");
+        this.conflictOrigins.set(path, "mismatch");
+        this.hotPaths.delete(path);
+        this.handoffPaths.add(path);
+        this.deps.debug?.(`hot freeze path-digest=${pathDigest(path)} reason=${reason}`);
+        this.deps.onConflict?.(path, "editor-document-divergence");
         // Tear down the live session: no more reconnects, no more incoming `operation` frames that
         // would otherwise keep advancing the Y.Doc past the diagnostic scene the resolver needs.
-        const session = this.sessions.get(input.canonicalPath);
         if (session) {
           void session.freeze(`editor-document-divergence: ${reason}`).catch(error => {
             this.deps.debug?.(`hot freeze persist failed: ${error instanceof Error ? error.message : "unknown"}`);
@@ -261,7 +288,7 @@ export class HotSyncCoordinator implements HotPathFence {
       },
       debug: this.deps.debug,
     });
-    const session = new HotDocumentSession({
+    session = new HotDocumentSession({
       client: this.deps.client,
       store: this.deps.store,
       doc: binding,
@@ -269,28 +296,32 @@ export class HotSyncCoordinator implements HotPathFence {
       canonicalPath: input.canonicalPath,
       events: {
         onStatus: (status, detail) => {
-          if (status === "hot") this.hotPaths.add(input.canonicalPath);
+          const path = route.canonicalPath;
+          if (status === "hot") this.hotPaths.add(path);
           if (status === "handoff-pending") {
-            this.handoffPaths.add(input.canonicalPath);
-            this.hotPaths.delete(input.canonicalPath);
+            this.handoffPaths.add(path);
+            this.hotPaths.delete(path);
           }
           // The nuanced reason stays in the session record (`statusOf().reason`); the map only classifies
           // it for the fence and for the resolution UI, which treats every server-side cause the same way.
-          if (status === "conflict") this.conflicts.set(input.canonicalPath, "conflict");
-          this.deps.onStatus?.(input.canonicalPath, status, detail);
+          if (status === "conflict") this.conflicts.set(path, "conflict");
+          this.deps.onStatus?.(path, status, detail);
         },
         onConflict: reason => {
           // Every cause the server reports is, for this device's purposes, the same kind of fact: the
           // authority refused the write and the path needs a human. The exact reason is preserved in the
           // session record, which is what `statusOf` and the resolver's message read.
-          this.conflicts.set(input.canonicalPath, "conflict");
-          this.deps.onConflict?.(input.canonicalPath, reason);
+          const path = route.canonicalPath;
+          this.conflicts.set(path, "conflict");
+          this.deps.onConflict?.(path, reason);
         },
         onDeleted: () => {
-          this.hotPaths.delete(input.canonicalPath);
-          this.bindings.delete(input.canonicalPath);
-          this.sessions.delete(input.canonicalPath);
+          const path = route.canonicalPath;
+          this.hotPaths.delete(path);
+          this.bindings.delete(path);
+          this.sessions.delete(path);
         },
+        onRenamed: (fromPath, toPath) => this.relocateSession(session, binding, route, toPath),
         debug: this.deps.debug,
       },
       ...(this.deps.now ? { now: this.deps.now } : {}),
@@ -894,34 +925,42 @@ export class HotSyncCoordinator implements HotPathFence {
         binding: null,
       };
     }
-    const result = await this.deps.client.namespace({
-      type: "rename",
-      operationId: this.nextOperationId("rename"),
-      clientId: this.deps.clientId,
-      fromPath: canonicalPath,
-      toPath,
-      documentId: record.documentId,
-      expectedEpoch: record.epoch,
-      expectedFromBinding: { documentId: record.documentId, epoch: record.epoch },
-      expectedToPathState: { state: "absent" },
-    });
-    if (result.outcome === "applied") {
-      // The document is the same one and the session keeps running: only the path binding moved, and
-      // the session learns the new epoch from the room's own `document-state` frame.
-      const binding = this.bindings.get(canonicalPath);
-      if (binding) {
-        this.bindings.delete(canonicalPath);
-        this.bindings.set(toPath, binding);
+    const operationId = this.nextOperationId("rename");
+    const finishTransition = session.beginNamespaceTransition();
+    try {
+      // No old-epoch operation may still be in flight when the room quiesces. New typing waits at the
+      // session barrier and will be persisted with whichever epoch this operation leaves active.
+      if (!(await session.drain())) {
+        return {
+          protocol: 1,
+          operationId,
+          type: "rename",
+          outcome: "rejected",
+          reason: "checkpoint-failed",
+          phase: "failed",
+          canonicalPath: toPath,
+          fromPath: canonicalPath,
+          binding: null,
+        };
       }
-      const moved = this.sessions.get(canonicalPath);
-      if (moved) {
-        this.sessions.delete(canonicalPath);
-        this.sessions.set(toPath, moved);
+      const result = await this.deps.client.namespace({
+        type: "rename",
+        operationId,
+        clientId: this.deps.clientId,
+        fromPath: canonicalPath,
+        toPath,
+        documentId: record.documentId,
+        expectedEpoch: record.epoch,
+        expectedFromBinding: { documentId: record.documentId, epoch: record.epoch },
+        expectedToPathState: { state: "absent" },
+      });
+      if (result.outcome === "applied" && result.identity) {
+        await session.adoptRename(toPath, result.identity.epoch);
       }
-      this.hotPaths.delete(canonicalPath);
-      this.hotPaths.add(toPath);
+      return result;
+    } finally {
+      finishTransition();
     }
-    return result;
   }
 
   /** The cold-mutation authority a cold write must hold while hot sessions exist. */
@@ -1013,9 +1052,6 @@ export class HotSyncCoordinator implements HotPathFence {
     return `${type}:${path}`;
   }
 }
-
-
-
 
 
 

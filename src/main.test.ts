@@ -522,6 +522,7 @@ describe("hot ownership from the cold path's point of view", () => {
     const env = harness();
     env.plugin.registerVaultListeners();
     (env.handlers.get("vault:rename") as unknown as (file: { path: string }, oldPath: string) => void)({ path: "b.md" }, "a.md");
+    await settleHotRename();
     expect(env.marked.map(entry => entry.path)).toEqual(["a.md", "b.md"]);
   });
 

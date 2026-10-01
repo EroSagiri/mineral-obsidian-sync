@@ -186,6 +186,17 @@ describe("hot session durability", () => {
     expect(session.session?.lastAcceptedRevision).toBe(0);
   });
 
+  it("ignores an operation echoed through another socket with the same client id", async () => {
+    const { session, doc, sockets } = harness();
+    await session.start({ local: null, operationId: "acquire-1" });
+    sockets[0].emit(welcomeFrame);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    await session.handleFrame({ protocol: 1, type: "operation", documentId: DOCUMENT, epoch: 1, clientId: "device-a", clientOperationId: "own-op", update: encodeHotPayload(new Uint8Array([7])), parentRevision: 0, serverRevision: 1 } as never);
+
+    expect(doc.appliedUpdates).toHaveLength(0);
+  });
+
   it("re-sends unacknowledged work after a resume, and drops rows from a retired epoch", async () => {
     const { session, store, sockets } = harness();
     await session.start({ local: null, operationId: "acquire-1" });

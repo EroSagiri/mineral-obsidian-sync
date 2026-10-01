@@ -34,6 +34,8 @@ export interface HotSessionEvents {
   onCheckpoint?(receipt: CheckpointReceipt): void;
   onConflict?(reason: string): void;
   onDeleted?(): void;
+  /** The same document moved to a new namespace path/epoch. */
+  onRenamed?(fromPath: string, toPath: string, epoch: DocumentEpoch): void | Promise<void>;
   debug?(message: string): void;
 }
 
@@ -97,6 +99,9 @@ export class HotDocumentSession {
   /** The current backoff for the reconnect loop. Reset to the initial delay on a successful resume. */
   private reconnectDelay: number;
   private reconnectAttempts = 0;
+  /** Local updates wait here while a namespace mutation settles and chooses their path/epoch. */
+  private namespaceBarrier: Promise<void> | null = null;
+  private namespaceBarrierRelease: (() => void) | null = null;
   /** Invalidates a reconnect that is already waiting on acquire when close/abandon begins. */
   private lifecycleGeneration = 0;
   private readonly events: HotSessionEvents;
@@ -129,7 +134,7 @@ export class HotDocumentSession {
   }
 
   get path(): string {
-    return this.deps.canonicalPath;
+    return this.record?.canonicalPath ?? this.deps.canonicalPath;
   }
 
   get session(): HotSessionRecord | null {
@@ -166,9 +171,44 @@ export class HotDocumentSession {
 
   /** Replaces the record and persists it in one step, so no caller can forget the durable half. */
   private async setRecord(next: HotSessionRecord, notify = true): Promise<void> {
+    const previousPath = this.record?.canonicalPath;
     this.record = next;
     await this.deps.store.putSession(next);
+    // Session records are keyed by path. A namespace rename is a move, not a copy: retaining the old
+    // key restores two authorities after reload and fences both names forever.
+    if (previousPath && previousPath !== next.canonicalPath) {
+      await this.deps.store.deleteSession(previousPath);
+    }
     if (notify) this.events.onStatus?.(next.status);
+  }
+
+  /**
+   * Stops newly produced editor updates at the durability boundary while rename/delete chooses an epoch.
+   * The Y.Doc may continue to absorb typing; `applyLocalUpdate` resumes afterwards and persists that
+   * update against the winning identity, so no keystroke is sent under a half-renamed namespace.
+   */
+  beginNamespaceTransition(): () => void {
+    if (this.namespaceBarrier) throw new Error("a hot namespace transition is already active");
+    this.namespaceBarrier = new Promise<void>(resolve => { this.namespaceBarrierRelease = resolve; });
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      const release = this.namespaceBarrierRelease;
+      this.namespaceBarrier = null;
+      this.namespaceBarrierRelease = null;
+      release?.();
+    };
+  }
+
+  /** Applies the authoritative path+epoch returned by a successful namespace rename. */
+  async adoptRename(canonicalPath: string, epoch: DocumentEpoch): Promise<void> {
+    const record = this.record;
+    if (!record) throw new Error("cannot rename a hot session without a record");
+    if (epoch < record.epoch) return;
+    const previousPath = record.canonicalPath;
+    await this.setRecord({ ...record, canonicalPath, epoch, status: "hot", updatedAt: this.now() }, false);
+    if (previousPath !== canonicalPath) await this.events.onRenamed?.(previousPath, canonicalPath, epoch);
   }
 
   /**
@@ -280,7 +320,13 @@ export class HotDocumentSession {
   private connect(ticket: string): void {
     const socket = this.deps.client.connect(ticket);
     this.socket = socket;
-    socket.onMessage(data => void this.onMessage(data));
+    // A reconnect or plugin reload can leave the old transport alive long enough to deliver a queued
+    // frame. Only the socket currently owned by this session may mutate its Y.Doc/editor; otherwise a
+    // stale same-device operation is indistinguishable from remote input and becomes an event echo.
+    socket.onMessage(data => {
+      if (this.socket !== socket) return;
+      void this.onMessage(data);
+    });
     socket.onClose(() => this.onSocketClosed(socket));
   }
 
@@ -373,6 +419,14 @@ export class HotDocumentSession {
         return;
       }
       case "operation": {
+        // The Gateway normally suppresses an operation for every socket belonging to its source
+        // client. Keep the identity check here as a protocol boundary as well: rolling deployments,
+        // reconnect overlap, or an older Gateway must never turn our own Yjs update into a remote
+        // editor write and then back into a new local operation.
+        if (record && frame.clientId === record.clientId) {
+          this.debug(`ignored echoed hot operation ${frame.clientOperationId}`);
+          return;
+        }
         this.deps.doc.applyRemote(frame.update);
         return;
       }
@@ -462,13 +516,12 @@ export class HotDocumentSession {
         // one; only the path and possibly the epoch moved, and the epoch is what makes old packets
         // unapplyable.
         if (record) {
-          await this.setRecord({
-            ...record,
-            ...(frame.canonicalPath ? { canonicalPath: frame.canonicalPath } : {}),
-            epoch: frame.epoch,
-            status: "hot",
-            updatedAt: this.now(),
-          });
+          if (frame.canonicalPath && frame.canonicalPath !== record.canonicalPath) {
+            await this.adoptRename(frame.canonicalPath, frame.epoch);
+            this.events.onStatus?.("hot");
+          } else {
+            await this.setRecord({ ...record, epoch: frame.epoch, status: "hot", updatedAt: this.now() });
+          }
         }
         return;
       }
@@ -533,6 +586,8 @@ export class HotDocumentSession {
    * outright, since `sendOperation` only sees what is in the map.
    */
   async applyLocalUpdate(update: string, clientOperationId: string): Promise<void> {
+    const barrier = this.namespaceBarrier;
+    if (barrier) await barrier;
     const record = this.record;
     if (!record) return;
     const entry: HotOutboxEntry = {
