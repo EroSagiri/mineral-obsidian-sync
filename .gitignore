@@ -51,3 +51,6 @@ tmp/
 # Diagnostic bundle output
 build-diag/
 
+# Deployment reports
+last-deploy.json
+

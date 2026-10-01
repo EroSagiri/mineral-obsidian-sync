@@ -28,20 +28,37 @@
 
 ## 安装
 
-本插件未发布到社区插件市场，需要手动安装：
+本插件未发布到社区插件市场，需要手动安装。构建与部署由脚本完成，vault 路径通过环境变量传入，脚本里不含任何写死的目录。
 
 ```powershell
 npm install
-npm run build          # 产出 main.js
+Copy-Item .env.example .env      # 填入 vault 路径
 ```
 
-然后把 `main.js` 和 `manifest.json` 复制到你的 Vault：
+在 `.env` 里写好两个目录（`.env` 已被 gitignore）：
+
+```text
+MINERAL_DEPLOY_WINDOWS_VAULT=C:\Users\me\Documents\MyVault
+MINERAL_DEPLOY_ANDROID_VAULT=mineral
+```
+
+然后部署到桌面端和/或 Android：
+
+```powershell
+./scripts/deploy-windows.ps1                 # 桌面 vault
+./scripts/deploy-android.ps1 -Restart        # Android 真机（重启 Obsidian 以加载新包）
+./scripts/deploy-windows.ps1 -DryRun         # 先看计划，不做任何改动
+```
+
+Android 上 Obsidian 会按插件**目录路径**缓存已加载的 bundle，所以 `-Restart` 会默认把新包装进一个全新的插件目录并改指 `community-plugins.json`——这是让真机确实执行新构建的唯一可靠方式。完整说明（全部环境变量、轮换与去重语义、失败行为）见 [`docs/deployment.md`](docs/deployment.md)。
+
+不使用脚本的话，手动方式是：`npm run build` 产出 `main.js`，把 `main.js` 与 `manifest.json` 复制到
 
 ```text
 <你的 Vault>/.obsidian/plugins/mineral-obsidian-sync/
 ```
 
-最后在 Obsidian 里：**设置 → 第三方插件 → 启用 “Mineral Obsidian Sync”**。
+最后在 Obsidian 里：**设置 → 第三方插件 → 启用 “Mineral Obsidian Sync”**。桌面端复制文件后需要重新加载插件；Android 上原地覆盖 `main.js` 通常不会生效，建议用脚本。
 
 最低 Obsidian 版本 1.5.0。桌面端与移动端共用同一套传输实现；自动调度仍需分别进行真实设备验证。
 
@@ -125,6 +142,7 @@ token 权限不足，或只给了错误 bucket 的权限。
 ## 更多文档
 
 - [`docs/development.md`](docs/development.md) —— 阶段状态、代码结构、开发命令、集成自检脚手架、真实验证记录、Android 待办清单。
+- [`docs/deployment.md`](docs/deployment.md) —— 部署：Windows 与 Android 两个目标、全部环境变量、Android 插件目录轮换与去重、部署报告与失败行为。
 - [`docs/scheduler-semantics.md`](docs/scheduler-semantics.md) —— Phase 3A 自动调度器的语义规格（触发时机、single-flight、dirty 模型、rerun 规则、MUST / MUST NOT）。
 - [`docs/gateway-integration.md`](docs/gateway-integration.md) —— Phase 4C Sync Gateway 接入：channel 派生、generation 游标与握手、写者通知合并、WS 生命周期与鉴权。
 - [docs/deletion-safety.md](docs/deletion-safety.md) —— Phase 4C.5 删除安全与状态 GC：baseline GC、安全 delete-local、tombstone 设计（D3）。

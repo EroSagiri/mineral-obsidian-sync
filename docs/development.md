@@ -131,7 +131,13 @@ npm run typecheck      # tsc --noEmit
 npm test               # vitest run
 npm run dev            # 开发构建（含自检命令，输出 main.js）
 npm run build          # 生产构建（typecheck + 打包，不含任何 dev 代码）
+npm run build:dev      # 开发包 → build-diag/main-dev.js（不覆盖 main.js）
+npm run deploy:windows # 部署到桌面 vault
+npm run deploy:android # 部署到 Android 真机
 ```
+
+部署的路径全部来自环境变量（CLI 参数 > shell > `.env`），脚本里没有写死的 vault 目录；
+两个目标的完整参数、Android 插件目录轮换与去重语义见 [`deployment.md`](deployment.md)。
 
 ### 生产构建如何剔除开发代码
 
@@ -144,10 +150,10 @@ npm run build          # 生产构建（typecheck + 打包，不含任何 dev �
 
 ```powershell
 npm run build
-Select-String -Path main.js -Pattern 'r2-sync-dev-|mineral-sync-test|self-test'
+Select-String -Path main.js -Pattern 'registerDevelopmentSelfTests|r2-sync-dev-'
 ```
 
-生产产物应约为 24 KB 且上述模式**全部无匹配**；开发产物约 340 KB 且全部匹配。
+生产产物约 323 KB 且上述模式**无匹配**——注意 `mineral-sync-test` 这个字符串本身会在生产包里出现一次：它是 `private/mineral-sync-test-local/` 等**内建排除前缀**（产品行为，不是开发代码），所以不要拿它当判据。开发产物 `build-diag/main-dev.js` 约 3.0 MB 且模式有匹配（`npm run build:dev` 产出，见 [`deployment.md`](deployment.md)）。
 
 ---
 

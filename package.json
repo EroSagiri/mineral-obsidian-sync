@@ -5,12 +5,18 @@
   "private": true,
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "build:dev": "node scripts/build.mjs development",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "verify:ingress": "node scripts/verify-mutation-ingress.mjs",
     "sync-core:link": "node scripts/vendor-sync-core.mjs",
-    "sync-core:link:dry-run": "node scripts/vendor-sync-core.mjs --dry-run"
+    "sync-core:link:dry-run": "node scripts/vendor-sync-core.mjs --dry-run",
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:windows": "node scripts/deploy.mjs --target windows",
+    "deploy:android": "node scripts/deploy.mjs --target android",
+    "deploy:android:restart": "node scripts/deploy.mjs --target android --restart",
+    "deploy:dry-run": "node scripts/deploy.mjs --dry-run"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

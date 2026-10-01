@@ -217,6 +217,11 @@ adb pull /storage/emulated/0/Documents/mineral/.obsidian/plugins/mineral-obsidia
 > `manifest.version = 0.1.0`、命令列表里没有新命令——它一直在跑安装时的那份缓存代码。用一个**新的插件
 > id** 安装则立刻生效（诊断探针插件就是这么验证的）。所以：更新插件后要么在设置里关掉再打开、要么
 > 用新版本号重新安装，否则"我换了文件但行为没变"。
+>
+> 这一条已经由部署脚本自动化：`./scripts/deploy-android.ps1 -Restart`（等价于 `--rotate`）会把新包
+> 装进一个全新的 `<pluginId>-deploy-<version>-<时间戳>/` 目录、改指 `community-plugins.json`、迁移
+> `data.json`，再重启 Obsidian——不需要手工停用/启用，也不需要借一个新的插件 id。见
+> [`deployment.md`](deployment.md)。
 
 
 **根目录是探测出来的，不是写死的**：Android 的 Obsidian 会痛快地写一个点目录，然后**不把它放进 vault 索引**
