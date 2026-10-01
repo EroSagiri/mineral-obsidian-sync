@@ -1566,7 +1566,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // Delete conflicts deliberately have an absent side. Preserve the effective deletion identity
       // separately so an old resolver choice cannot apply after a path is recreated or re-deleted.
       if (isRemoteDeleted(observedRemote)) { if (observedLocal) output.push({ key: conflict.key, previous: previous.get(conflict.key), observedLocal, observedRemoteDeletion: observedRemote.deleted }); }
-      else if (previous.has(conflict.key) && (observedLocal || observedRemote)) output.push({ key: conflict.key, previous: previous.get(conflict.key), observedLocal, observedRemote });
+      else if (observedLocal || observedRemote) output.push({ key: conflict.key, previous: previous.get(conflict.key), observedLocal, observedRemote });
     }
     return output;
   }
@@ -1846,6 +1846,5 @@ function handoffHistoryMetadata(facts: HandoffEvidence | undefined): SyncHistory
     ...(facts.order === undefined ? {} : { order: facts.order }),
   };
 }
-
 
 

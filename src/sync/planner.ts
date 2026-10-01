@@ -108,7 +108,8 @@ export function buildSyncPlan(
     if (!before) {
       if (here && !there) operations.push({ type: "upload", key, reason: "new local file", expectedLocal: here, expectedRemote: { kind: "absent" } });
       else if (!here && there) operations.push({ type: "download", key, reason: "new remote object", expectedLocal: { kind: "absent" }, expectedRemote: there });
-      else if (here && there) operations.push(operation("conflict", key, "first sync cannot prove both entries identical", "both-created-different"));
+      else if (here && there) operations.push(resolutionOperation(resolutions?.get(key), key, here, there)
+        ?? operation("conflict", key, "first sync cannot prove both entries identical", "both-created-different"));
       continue;
     }
     if (here && there) {

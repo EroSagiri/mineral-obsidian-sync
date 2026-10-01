@@ -177,6 +177,26 @@ describe("an emptied remote revision is a question, not a download", () => {
   });
 });
 
+describe("a first-sync conflict can be resolved", () => {
+  it("applies a version-bound keep-local intent instead of rediscovering the conflict forever", () => {
+    const here = local("note.md", 10, 100);
+    const there = remote("note.md", 20, "etag-remote");
+    const result = buildSyncPlan(
+      new Map([["note.md", here]]),
+      new Map([["note.md", there]]),
+      new Map(),
+      new Map([["note.md", { intent: { conflictId: "first-sync", type: "keep-local" } }]]),
+    );
+    expect(result.operations).toEqual([expect.objectContaining({
+      type: "resolve-keep-local",
+      key: "note.md",
+      conflictId: "first-sync",
+      expectedLocal: here,
+      expectedRemoteETag: "etag-remote",
+    })]);
+  });
+});
+
 describe("hot ownership is a plan input, not only an execution check", () => {
   const baseline = (key: string): PreviousEntry => ({ key, local: { size: 10, mtime: 100 }, remote: { size: 10, etag: "etag-a", lastModified: 1000 }, syncedAt: 1 });
 

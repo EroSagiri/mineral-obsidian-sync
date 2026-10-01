@@ -1064,6 +1064,21 @@ describe("a Gateway delete reaches the resolver as a deletion", () => {
   });
 });
 
+describe("a first-sync disagreement reaches the resolver", () => {
+  it("keeps the observed pair even though no previous baseline exists", () => {
+    const env = historyEnv();
+    const observedLocal = { key: "note.md", size: 6, mtime: 42 };
+    const observedRemote = { key: "note.md", size: 12, etag: "REMOTE", lastModified: 1_000 };
+
+    expect(env.plugin.conflictObservations(
+      [{ type: "conflict", key: "note.md", conflict: "both-created-different", reason: "test" }],
+      new Map([["note.md", observedLocal]]),
+      new Map([["note.md", observedRemote]]),
+      new Map(),
+    )).toEqual([{ key: "note.md", previous: undefined, observedLocal, observedRemote }]);
+  });
+});
+
 describe("tombstone retention is a once-per-session pass", () => {  /** The pass resolves a channel (a digest) and then talks to R2, so microtasks alone do not settle it. */
   const settle = async (): Promise<void> => { for (let index = 0; index < 8; index++) await new Promise((resolve) => setTimeout(resolve, 0)); await flush(); };
 
@@ -1171,7 +1186,6 @@ describe("restoring an earlier version", () => {
     expect(opened).toBe(1);
   });
 });
-
 
 
 

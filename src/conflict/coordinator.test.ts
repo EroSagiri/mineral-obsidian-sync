@@ -308,6 +308,25 @@ describe("conflict coordinator", () => {
     expect(env.stores.intents.size).toBe(0);
   });
 
+  it("surfaces a first-sync disagreement with both observed snapshots", async () => {
+    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
+    remoteBodies.set("note.md", "remote\n");
+    const observedLocal = localEntry("note.md", 6, 50);
+    const observedRemote = { key: "note.md", size: 7, etag: "B", lastModified: 1 };
+
+    await coordinator().handleConflicts([{ key: "note.md", observedLocal, observedRemote }]);
+
+    const [record] = await env.stores.listConflicts(CHANNEL);
+    expect(record).toMatchObject({
+      autoMergeStatus: "manual-required",
+      previous: { localVersion: observedLocal, remoteETag: "B" },
+      snapshot: { baseAvailable: false, local: "local\n", remote: "remote\n" },
+    });
+    expect(record.reason).toContain("no common sync baseline");
+    expect(env.stores.intents.size).toBe(0);
+    expect(env.reconcilations.length).toBe(1);
+  });
+
   it("does not use a snapshot whose baseline no longer matches", async () => {
     env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
     remoteBodies.set("note.md", "remote\n");

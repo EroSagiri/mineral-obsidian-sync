@@ -208,14 +208,19 @@ export class ConflictCoordinator {
    */
   private async inspect(input: ConflictDetectionInput): Promise<ConflictRecord | undefined> {
     const { key, previous, observedLocal, observedRemote, observedRemoteDeletion } = input;
-    if (!previous || (!observedLocal && !observedRemote)) return undefined;
+    if (!observedLocal && !observedRemote) return undefined;
     const conflictId = await this.identityOf(input);
+    // A first-sync disagreement has no ancestor, but it still has an exact observed pair that a user
+    // decision can be bound to. Using that pair as the record's decision identity does not invent a
+    // sync baseline: only the executor commits one, after a conditional resolution actually lands.
+    const decisionLocal = previous?.local ? { key, size: previous.local.size, mtime: previous.local.mtime } : observedLocal;
+    if (!decisionLocal) return undefined;
     const base: ConflictRecord = {
       protocolVersion: CONFLICT_PROTOCOL_VERSION,
       conflictId,
       channel: this.dependencies.channel,
       path: key,
-      previous: { localVersion: previous.local ? { key, size: previous.local.size, mtime: previous.local.mtime } : observedLocal!, remoteETag: previous.remote?.etag },
+      previous: { localVersion: decisionLocal, remoteETag: previous?.remote?.etag ?? observedRemote?.etag },
       observedLocal,
       observedRemoteETag: observedRemote?.etag,
       observedRemoteDeletion,
@@ -231,6 +236,29 @@ export class ConflictCoordinator {
     // must not even be read.
     if (!isMergeablePath(key)) return { ...base, autoMergeStatus: "unsupported", reason: "only markdown and plain-text files are merged automatically" };
     if (observedLocal.size > MAX_MERGEABLE_BYTES || observedRemote.size > MAX_MERGEABLE_BYTES) return { ...base, autoMergeStatus: "too-large", reason: `larger than the ${MAX_MERGEABLE_BYTES} byte merge ceiling` };
+
+    // With no common ancestor, automatic merging would be guesswork. Read both bounded text snapshots
+    // so the resolver can show the real alternatives, but require an explicit keep-local/keep-remote
+    // choice. The intent is still tied to `conflictId`, so either side moving invalidates the click.
+    if (!previous) {
+      const localBytes = await this.readLocal(key);
+      if (!localBytes) return { ...base, autoMergeStatus: "base-unavailable", reason: "the local file could not be read" };
+      let remoteBytes: Uint8Array;
+      try { remoteBytes = new Uint8Array(await this.dependencies.client.getObject(key, { ifMatch: observedRemote.etag })); }
+      catch (error) {
+        if (error instanceof RemoteObjectChangedError) return { ...base, autoMergeStatus: "manual-required", reason: "the remote changed while the conflict was being examined" };
+        if (error instanceof RemoteHttpError) return { ...base, autoMergeStatus: "manual-required", reason: `the remote snapshot could not be read (HTTP ${error.status})` };
+        return { ...base, autoMergeStatus: "manual-required", reason: "the remote snapshot could not be read" };
+      }
+      const local = decodeText(localBytes), remote = decodeText(remoteBytes);
+      if (!local || !remote) return { ...base, autoMergeStatus: "decode-failed", reason: "one side is not valid UTF-8 text" };
+      return {
+        ...base,
+        autoMergeStatus: "manual-required",
+        reason: "both sides exist but no common sync baseline is available",
+        snapshot: { baseAvailable: false, local: local.text, remote: remote.text },
+      };
+    }
 
     let snapshot: MergeBaseRecord | undefined;
     try { snapshot = await this.dependencies.mergeBase.get(this.dependencies.channel, key); }
