@@ -1,7 +1,7 @@
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import { RemoteHttpError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
-import { parseTombstone, tombstoneKey } from "../remote/tombstones";
+import { parseTombstone, tombstoneReadKeys } from "../remote/tombstones";
 import { canonicalKey } from "./path";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry } from "./types";
 
@@ -55,12 +55,15 @@ export interface RemoteDeltaObservations {
  * alone until one runs; it never errs towards resurrecting something.
  */
 export async function findLogicallyDeleted(client: R2Client, key: string, etag: string): Promise<RemoteDeletionIdentity | undefined> {
-  let body: ArrayBuffer;
-  try { body = await client.getObject(await tombstoneKey(key, etag)); }
-  catch (error) { if (error instanceof RemoteHttpError && error.status === 404) return undefined; throw error; }
-  const record = parseTombstone(body);
-  if (record.path !== key || record.deletedRemoteETag !== etag) throw new Error("Tombstone does not describe the object it was looked up for");
-  return { path: key, deletedRemoteETag: etag, createdAt: record.createdAt, objectPresent: true };
+  for (const metadataKey of await tombstoneReadKeys(key, etag)) {
+    let body: ArrayBuffer;
+    try { body = await client.getObject(metadataKey); }
+    catch (error) { if (error instanceof RemoteHttpError && error.status === 404) continue; throw error; }
+    const record = parseTombstone(body);
+    if (record.path !== key || record.deletedRemoteETag !== etag) throw new Error("Tombstone does not describe the object it was looked up for");
+    return { path: key, deletedRemoteETag: etag, createdAt: record.createdAt, objectPresent: true };
+  }
+  return undefined;
 }
 
 /**

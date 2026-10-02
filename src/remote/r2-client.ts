@@ -1,10 +1,11 @@
 import { RemoteHttpError, RemoteObjectChangedError } from "./errors";
+import { VERSION_NAMESPACE } from "@mineral/sync-core/storage";
 import { SettingsCredentialProvider } from "./credentials";
 import { Aws4FetchSigner, type RequestSigner } from "./signer";
 import { RequestUrlTransport, type HttpTransport } from "./transport";
 import { normalizePrefix, remoteObjectKey, vaultKeyFromRemote } from "../sync/path";
 import type { RemoteEntry, RemoteIdentity, RemoteVersion } from "../sync/types";
-import { TOMBSTONE_NAMESPACE, encodeTombstone, isInternalRemoteKey, parseTombstone, tombstoneKey, type RemoteDeletion, type RemoteTombstone } from "./tombstones";
+import { TOMBSTONE_NAMESPACE, TOMBSTONE_READ_NAMESPACES, tombstoneReadKeys, encodeTombstone, isInternalRemoteKey, parseTombstone, tombstoneKey, type RemoteDeletion, type RemoteTombstone } from "./tombstones";
 
 export interface R2Configuration { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; remotePrefix: string; }
 export type RemoteDebugLogger = (message: string) => void;
@@ -20,6 +21,8 @@ export interface R2Client {
   putObject(key: string, body: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion>;
   /** Immutable conditional create. A duplicate of the same path/version is an equivalent success. */
   putTombstone?(record: RemoteTombstone): Promise<RemoteDeletion>;
+  /** Archives the exact retired bytes before removing the live key. Caller holds the writer lease. */
+  recycleObject?(record: RemoteTombstone): Promise<RemoteDeletion>;
   /** Removes one tombstone record. Only retention calls this; it never touches a user object. */
   deleteTombstone?(record: RemoteTombstone): Promise<void>;
   /** Physically removes one user object. Only retention calls this, and only for content already deleted. */
@@ -83,7 +86,10 @@ export class SignedR2ListClient implements R2Client {
     const startedAt = Date.now();
     try {
       this.validate();
-      const response = await this.transport.send(await this.signer.sign({ method, url, headers, body }));
+      // Compression of R2 responses weakens ETag and can remove Content-Length on HEAD. Sync must
+      // observe the stored object representation because its ETag authorises conditional mutations.
+      const readHeaders = method === "HEAD" || method === "GET" ? { "accept-encoding": "identity", ...headers } : headers;
+      const response = await this.transport.send(await this.signer.sign({ method, url, headers: readHeaders, body }));
       this.debug?.(`r2 request operation=${operation} method=${method} status=${response.status} durationMs=${Date.now() - startedAt}`);
       return response;
     } catch (error) {
@@ -113,12 +119,14 @@ export class SignedR2ListClient implements R2Client {
     return output;
   }
   async listTombstones(): Promise<RemoteDeletion[]> {
-    const prefix = `${normalizePrefix(this.config.remotePrefix)}${TOMBSTONE_NAMESPACE}`;
+    const prefixes = TOMBSTONE_READ_NAMESPACES.map(namespace => `${normalizePrefix(this.config.remotePrefix)}${namespace}`);
+    const entries = (await Promise.all(prefixes.map(prefix => this.listRaw(prefix)))).flat();
+    const uniqueEntries = [...new Map(entries.map(entry => [entry.key, entry])).values()];
     // These immutable metadata reads are independent, but an unbounded Promise.all can overwhelm
     // Android's native requestUrl bridge. Preserve list order while keeping only a small batch in
     // flight; the transport timeout then guarantees that one wedged GET cannot freeze every later
     // foreground/manual cold-sync cycle forever.
-    const resolved = await mapInBatches(await this.listRaw(prefix), TOMBSTONE_READ_CONCURRENCY, async (entry): Promise<RemoteDeletion | undefined> => {
+    const resolved = await mapInBatches(uniqueEntries, TOMBSTONE_READ_CONCURRENCY, async (entry): Promise<RemoteDeletion | undefined> => {
       const key = vaultKeyFromRemote(this.config.remotePrefix, entry.key);
       if (!key || !isInternalRemoteKey(key) || !entry.etag) throw new Error("Tombstone metadata key is invalid");
       let body: ArrayBuffer;
@@ -131,14 +139,35 @@ export class SignedR2ListClient implements R2Client {
         throw error;
       }
       const record = parseTombstone(body);
-      const expectedKey = await tombstoneKey(record.path, record.deletedRemoteETag);
-      if (key !== expectedKey) throw new Error("Tombstone metadata key does not match its record");
+      const expectedKeys = await tombstoneReadKeys(record.path, record.deletedRemoteETag);
+      if (!expectedKeys.includes(key)) throw new Error("Tombstone metadata key does not match its record");
       // The listing's own timestamp is R2's clock, which is what retention compares against the object's.
-      return { tombstone: record, metadataETag: entry.etag, metadataLastModified: entry.lastModified };
+      return { tombstone: record, metadataETag: entry.etag, metadataLastModified: record.r2AcceptedAt ? Date.parse(record.r2AcceptedAt) : entry.lastModified };
     });
-    return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
+    const deletions = new Map<string, RemoteDeletion>();
+    for (const deletion of resolved) {
+      if (!deletion) continue;
+      const identity = await tombstoneKey(deletion.tombstone.path, deletion.tombstone.deletedRemoteETag);
+      const existing = deletions.get(identity);
+      // Copying metadata must not make a historical deletion look newer than a re-created object.
+      if (!existing || deletion.metadataLastModified! < existing.metadataLastModified!) deletions.set(identity, deletion);
+    }
+    return [...deletions.values()];
   }
-  async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
+  async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> {
+    const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {});
+    if (response.status === 412) throw new RemoteObjectChangedError();
+    if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status);
+    const length = header(response.headers, "content-length");
+    if (length !== undefined && Number.isFinite(Number(length))) return objectEntry(key, response.headers);
+    // R2 can omit Content-Length on HEAD. Never invent a zero-byte file: measure a conditional GET
+    // of the exact observed ETag instead, so a replacement between requests is reported as stale.
+    const etag = header(response.headers, "etag")?.replace(/^"|"$/g, "");
+    if (!etag || etag.startsWith("W/")) throw new Error("R2 HEAD response lacked a strong ETag for metadata recovery");
+    const body = await this.getObject(key, { ifMatch: etag });
+    this.debug?.("r2 HEAD metadata recovered by conditional GET");
+    return objectEntry(key, { ...response.headers, "content-length": String(body.byteLength) });
+  }
   async verifyObjectVersion(key: string, etag: string): Promise<void> {
     const response = await this.send("VerifyObjectVersion", "HEAD", this.objectUrl(key), { "if-match": `"${etag}"` });
     if (response.status === 412) throw new RemoteObjectChangedError();
@@ -181,6 +210,40 @@ export class SignedR2ListClient implements R2Client {
       return { tombstone: existing };
     }
   }
+
+  async recycleObject(record: RemoteTombstone): Promise<RemoteDeletion> {
+    const identity = (await tombstoneKey(record.path, record.deletedRemoteETag)).split("/").at(-1)!;
+    const destination = `${VERSION_NAMESPACE}deleted-${identity}/${record.path}`;
+    const source = await this.send("GetRecycleSource", "GET", this.objectUrl(record.path), { "if-match": `"${record.deletedRemoteETag}"` });
+    if (source.status === 412) throw new RemoteObjectChangedError();
+    if (source.status < 200 || source.status >= 300) throw new RemoteHttpError("GetRecycleSource", source.status);
+    const body = source.arrayBuffer ?? new TextEncoder().encode(source.text).buffer;
+    const originalMetadata: Record<string, string> = {};
+    for (const [name, value] of Object.entries(source.headers)) {
+      if (name.toLowerCase().startsWith("x-amz-meta-")) originalMetadata[name.slice(11)] = value;
+    }
+    const metadataJson = JSON.stringify(originalMetadata).replace(/[\u007f-\uffff]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    {
+      const response = await this.send("RecycleObject", "PUT", this.objectUrl(destination), {
+        "if-none-match": "*", "content-type": header(source.headers, "content-type") ?? "application/octet-stream",
+        ...(/^[\x20-\x7e]+$/.test(record.path) ? { "x-amz-meta-sourcekey": record.path } : {}),
+        "x-amz-meta-sourceetag": record.deletedRemoteETag,
+        "x-amz-meta-createdat": record.createdAt, "x-amz-meta-reason": "delete",
+        "x-amz-meta-mineraloriginalmetadata": metadataJson,
+      }, body);
+      if (response.status === 412) {
+        const existing = new Uint8Array(await this.getObject(destination));
+        const expected = new Uint8Array(body);
+        if (existing.length !== expected.length || existing.some((byte, index) => byte !== expected[index])) throw new Error("Recycle copy differs from the retired version");
+      } else if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("RecycleObject", response.status);
+    }
+    const deletion = await this.putTombstone(record);
+    await this.verifyObjectVersion(record.path, record.deletedRemoteETag);
+    // R2 DELETE has no conditional semantics. The Gateway lease coordinates participating writers;
+    // the conditional GET/HEAD detects changes before removal, but cannot lock external S3 writers.
+    await this.delete(record.path, "RecycleDeleteObject");
+    return deletion;
+  }
   /**
    * Deletes one tombstone record, for retention.
    *
@@ -189,17 +252,16 @@ export class SignedR2ListClient implements R2Client {
    * record at the same key to protect, and therefore nothing a conditional request could add.
    */
   async deleteTombstone(record: RemoteTombstone): Promise<void> {
-    const key = await tombstoneKey(record.path, record.deletedRemoteETag);
-    await this.delete(key, "DeleteTombstone");
+    for (const key of await tombstoneReadKeys(record.path, record.deletedRemoteETag)) {
+      await this.delete(key, "DeleteTombstone");
+    }
   }
 
   /**
    * Physically removes one user object.
    *
-   * Reserved for retention: the caller has already proved that the bytes are a version every device has
-   * been told is deleted, and that nothing has written them again since. An ordinary deletion never comes
-   * here — it writes a tombstone and leaves the object where it is, which is what makes deletion
-   * recoverable in the first place.
+   * Reserved for explicit retention/cleanup. Ordinary deletion uses recycleObject to archive the
+   * retired bytes and retain their version-bound tombstone before removing the source.
    */
   async deleteObject(key: string): Promise<void> {
     await this.delete(key, "DeleteObject");

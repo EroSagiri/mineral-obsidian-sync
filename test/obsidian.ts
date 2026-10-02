@@ -141,6 +141,23 @@ export class Notice {
 
 export function setIcon(): void {}
 
+/** The row element a `Setting` owns, as far as a modal test is concerned: classes only. */
+class FakeSettingElement {
+  readonly classes = new Set<string>();
+  addClass(...names: string[]): void { for (const name of names) if (name) this.classes.add(name); }
+  removeClass(...names: string[]): void { for (const name of names) this.classes.delete(name); }
+}
+
+/** Every button every `Setting` registered, in creation order, with a typed accessor for tests. */
+export function registeredSettingButtons(): Array<{ text: string; callback: () => void }> {
+  return Setting.registered;
+}
+
+/** Every notice a test run showed, so a message can be asserted without reaching into the class. */
+export function shownNotices(): string[] {
+  return Notice.shown;
+}
+
 /**
  * Minimal `Setting` stand-in.
  *
@@ -153,21 +170,26 @@ export class Setting {
    * Setting-hosted control, and this is the smallest surface that makes that possible without
    * emulating Obsidian's DOM.
    */
-  static readonly registered: Array<{ text: string; callback: () => void }> = [];
-  readonly buttons: Array<{ text: string; callback: () => void }> = [];
+  static readonly registered: Array<{ text: string; callback: () => void; settled?: Promise<unknown> }> = [];
+  readonly buttons: Array<{ text: string; callback: () => void; settled?: Promise<unknown> }> = [];
   name?: string;
+  /** Obsidian's row element. A modal that marks a resolved row touches this, so the shim keeps one. */
+  readonly settingEl = new FakeSettingElement();
   constructor(public containerEl: unknown) {}
   setName(value?: string): this { this.name = value; return this; }
   setDesc(): this { return this; }
   setHeading(): this { return this; }
   setClass(): this { return this; }
-  addButton(callback: (button: { setButtonText(text: string): unknown; setCta(): unknown; onClick(handler: () => void): unknown }) => unknown): this {
+  addButton(callback: (button: { setButtonText(text: string): unknown; setCta(): unknown; setWarning(): unknown; onClick(handler: () => void): unknown }) => unknown): this {
     let label = "";
     const button = {
       setButtonText: (text: string) => { label = text; return button; },
       setCta: () => button,
+      setWarning: () => button,
       onClick: (handler: () => void) => {
-        const entry = { text: label, callback: handler };
+        // The handler's return value is kept, not discarded: a modal whose click handler is `async` would
+        // otherwise reject into nowhere, and a test could neither await it nor see the failure.
+        const entry: { text: string; callback: () => void; settled?: Promise<unknown> } = { text: label, callback: handler };
         this.buttons.push(entry);
         Setting.registered.push(entry);
         return button;

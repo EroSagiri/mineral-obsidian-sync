@@ -5,7 +5,7 @@ describe("logical deletion tombstones", () => {
   const record = { protocol: TOMBSTONE_PROTOCOL, path: "notes/a.md", deletedRemoteETag: "etag-A", createdAt: "2026-09-22T00:00:00.000Z" } as const;
 
   it("derives an opaque deterministic key from both canonical path and deleted version", async () => {
-    expect(await tombstoneKey(record.path, record.deletedRemoteETag)).toMatch(/^\.mineral-sync\/tombstones\/[A-Za-z0-9_-]+\.json$/);
+    expect(await tombstoneKey(record.path, record.deletedRemoteETag)).toMatch(/^\.mineral\/tombstones\/[A-Za-z0-9_-]+\.json$/);
     expect(await tombstoneKey(record.path, record.deletedRemoteETag)).not.toEqual(await tombstoneKey(record.path, "etag-B"));
   });
 

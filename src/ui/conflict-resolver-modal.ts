@@ -23,12 +23,12 @@ import {
  * - **Technical details** is collapsed and is never needed to finish.
  *
  * The rule this file must never break is unchanged: **the UI does not write data.** It renders a view
- * and persists a `ResolutionIntent`; every file and R2 change is performed later by `SafeExecutor`
- * through the planner.
+ * and submits a version-bound `ResolutionIntent`; the coordinator routes it to the current
+ * hot or cold writer.
  */
 export interface ConflictResolverDependencies {
   list(): Promise<ConflictRecord[]>;
-  /** Persists a resolution intent only; never mutates content. */
+  /** Submits the decision to its owner; the UI has no content or transport write capability. */
   propose(intent: ResolutionIntent, reason: "conflict-auto-merge" | "conflict-manual-resolution"): Promise<void>;
   /** Exposed so a test can assert that the UI never reaches for a transport or the Vault. */
   debug?(message: string): void;
@@ -53,7 +53,15 @@ export class ConflictResolverModal extends Modal {
     this.contentEl.createEl("h2", { text: "Mineral Sync" });
     const loading = this.contentEl.createEl("p", { text: "Loading conflicts…" });
     try { this.records = await this.dependencies.list(); }
-    catch { this.records = []; }
+    catch {
+      loading.remove();
+      this.contentEl.createEl("p", { text: "无法加载冲突，请重试。", cls: "mineral-sync-conflicts__headline" });
+      const actions = this.contentEl.createDiv({ cls: "mineral-sync-conflicts__actions" });
+      this.button(actions, "重试", () => { this.contentEl.empty(); void this.onOpen(); }, true);
+      this.button(actions, "关闭", () => this.close());
+      this.dependencies.debug?.("conflict resolver could not load the current conflicts");
+      return;
+    }
     loading.remove();
     this.total = this.records.length;
     this.resolved = 0;
@@ -76,7 +84,19 @@ export class ConflictResolverModal extends Modal {
       return;
     }
 
+    if (record.hotPending) {
+      contentEl.createEl("p", { text: "合并结果已进入热房间，等待保存与本机内容确认。该文件仍可继续编辑。" });
+      this.button(contentEl, "Done", () => this.close(), true);
+      return;
+    }
     const view = presentConflict(record);
+    if (record.hotResolution) {
+      contentEl.createEl("p", { text: "此文件由热房间处理。确认后结果直接进入当前房间；版本变化时需刷新后重新确认。先前冷同步的合并稿可能尚未包含热房间修改，请一起核对。" });
+      const details = contentEl.createEl("details");
+      details.createEl("summary", { text: "查看热房间当前内容（包含尚未保存的修改）" });
+      details.createEl("pre", { text: record.hotResolution.snapshot.content });
+    }
+
     contentEl.createEl("h3", { text: view.path, cls: "mineral-sync-conflicts__path" });
     if (this.total > 1) {
       const pager = contentEl.createDiv({ cls: "mineral-sync-conflicts__pager" });
@@ -118,6 +138,11 @@ export class ConflictResolverModal extends Modal {
       this.button(actions, "View differences", () => { this.page = "differences"; this.render(); });
       this.button(actions, "Edit manually", () => { this.page = "edit"; this.render(); });
     } else {
+      if (this.record?.hotResolution && this.record.snapshot.draft !== undefined) {
+        const prepared = this.record.snapshot.draft;
+        parent.createEl("pre", { text: prepared, cls: "mineral-sync-conflicts__result" });
+        this.button(actions, "使用已准备好的合并结果", () => { this.draft = { path: view.path, text: prepared }; void this.apply("merged"); }, true);
+      }
       // With nothing trustworthy prepared, writing the result is the primary path, not a fallback.
       this.button(actions, "Edit manually", () => { this.page = "edit"; this.render(); }, true);
       this.button(actions, "View differences", () => { this.page = "differences"; this.render(); });
@@ -197,7 +222,7 @@ export class ConflictResolverModal extends Modal {
   /** The third layer: the final text, with no markers anywhere near it. */
   private renderEdit(parent: HTMLElement, record: ConflictRecord, view: Extract<ConflictPresentation, { kind: "suggested" | "manual" }>): void {
     if (!this.draft) {
-      const fallback = view.kind === "suggested" ? view.suggestedText : view.draftText;
+      const fallback = record.hotResolution && record.snapshot.draft !== undefined ? record.snapshot.draft : view.kind === "suggested" ? view.suggestedText : view.draftText;
       this.draft = { path: record.path, text: fallback };
     }
     parent.createEl("p", { text: "Edit final result", cls: "mineral-sync-conflicts__headline" });
@@ -244,14 +269,15 @@ export class ConflictResolverModal extends Modal {
       createdAt: Date.now(),
       // A person made this decision, which is what distinguishes its history entry from an auto-merge.
       origin: "manual",
+      hotResolution: record.hotResolution,
     };
     try {
       if (type === "merged" && this.draft) intent.merged = await mergedContentOf(this.draft.text);
       await this.dependencies.propose(intent, "conflict-manual-resolution");
     }
-    catch { new Notice("Mineral Sync: the resolution could not be recorded."); return; }
+    catch (error) { new Notice(error instanceof Error ? error.message : "Mineral Sync: the resolution could not be recorded."); return; }
     this.dependencies.debug?.(`conflict resolution requested type=${type} path-hash=${shortConflictId(record.conflictId)}`);
-    new Notice("Mineral Sync: resolution recorded. It will be applied on the next reconciliation.");
+    new Notice(intent.hotResolution ? "合并结果已提交，保存状态会继续更新。" : "Mineral Sync: resolution recorded. It will be applied on the next reconciliation.");
     // The next conflict is shown immediately, from its own result page: no trip back to a list.
     this.draft = undefined;
     this.page = "result";

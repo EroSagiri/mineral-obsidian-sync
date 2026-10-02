@@ -28,6 +28,9 @@ export type HotSessionStatus =
  * the name.
  */
 export interface HotSessionRecord {
+  /** Durable rename authority, retained until the Gateway returns a terminal result. */
+  pendingRename?: Extract<import("@mineral/sync-core/namespace-protocol").NamespaceIntent, { type: "rename" }>;
+  nextRenamePath?: string;
   canonicalPath: string;
   documentId: string;
   epoch: number;

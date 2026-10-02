@@ -19,7 +19,7 @@ import { SelfTestReportModal } from "./report-modal";
  * These commands are diagnostics, not synchronization: they are named after the transport,
  * they cannot be triggered from the status bar, and every key they touch is minted inside
  * `.mineral-sync-test/<run-id>/` behind a hard prefix guard. The hot command adds one deliberate
- * exception to that prefix: its protocol group lives under `.mineral-sync/selftest/<run-id>/`, which
+ * exception to that prefix: its protocol group lives under `.mineral/selftest/<run-id>/`, which
  * the sync filter ignores — a hot scratch note must not be a cold-sync candidate, or an ordinary
  * upload could land between the room's acquisition and its first checkpoint.
  */

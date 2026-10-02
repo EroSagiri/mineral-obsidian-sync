@@ -10,7 +10,7 @@ import { MemoryHotStateStore } from "./store";
  * The plugin's hot path, driven against a **deployed** Gateway and Vault.
  *
  * It is skipped unless the environment provides a gateway URL, a token file, and an R2 identity file,
- * because it writes to a real namespace — under `.mineral-sync/hot-verify/`, which the plugin ignores
+ * because it writes to a real namespace — under `.mineral/hot-verify/`, which the plugin ignores
  * and the index excludes. Everything else in this repository's hot tests runs in-process against
  * fakes; this one is the only place where "does the plugin's own code talk to the real service?" is
  * answered by the real service.
@@ -119,7 +119,7 @@ describe.skipIf(!enabled)("hot sync against the deployed gateway", () => {
     const token = readFileSync(tokenFile!, "utf8").trim();
     const identity = JSON.parse(readFileSync(identityFile!, "utf8")) as { endpoint: string; bucket: string; remotePrefix?: string };
     const channel = await deriveRemoteChangeChannel({ endpoint: identity.endpoint, bucket: identity.bucket, remotePrefix: identity.remotePrefix ?? "" });
-    const path = `.mineral-sync/hot-verify/plugin-${Date.now().toString(36)}/note.md`;
+    const path = `.mineral/hot-verify/plugin-${Date.now().toString(36)}/note.md`;
 
     const devices = ["plugin-a", "plugin-b"].map(clientId => {
       const client = new HotGatewayClient({ endpoint: gateway!, token, channel }, nodeTransport(token), nodeSocketFactory);
@@ -210,7 +210,7 @@ describe.skipIf(!enabled)("hot sync against the deployed gateway", () => {
     const token = readFileSync(tokenFile!, "utf8").trim();
     const identity = JSON.parse(readFileSync(identityFile!, "utf8")) as { endpoint: string; bucket: string; remotePrefix?: string; accessKeyId: string; secretAccessKey: string };
     const channel = await deriveRemoteChangeChannel({ endpoint: identity.endpoint, bucket: identity.bucket, remotePrefix: identity.remotePrefix ?? "" });
-    const path = `.mineral-sync/hot-verify/conflict-${Date.now().toString(36)}/note.md`;
+    const path = `.mineral/hot-verify/conflict-${Date.now().toString(36)}/note.md`;
 
     const client = new HotGatewayClient({ endpoint: gateway!, token, channel }, nodeTransport(token), nodeSocketFactory);
     const store = new MemoryHotStateStore();

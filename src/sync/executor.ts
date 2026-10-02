@@ -213,14 +213,13 @@ export class SafeExecutor {
     }
     const record: RemoteTombstone = { protocol: TOMBSTONE_PROTOCOL, path: operation.key, deletedRemoteETag: etag, createdAt: new Date().toISOString() };
     try {
-      await this.r2.putTombstone(record);
-      // The tombstone is the durable half of this deletion: the object deliberately stays where it is,
-      // and this immutable record is what makes every later reader see "deleted" rather than "never
-      // existed". Logged as soon as the PUT landed, because that is the R2 fact; the baseline pruning
-      // below decides whether the operation as a whole may be reported as applied.
+      if (this.r2.recycleObject) await this.r2.recycleObject(record);
+      else await this.r2.putTombstone(record);
+      // The immutable tombstone preserves deletion identity after the source moves to versions.
+      // Baseline pruning below decides whether the whole operation may be reported as applied.
       this.log(`local delete landed path-digest=${pathDigest(operation.key)} tombstone=written`);
     } catch (error) {
-      // A received 4xx means no record was accepted; a transport failure or 5xx remains ambiguous.
+      // Archive, tombstone and source removal are separate requests; failure can be partial.
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
       return uploadFailure("PutObject tombstone", operation.key, error);
     }

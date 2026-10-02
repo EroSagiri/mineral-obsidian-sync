@@ -28,6 +28,27 @@ function setup(capture: () => CycleDependencies, debug?: (message: string) => vo
 }
 
 describe("SyncScheduler", () => {
+  it("does not retire conflict records when observation fails", async () => {
+    const observations: unknown[] = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({ captureCycle: () => ({ ...base([]), scanRemote: async () => { throw new Error("HEAD metadata missing"); } }), visible: () => true, timers, onConflicts: async records => { observations.push(records); } });
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    expect(observations).toEqual([]);
+    expect(scheduler.diagnostics().lastFailureClass).toBe("stable");
+  });
+
+  it("excludes a deferred write from the scope that can retire conflicts", async () => {
+    const scopes: unknown[] = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({ captureCycle: () => base([upload("note.md"), { type: "noop", key: "other.md", reason: "unchanged" }]), visible: () => true, timers, hotAuthority: { authorize: async () => "deferred", settle: async () => {} }, onConflicts: async (_records, scope) => { scopes.push(scope); } });
+    scheduler.requestReconcile("manual");
+    timers.fire(0);
+    await flush();
+    expect(scopes).toEqual([["other.md"]]);
+  });
+
   it("awaits baseline verification before executing the resulting plan", async () => {
     const executed: string[] = [];
     let release!: () => void;

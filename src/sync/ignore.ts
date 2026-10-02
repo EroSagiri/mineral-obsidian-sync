@@ -1,4 +1,5 @@
 import { canonicalKey } from "./path";
+import { isSystemStorageKey } from "@mineral/sync-core/storage";
 
 export interface IgnoreRules {
   ignoredPaths: string[];
@@ -14,7 +15,6 @@ export function ignorePolicyFingerprint(rules: IgnoreRules): string {
 }
 
 const PLUGIN_PREFIX = ".obsidian/plugins/mineral-obsidian-sync/";
-const REMOTE_INTERNAL_PREFIX = ".mineral-sync/";
 /**
  * The integration harness's scratch roots.
  *
@@ -39,7 +39,7 @@ export function createVaultPathFilter(rules: IgnoreRules): VaultPathFilter {
     ignores(key: string): boolean {
       const normalized = canonicalKey(key);
       const lower = normalized.toLowerCase();
-      if (lower.startsWith(PLUGIN_PREFIX) || lower.startsWith(REMOTE_INTERNAL_PREFIX) || INTEGRATION_PREFIXES.some(prefix => lower.startsWith(prefix)) || TEMPORARY_BASENAMES.has(lower.split("/").at(-1) ?? "") || lower.endsWith("~") || lower.endsWith(".tmp")) return true;
+      if (lower.startsWith(PLUGIN_PREFIX) || isSystemStorageKey(lower) || INTEGRATION_PREFIXES.some(prefix => lower.startsWith(prefix)) || TEMPORARY_BASENAMES.has(lower.split("/").at(-1) ?? "") || lower.endsWith("~") || lower.endsWith(".tmp")) return true;
       return [...paths].some((path) => normalized === path || normalized.startsWith(`${path}/`));
     },
   };

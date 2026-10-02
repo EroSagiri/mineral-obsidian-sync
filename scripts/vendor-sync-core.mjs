@@ -195,6 +195,10 @@ async function run(command, args, options = {}) {
 
 /** Step logger: dry-run shows the line, real run executes the callback. */
 async function step(label, dryRun, work) {
+  if (typeof dryRun === "function") {
+    work = dryRun;
+    dryRun = args.dryRun;
+  }
   process.stdout.write(`→ ${label}\n`);
   if (dryRun) return undefined;
   return await work();

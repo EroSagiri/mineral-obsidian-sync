@@ -1,6 +1,6 @@
 {
   "name": "mineral-obsidian-sync",
-  "version": "0.1.0",
+  "version": "0.0.2",
   "description": "Read-only dry-run planner for R2-backed Obsidian vault sync.",
   "private": true,
   "scripts": {
@@ -27,7 +27,7 @@
     "vitest": "^3.1.1"
   },
   "dependencies": {
-    "@mineral/sync-core": "file:vendor/mineral-sync-core-0.2.0.tgz",
+    "@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.2.tgz",
     "aws4fetch": "^1.0.20",
     "node-diff3": "^3.2.1",
     "yjs": "^13.6.33"

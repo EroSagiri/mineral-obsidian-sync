@@ -39,13 +39,13 @@ import { IndexedDbSyncHistoryStore } from "./history/store";
 import type { SyncHistoryMetadata, SyncHistoryStore } from "./history/types";
 import { SyncHistoryModal } from "./ui/sync-history-modal";
 import { SYNC_HISTORY_CSS } from "./ui/history-styles";
-import { HotConflictModal } from "./ui/hot-conflict-modal";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type HotStatusInput, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ReconcileReason, ResultCounts, SchedulerState } from "./scheduler/types";
 import { HotGatewayClient, type HotHttpRequest, type HotHttpResponse, type HotSocket } from "./hot/client";
 import { HotSyncCoordinator } from "./hot/coordinator";
 import { IndexedDbHotStateStore } from "./hot/store";
+import { deviceHotClientId, migrateHotClientIdentity } from "./hot/device-identity";
 import type { HotBaseline } from "./hot/types";
 import { hotContentHash } from "@mineral/sync-core/hot-protocol";
 import { DebugLogger } from "./logging/debug-logger";
@@ -99,6 +99,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly hotStore = new IndexedDbHotStateStore();
   /** The one path this device currently holds open hot, if any. */
   private hotOpenPath?: string;
+  private hotStartupPending = false;
   /**
    * File-open events are not a document lifecycle by themselves: Obsidian can emit the next one while
    * the previous hot acquire is still waiting on HTTP/WebSocket state, and it may reuse the same Editor
@@ -109,6 +110,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private hotDocumentTransition: Promise<void> = Promise.resolve();
   private hotDocumentRequest = 0;
   private hotLastError?: string;
+  private hotOpenFailurePath?: string;
+  private hotOpenRetryAt = 0;
+  private hotOpenRetryDelay = 5000;
+  private hotOpenRetryTimer?: ReturnType<typeof setTimeout>;
   /**
    * The plugin's debug logger. The plugin itself owns the lifecycle and feeds its settings in; all
    * modules receive a `tag(name)` closure that emits under their module tag.
@@ -276,7 +281,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       captureCycle: (reason) => this.captureSchedulerCycle(reason),
       onStatus: (state, counts) => this.setSchedulerStatus(state, counts),
       debug: this.taggedDebug("scheduler"),
-      onConflicts: (conflicts) => this.handleConflicts(conflicts),
+      onConflicts: (conflicts, observedPaths) => this.handleConflicts(conflicts, observedPaths),
       // A second control-plane port, for the service that owns the *facts* rather than the wake-up. It is
       // handed only what this device observed a write to leave in R2, and its answer is never read: the
       // write is durable before this runs, so a report can only defer, never fail or reclassify.
@@ -287,16 +292,29 @@ export default class R2PersonalSyncPlugin extends Plugin {
         announcesLandedWrites: () => this.mutationIngress.announcesLandedWrites(),
       },
       onResolutionApplied: (conflictId, path) => this.clearResolution(conflictId, path),
-      // The hot fence, asked at the mutation boundary rather than at plan time.
+      // The hot fence, asked at the mutation boundary rather than at plan time. The operation travels with
+      // the question because a resolved merge is the decision the fence was waiting for and must be allowed
+      // to land; everything else it is asked about is still refused.
       hotDeferral: {
-        isFenced: (key) => this.hotCoordinator?.isFenced(key) ?? false,
+        isFenced: (key, operation) => {
+          const fenced = this.hotCoordinator?.isFencedFor(key, operation ?? "") ?? false;
+          // A path whose decision cannot finish is indistinguishable from one that was never asked, so the
+          // decision itself is recorded: which operation, what the fence says, and whether anything is live
+          // behind it. Without this line the log shows only that something was deferred, which is the same
+          // for a live session and for a disk record — two cases whose correct handling is opposite.
+          if (operation === "resolve-merged") {
+            this.debug(`hot fence path-digest=${pathDigest(key)} operation=${operation} fenced=${fenced} reason=${this.hotCoordinator?.fenceReason(key) ?? "none"} live=${this.hotCoordinator?.bindingFor(key) !== undefined}`);
+          }
+          return fenced;
+        },
         noteDeferred: (key) => this.hotCoordinator?.noteDeferred(key),
       },
       // The cross-device half: only the Gateway knows whether another device is editing this path now.
       hotAuthority: {
-        authorize: (key) => this.hotCoordinator?.authorizeColdMutation(key) ?? Promise.resolve("granted" as const),
+        authorize: (key, operation) => this.hotCoordinator?.authorizeColdMutation(key, null, operation) ?? Promise.resolve("granted" as const),
         settle: async (key) => { await this.hotCoordinator?.settleColdMutation(key); },
       },
+
       remoteChange: {
         hasPending: () => this.gateway?.hasPending() ?? false,
         readGeneration: () => this.gateway?.readGeneration() ?? Promise.resolve({ ok: false as const, kind: "misconfigured" }),
@@ -305,6 +323,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
         canApplyIncrementally: (generation) => this.gateway?.canApplyIncrementally(generation) ?? false,
       },
     });
+    this.hotStartupPending = true;
     this.app.workspace.onLayoutReady(() => {
       this.registerVaultListeners();
       this.registerAndroidLocalDriftDetector();
@@ -312,16 +331,20 @@ export default class R2PersonalSyncPlugin extends Plugin {
       this.registerDomEvent(document, "visibilitychange", () => this.onVisibilityChanged(document.visibilityState !== "hidden"));
       // The channel is a digest, so it is resolved once before the first cycle, which is what lets the
       // planner receive valid resolution intents synchronously instead of doing its own I/O.
-      void this.resolveChannel().then(() => { this.lastIntegrityRequestedAt = Date.now(); this.scheduler?.requestReconcile("startup"); });
-      void this.applyGatewayConfig(true);
-      // The hot layer has to adopt the file the user is already looking at. Waiting for a `file-open`
-      // event is what made the feature look broken: enabling it (or loading the plugin) produces no such
-      // event, so the note in front of the user stayed cold while the status bar said hot sync was on.
-      void this.refreshHotSync().then(() => this.openActiveFileHot());
+      void (async () => {
+        // Restore durable fences before cold planning, then let startup reconciliation update the file
+        // before a new room claims it. File-open and editor-change use the same startup gate.
+        await this.resolveChannel();
+        await this.refreshHotSync();
+        await this.applyGatewayConfig(true);
+        this.lastIntegrityRequestedAt = Date.now();
+        this.scheduler?.requestReconcile("startup");
+      })();
     });
   }
 
   onunload(): void {
+    this.clearHotOpenRetry();
     this.activeAnalysis?.abort();
     // Best effort: an owed buffer is written before the timers that could still carry it go away.
     // Obsidian also saves on the way out, so this is a belt-and-braces step rather than the only one.
@@ -359,6 +382,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   async refreshHotSync(): Promise<void> {
     const wanted = Boolean(this.settings.hotSyncEnabled && this.settings.gatewayEnabled);
     if (!wanted) {
+      this.clearHotOpenRetry();
       // Turning it off must finish the handoff for anything still open, not abandon it mid-session.
       const coordinator = this.hotCoordinator;
       await this.closeHotDocument();
@@ -392,7 +416,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
         store: this.hotStore,
         clientId: await this.ensureHotClientId(),
         commitBaseline: (path, baseline) => this.commitHotBaseline(path, baseline),
-        onStatus: (path, status, detail) => this.debug(`hot status path-digest=${pathDigest(path)} status=${status}${detail ? ` detail=${detail}` : ""}`),
+        onStatus: (path, status, detail) => {
+          this.debug(`hot status path-digest=${pathDigest(path)} status=${status}${detail ? ` detail=${detail}` : ""}`);
+          if (status === "hot" && coordinator.sessionFor(path)?.session?.pendingSave === false) this.scheduler?.requestReconcile("hot-resolution");
+        },
         onConflict: (path, reason) => {
           this.debug(`hot conflict path-digest=${pathDigest(path)} reason=${reason}`);
           new Notice(t("notice.hotConflict", { path, reason }));
@@ -406,15 +433,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
         },
         // A resolution that makes the file adopt the server's version has to actually write the file, not
         // only the pane: the pane may not exist and the disk is what sync is about.
-        writeLocalText: async (path, text) => {
-          try { await this.app.vault.adapter.write(path, text); }
-          catch (error) { this.debug(`hot write-back failed path-digest=${pathDigest(path)} error=${error instanceof Error ? error.message : "unknown"}`); }
-        },
+        writeLocalText: (path, text) => this.writeHotResolutionText(path, text),
         // A hot session writes into the buffer whenever a remote edit lands, and any write moves the
         // viewport. The pane's place is captured first and put back afterwards, so a syncing note does not
         // drag the reader's view around — the complaint this exists for.
         preserveViewport: (path) => this.preserveViewportFor(path),
-        onRenamed: (fromPath, toPath) => this.applyHotNamespaceRename(fromPath, toPath),
+        onRenamed: async (fromPath, toPath) => {
+          await this.applyHotNamespaceRename(fromPath, toPath);
+          this.openActiveFileHot();
+        },
         onResolved: (path, decision) => {
           this.debug(`hot resolved path-digest=${pathDigest(path)} decision=${decision}`);
           // Whatever was decided, the cold path has to look at the file again: either to publish the
@@ -447,7 +474,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * written. Called when the layer appears and once the workspace layout is ready.
    */
   private openActiveFileHot(): void {
-    if (!this.hotCoordinator) return;
+    if (!this.hotCoordinator || this.hotStartupPending) return;
     const file = this.app.workspace.getActiveFile();
     if (file && file.extension === "md") void this.openHotDocument(file);
   }
@@ -491,11 +518,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
 
   /** A stable per-device id, minted once and persisted: the server scopes operation dedupe to it. */
   private async ensureHotClientId(): Promise<string> {
-    if (!this.settings.hotClientId) {
-      this.settings.hotClientId = crypto.randomUUID();
-      await this.saveData(this.settings);
-    }
-    return this.settings.hotClientId;
+    const key = "mineral-obsidian-sync:hot-client-id:v2";
+    const scoped = typeof this.app.loadLocalStorage === "function" && typeof this.app.saveLocalStorage === "function";
+    const fallbackKey = `${key}:${this.app.vault.getName()}`;
+    const id = deviceHotClientId({
+      read: () => scoped ? this.app.loadLocalStorage(key) : window.localStorage.getItem(fallbackKey),
+      write: value => { if (scoped) this.app.saveLocalStorage(key, value); else window.localStorage.setItem(fallbackKey, value); },
+    });
+    if (this.hotStore) await migrateHotClientIdentity(this.hotStore, id);
+    return id;
   }
 
   /**
@@ -530,12 +561,16 @@ export default class R2PersonalSyncPlugin extends Plugin {
       },
       close: (code, reason) => socket.close(code, reason),
       onMessage: (handler) => socket.addEventListener("message", (event) => handler(String(event.data))),
-      onClose: (handler) => socket.addEventListener("close", () => handler()),
+      onClose: (handler) => socket.addEventListener("close", (event) => {
+        this.logger?.log("main", `hot socket closed code=${event.code}`);
+        handler();
+      }),
     };
   }
 
   /** Opens the hot session for the file the user just brought into focus. */
   private openHotDocument(file: TFile): Promise<void> {
+    if (this.hotOpenFailurePath === file.path && Date.now() < this.hotOpenRetryAt) return Promise.resolve();
     const request = ++this.hotDocumentRequest;
     const transition = this.hotDocumentTransition
       .catch(() => undefined)
@@ -547,7 +582,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
   /** Performs one serialized file transition, provided no newer file-open request superseded it. */
   private async openHotDocumentNow(file: TFile, request: number): Promise<void> {
     const coordinator = this.hotCoordinator;
-    if (request !== this.hotDocumentRequest || !coordinator) return;
+    if (request !== this.hotDocumentRequest || !coordinator || this.hotStartupPending) return;
+    if (coordinator.hasPendingRename?.(file.path)) return;
+    if (this.hotOpenFailurePath === file.path && Date.now() < this.hotOpenRetryAt) return;
     // The latest file-open is also a close request when the new target cannot be hot. Leaving the previous
     // Markdown binding alive here is especially dangerous for ignored notes because Obsidian may reuse its
     // Editor object for the ignored file.
@@ -564,14 +601,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
       await this.closeHotDocumentNow();
       return;
     }
-    // A durable cold conflict owns this path until its version-bound decision has actually landed.
-    // Taking the same path hot here creates a lock inversion: the hot room fences the cold executor,
-    // while only that executor can apply and retire the conflict. The resolver then appears to accept
-    // every click but can never finish. Keep the path cold until `clearResolution` removes the record;
-    // that method re-opens the still-active file afterwards.
-    if (await this.hasColdConflict(file.path)) {
-      await this.closeHotDocumentNow();
-      this.debug(`hot open deferred path-digest=${pathDigest(file.path)} reason=cold-conflict`);
+    // A cold conflict is evidence, not ownership. Keep an operational hot writer running.
+    try {
+      if (await this.hasColdConflict(file.path)) await coordinator.discoverRemoteConflict(file.path);
+    } catch (error) {
+      this.deferHotOpen(file.path, error instanceof Error ? error.message : "unavailable");
       this.scheduler?.refreshStatus();
       return;
     }
@@ -606,6 +640,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       const outcome = await coordinator.open({ canonicalPath: file.path, editor, localText, isCurrent });
       if (!isCurrent()) return;
       if (outcome.outcome === "hot") {
+        this.clearHotOpenRetry();
         this.hotOpenPath = file.path;
         this.debug(`hot opened path-digest=${pathDigest(file.path)} epoch=${outcome.identity?.epoch ?? 0}`);
       } else {
@@ -613,12 +648,36 @@ export default class R2PersonalSyncPlugin extends Plugin {
         if (outcome.outcome === "conflict") new Notice(t("notice.openConflictWithRemote", { path: file.path }));
         // "Unavailable" is not a conflict and no choice can settle it, so it says what actually happened
         // instead of offering a resolution that cannot work.
-        else if (outcome.outcome === "rejected") new Notice(t("notice.openUnavailable", { path: file.path, reason: outcome.reason ?? "unavailable" }));
+        else if (outcome.outcome === "rejected") this.deferHotOpen(file.path, outcome.reason ?? "unavailable");
       }
     } catch (error) {
       this.debug(`hot open failed path-digest=${pathDigest(file.path)} error=${error instanceof Error ? error.message : "unknown"}`);
+      if (request === this.hotDocumentRequest && this.hotCoordinator === coordinator) this.deferHotOpen(file.path, error instanceof Error ? error.message : "unavailable");
     }
     this.scheduler?.refreshStatus();
+  }
+
+  private clearHotOpenRetry(): void {
+    if (this.hotOpenRetryTimer !== undefined) clearTimeout(this.hotOpenRetryTimer);
+    this.hotOpenRetryTimer = undefined;
+    if (this.hotOpenFailurePath) this.hotLastError = undefined;
+    this.hotOpenFailurePath = undefined;
+    this.hotOpenRetryAt = 0;
+    this.hotOpenRetryDelay = 5000;
+  }
+
+  /** Typing during a Gateway outage must not retry acquire or show a notice on every keystroke. */
+  private deferHotOpen(path: string, reason: string): void {
+    const delay = this.hotOpenFailurePath === path ? Math.min(this.hotOpenRetryDelay * 2, 60000) : 5000;
+    if (this.hotOpenRetryTimer !== undefined) clearTimeout(this.hotOpenRetryTimer);
+    this.hotOpenFailurePath = path;
+    this.hotLastError = reason;
+    this.hotOpenRetryDelay = delay;
+    this.hotOpenRetryAt = Date.now() + delay;
+    this.hotOpenRetryTimer = setTimeout(() => {
+      this.hotOpenRetryTimer = undefined;
+      if (this.hotCoordinator && this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path === path) this.openActiveFileHot();
+    }, delay);
   }
 
   /** Fail closed when the durable conflict store cannot be read: hot ownership must not hide a decision. */
@@ -723,6 +782,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * the new path really is a local change the cold path has to reconcile.
    */
   private async handleVaultRename(oldPath: string, newPath: string): Promise<void> {
+    this.hotCoordinator?.reserveLocalRename?.(oldPath, newPath);
     const transition = this.hotDocumentTransition
       .catch(() => undefined)
       .then(() => this.handleVaultRenameNow(oldPath, newPath));
@@ -767,6 +827,18 @@ export default class R2PersonalSyncPlugin extends Plugin {
     // an old source and no target; every other shape is a local namespace collision and must freeze.
     if (!source && target) return;
     if (!source && !target) return;
+    if (source instanceof TFile && target instanceof TFile) {
+      const [original, copied] = await Promise.all([this.app.vault.adapter.read(fromPath), this.app.vault.adapter.read(toPath)]);
+      const leaves = this.app.workspace.getLeavesOfType("markdown").filter(leaf => leaf.view instanceof MarkdownView && leaf.view.file?.path === fromPath);
+      const unchangedEditors = leaves.every(leaf => (leaf.view as MarkdownView).editor.getValue() === original);
+      // A cold download can precede the authoritative room rename. Retire only an identical local
+      // duplicate; an edited source or unrelated target still needs a conflict decision.
+      if (original === copied && unchangedEditors) {
+        await this.app.vault.trash(source, true);
+        for (const leaf of leaves) await leaf.openFile(target);
+        return;
+      }
+    }
     if (!(source instanceof TFile) || target) {
       this.hotCoordinator?.flagExternalEdit(toPath);
       new Notice(t("notice.renameTargetTaken", { fromPath, toPath }));
@@ -964,6 +1036,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // was before the feature existed.
       ...(this.hotCoordinator ? { hot: this.hotStatusInput() } : {}),
     }));
+    if (this.hotStartupPending && state !== "running" && this.scheduler?.diagnostics?.().lastCycleFinishedAt !== undefined) {
+      this.hotStartupPending = false;
+      this.openActiveFileHot();
+    }
     this.maybePruneTombstones(state);
   }
 
@@ -979,8 +1055,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const summary = coordinator?.summary() ?? { hot: 0, handoffPending: 0, conflicts: 0, deferred: { paths: 0, operations: 0 } };
     const open = this.hotOpenPath ? coordinator?.statusOf(this.hotOpenPath) : undefined;
     const session = this.hotOpenPath ? coordinator?.sessionFor(this.hotOpenPath)?.session : undefined;
+    const unavailable = this.hotOpenFailurePath && this.app.workspace.getActiveViewOfType?.(MarkdownView)?.file?.path === this.hotOpenFailurePath;
     return {
-      status: (open?.status ?? "idle") as HotStatusInput["status"],
+      status: (unavailable ? "disconnected" : open?.status ?? "idle") as HotStatusInput["status"],
       pendingSave: Boolean(session?.pendingSave),
       handoffPending: summary.handoffPending,
       conflicts: summary.conflicts,
@@ -1054,48 +1131,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * that is no longer open.
    */
   private openHotConflictResolver(): void {
-    const coordinator = this.hotCoordinator;
-    if (!coordinator) {
-      new Notice(t("notice.noHotRunning"));
-      return;
-    }
-    const conflicts = coordinator.hotConflicts();
-    if (conflicts.length === 0) {
-      new Notice(t("notice.noHotConflicts"));
-      return;
-    }
-    // What each side holds is part of the question, so it is gathered before the user is asked. A blind
-    // "keep local / take the other side" is how a choice to overwrite real work gets made by accident.
-    void Promise.all(conflicts.map(async conflict => {
-      let localSize: number | undefined;
-      let remoteSize: number | undefined;
-      try { localSize = (await this.app.vault.adapter.stat(conflict.canonicalPath))?.size ?? undefined; } catch { /* unreadable: shown as unknown */ }
-      try { remoteSize = (await coordinator.pathStatus(conflict.canonicalPath)).remote?.size ?? undefined; } catch { /* unreachable: shown as unknown */ }
-      return { ...conflict, ...(localSize === undefined ? {} : { localSize }), ...(remoteSize === undefined ? {} : { remoteSize }) };
-    })).then(entries => {
-      new HotConflictModal(this.app, entries, async (canonicalPath, decision) => {
-        // The pane's editor is handed over when there is one, so "keep local" can put the chosen text back
-        // where the user is looking; a conflict for a file that is not open in a pane gets a headless
-        // carrier, because the file on disk is what a resolution reads and writes either way.
-        const result = await coordinator.resolveConflict(canonicalPath, decision, this.markdownViewFor(canonicalPath)?.editor);
-        this.debug(`hot resolve path-digest=${pathDigest(canonicalPath)} decision=${decision} outcome=${result.outcome}${result.detail ? ` detail=${result.detail}` : ""}`);
-        // A development build leaves the reasoning on disk, because the device that refused the decision is
-        // the only one that can say which gate did it.
-        if (__DEV__ && result.outcome === "failed") {
-          const report = [
-            `outcome: ${result.outcome} detail: ${result.detail ?? "none"}`,
-            `decision: ${decision}`,
-            `status: ${this.hotSyncStatusText()}`,
-            "",
-            ...this.logger.read(60),
-            "",
-          ].join("\n");
-          void this.app.vault.adapter.write("private/mineral-sync-hot-selftest/resolve-failure.txt", report).catch(() => undefined);
-        }
-        if (result.outcome !== "failed") this.scheduler?.refreshStatus();
-        return result;
-      }).open();
-    });
+    void this.openConflictResolver();
   }
 
   /**
@@ -1308,6 +1344,12 @@ export default class R2PersonalSyncPlugin extends Plugin {
     } catch { /* an unreadable stamp only costs a redundant cycle */ }
     if (await this.flagExternalHotEdit(path)) return;
     this.markLocalUnlessHot(path);
+  }
+
+  /** Identify our resolution write even when its Vault event arrives after another keystroke. */
+  private async writeHotResolutionText(path: string, text: string): Promise<void> {
+    this.recordHotBufferSnapshot(path, text);
+    await this.app.vault.adapter.write(path, text);
   }
 
   /**
@@ -1605,7 +1647,12 @@ export default class R2PersonalSyncPlugin extends Plugin {
     return {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.
-      scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
+      scanLocal: async () => {
+        // A restored record has no socket. Only confirmed saved, unoccupied rooms may release it;
+        // then the normal planner compares the existing baseline instead of inventing a new one.
+        await this.hotCoordinator?.reconcileDormantOwnership();
+        return Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter);
+      },
       scanRemote: () => scanRemote(client, filter, this.taggedDebug("scan-remote"), reason === "integrity-check" || !settings.gatewayEnabled || !settings.gatewayEndpoint || !settings.gatewayToken || !this.gateway?.currentChannel()
         ? undefined
         : async () => {
@@ -1649,11 +1696,15 @@ export default class R2PersonalSyncPlugin extends Plugin {
         const bootstrap = await buildBootstrapResult(local, remote, previous, {
           readLocal: (_key, expected) => readStableLocalBytes(this.app.vault, expected),
           readRemote: (key, expected) => client.getObject(key, { ifMatch: expected.etag }),
-        }, undefined, identity, ignorePolicy);
+        }, undefined, identity, ignorePolicy, { verifyConflicts: true, deferPath: key => this.hotCoordinator?.isFenced(key) ?? false });
         await this.stateStore.saveVerified(bootstrap.baselineCandidates);
         if (bootstrap.baselineCandidates.size) this.debug(`cycle bootstrap verified=${bootstrap.baselineCandidates.size}`);
         const verifiedPrevious = new Map(previous);
-        for (const [key, entry] of bootstrap.baselineCandidates) verifiedPrevious.set(key, entry);
+        for (const [key, entry] of bootstrap.baselineCandidates) {
+          verifiedPrevious.set(key, entry);
+          // Conflict observation and merge-base recording must use the same verified baseline.
+          previous.set(key, entry);
+        }
         return buildSyncPlan(local, remote, verifiedPrevious, this.coordinator?.resolutions(), {
           // Ownership is a plan input, not only an execution check: a hot path must never be described as
           // an upload, a download, or a deletion inference that some later stage has to remember to skip.
@@ -1730,10 +1781,105 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // Only decisions, never evidence: an automatically settled divergence stays recorded but is not
       // offered here, because asking the user to review a merge the engine already made is the
       // interruption this behaviour exists to remove.
-      list: () => this.pendingConflicts(),
-      propose: (intent) => coordinator.propose(intent),
+      list: async () => {
+        const records = await this.pendingConflicts();
+        this.lastConflictCount = records.length;
+        this.scheduler?.refreshStatus();
+        return records;
+      },
+      propose: (intent) => this.proposeUnifiedResolution(intent),
       debug: this.taggedDebug("conflict"),
     }).open();
+  }
+
+  private async unifiedConflictRecords(): Promise<ConflictRecord[]> {
+    const channel = this.currentChannel();
+    if (!channel) return [];
+    const cold = (await this.coordinator?.list()) ?? [];
+    const paths = new Set([...cold.map(record => record.path), ...(this.hotCoordinator?.hotConflicts() ?? []).map(record => record.canonicalPath)]);
+    const records: ConflictRecord[] = [];
+    for (const path of paths) {
+      const old = cold.find(record => record.path === path && !isAutoResolved(record.autoMergeStatus))
+        ?? cold.find(record => record.path === path);
+      const pending = await this.coordinator?.intentFor(path);
+      const pendingRecord = pending?.hotPending ? cold.find(record => record.conflictId === pending.conflictId) : undefined;
+      if (pendingRecord) { records.push({ ...pendingRecord, hotPending: true }); continue; }
+
+      const snapshot = await this.hotCoordinator?.resolutionSnapshot(path);
+      if (!snapshot) { if (old && !isAutoResolved(old.autoMergeStatus)) records.push(old); continue; }
+      const stat = await this.app.vault.adapter.stat(path);
+      // Absence is a deletion conflict, not an empty text buffer to merge into a room.
+      if (!stat) { if (old && !isAutoResolved(old.autoMergeStatus)) records.push(old); continue; }
+      const disk = await this.app.vault.adapter.read(path);
+      const editor = this.markdownViewFor(path)?.editor;
+      const local = editor?.getValue() ?? disk;
+      if (snapshot.state === "active" && snapshot.expectedRemoteETag === snapshot.remoteETag && local === snapshot.content && !pending?.hotPending) {
+        if (old) await this.coordinator?.clear(old.conflictId, path);
+        continue;
+      }
+      const localHash = await hotContentHash(disk);
+      const editorHash = editor ? await hotContentHash(local) : undefined;
+      const conflictId = await hotContentHash(JSON.stringify({ channel, path, documentId: snapshot.documentId, epoch: snapshot.epoch,
+        revision: snapshot.revision, contentHash: snapshot.contentHash, remoteETag: snapshot.remoteETag, localHash, editorHash }));
+      const observedLocal = { key: path, size: stat?.size ?? 0, mtime: stat?.mtime ?? 0 };
+      const draft = pending?.type === "merged" ? pending.merged?.content : old?.snapshot.draft;
+      const record: ConflictRecord = { protocolVersion: 1, channel, path, conflictId,
+        previous: old?.previous ?? { localVersion: observedLocal }, observedLocal,
+        observedRemoteETag: snapshot.remoteETag ?? undefined, detectedAt: Date.now(),
+        autoMergeStatus: draft === undefined ? "manual-required" : "clean",
+        snapshot: { local, remote: snapshot.remoteContent, draft, baseAvailable: false },
+        hotResolution: { snapshot, localHash, editorHash } };
+      await this.conflictStores.putConflict(record);
+      await this.conflictStores.removeConflicts(channel, cold.filter(previous => previous.path === path && previous.conflictId !== conflictId).map(previous => previous.conflictId));
+      records.push(record);
+    }
+    return records;
+  }
+
+  private async proposeUnifiedResolution(intent: ResolutionIntent): Promise<void> {
+    if (!intent.hotResolution) { await this.coordinator?.propose(intent); return; }
+    const record = await this.conflictStores.getConflict(intent.channel, intent.conflictId);
+    if (!record) throw new Error("冲突版本已变化，请重新打开冲突窗口。");
+    const content = intent.type === "merged" ? intent.merged?.content
+      : intent.type === "keep-local" ? record.snapshot.local
+      : intent.type === "keep-remote" ? record.snapshot.remote : undefined;
+    if (content === undefined) throw new Error("删除冲突需要通过文件删除流程处理。");
+    await this.conflictStores.putIntent(intent);
+    const context = intent.hotResolution;
+    const result = await this.hotCoordinator!.applyUnifiedResolution(intent.path, context.snapshot, content, `resolve.${intent.conflictId}`,
+      context.localHash, context.editorHash, this.markdownViewFor(intent.path)?.editor);
+    this.debug(`unified resolution path-digest=${pathDigest(intent.path)} outcome=${result.outcome} revision=${result.revision ?? "none"}`);
+    if (result.outcome === "stale" || result.outcome === "not-found") throw new Error("版本已经变化，请刷新冲突后重新确认。");
+    if (result.outcome === "saved") await this.clearResolution(intent.conflictId, intent.path);
+    else {
+      await this.conflictStores.putIntent({ ...intent, hotPending: { content, revision: result.revision } });
+      new Notice("合并结果已被接受，正在等待服务器保存确认。");
+      this.scheduler?.requestReconcile("hot-resolution");
+    }
+  }
+
+  private async confirmPendingHotResolutions(): Promise<void> {
+    const channel = this.currentChannel();
+    if (!channel || !this.hotCoordinator) return;
+    for (const intent of await this.conflictStores.listIntents(channel)) {
+      if (!intent.hotResolution || intent.origin !== "manual") continue;
+      const record = await this.conflictStores.getConflict(channel, intent.conflictId);
+      const content = intent.hotPending?.content ?? (record ? this.resolutionResultText(record, intent) : undefined);
+      if (content === undefined) continue;
+      const probe = await this.hotCoordinator.retryUnifiedResolution(intent.path, intent.hotResolution.snapshot, content, `resolve.${intent.conflictId}`);
+      const accepted = probe.outcome === "saved" || probe.outcome === "pending";
+      const context = intent.hotResolution;
+      const result = await this.hotCoordinator.applyUnifiedResolution(intent.path, context.snapshot,
+        content, `resolve.${intent.conflictId}`, context.localHash, context.editorHash, this.markdownViewFor(intent.path)?.editor, accepted);
+      if (result.outcome === "saved") {
+        const current = (await this.coordinator?.list())?.find(record => record.path === intent.path);
+        if (current?.conflictId === intent.conflictId) await this.clearResolution(intent.conflictId, intent.path);
+        else await this.conflictStores.removeIntents(channel, [intent.conflictId]);
+      } else if (result.outcome === "pending") {
+        await this.conflictStores.putIntent({ ...intent, hotPending: { content, revision: result.revision } });
+      }
+
+    }
   }
 
   private async refreshConflictsForResolver(): Promise<void> {
@@ -1749,10 +1895,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const [remote, stored] = await Promise.all([scanRemote(new SignedR2ListClient(settings), filter), this.stateStore.loadAll()]);
     const previous = new Map([...stored].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicyFingerprint(settings) && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix));
     // Deliberately do not consume a pending intent here. The command is rebuilding user-visible
-    // observations; the scheduler remains the only place that executes the resolution.
-    const plan = buildSyncPlan(local, remote, previous);
+    // observations; resolutions are routed separately to their current writer.
+    const plan = buildSyncPlan(local, remote, previous, undefined, { deferPath: key => this.hotCoordinator?.isFenced(key) ?? false });
     const conflicts = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict");
-    await coordinator.handleConflicts(this.conflictObservations(conflicts, local, remote, previous));
+    await coordinator.handleConflicts(this.conflictObservations(conflicts, local, remote, previous), [...new Set([...local.keys(), ...remote.keys()])].filter(key => !this.hotCoordinator?.isFenced(key)));
     await this.refreshConflictStatus();
   }
 
@@ -1763,13 +1909,14 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * active and must be dropped. The channel is re-derived here so records and intents always belong to
    * the namespace the cycle that produced them was built for.
    */
-  private async handleConflicts(conflicts: ConflictObservation[]): Promise<void> {
+  private async handleConflicts(conflicts: ConflictObservation[], observedPaths?: readonly string[]): Promise<void> {
     const coordinator = this.coordinator;
     if (!coordinator) return;
     const channel = await this.resolveChannel();
     if (!channel) return;
     coordinator.setChannel(channel);
-    await coordinator.handleConflicts(conflicts);
+    await coordinator.handleConflicts(conflicts, observedPaths);
+    await this.confirmPendingHotResolutions().catch(() => this.debug("pending hot resolution confirmation unavailable"));
     await this.refreshConflictStatus();
   }
 
@@ -1848,8 +1995,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * evidence but is not work, so it is neither counted nor shown: the badge is only for real decisions.
    */
   private async pendingConflicts(): Promise<ConflictRecord[]> {
-    const records = (await this.coordinator?.list()) ?? [];
-    return records.filter((record) => !isAutoResolved(record.autoMergeStatus));
+    return this.unifiedConflictRecords();
   }
 
   /**

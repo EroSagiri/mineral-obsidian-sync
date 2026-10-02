@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Editor, EditorPosition, EditorTransaction } from "obsidian";
 import * as Y from "yjs";
 import { encodeHotPayload, hotContentHash } from "@mineral/sync-core/hot-protocol";
@@ -18,6 +18,57 @@ import type { HotBaseline } from "./types";
 const CHANNEL = "F".repeat(43);
 const PATH = "notes/fenced.md";
 const DOCUMENT = "ZyXwVuTsRqPoNmLkJiHgFe";
+
+describe("dormant hot ownership recovery", () => {
+  async function setup(overrides: Record<string, unknown> = {}, failure = false) {
+    const store = new MemoryHotStateStore();
+    await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "disconnected", lastAcceptedRevision: 3, lastCheckpointedRevision: 3, pendingSave: false, requestedRevision: null, updatedAt: 1 });
+    let queries = 0;
+    const client = new HotGatewayClient({ endpoint: "https://gateway.test", token: "t", channel: CHANNEL }, async () => {
+      queries += 1;
+      if (failure) throw new Error("offline");
+      return { status: 200, text: JSON.stringify({ binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 }, remote: null, hotOwned: false, room: { state: "active", clients: 0, pendingSave: false, latestAcceptedRevision: 4, latestCheckpointedRevision: 4 }, ...overrides }) };
+    }, () => new FakeSocket());
+    const coordinator = new HotSyncCoordinator({ client, store, clientId: "device-a" });
+    await coordinator.restore();
+    return { coordinator, store, queries: () => queries };
+  }
+
+  it("returns a restored, fully saved and unoccupied path to cold reconciliation without changing its baseline", async () => {
+    const { coordinator, store } = await setup();
+    expect(coordinator.isFenced(PATH)).toBe(true);
+    expect(await coordinator.reconcileDormantOwnership()).toBe(1);
+    expect(coordinator.isFenced(PATH)).toBe(false);
+    expect(await store.loadSessions()).toEqual([]);
+  });
+
+  it.each([
+    { hotOwned: true },
+    { room: { state: "active", clients: 1, pendingSave: false, latestAcceptedRevision: 4, latestCheckpointedRevision: 4 } },
+    { room: { state: "active", clients: 0, pendingSave: true, latestAcceptedRevision: 4, latestCheckpointedRevision: 3 } },
+    { room: { state: "conflicted", clients: 0, pendingSave: false, latestAcceptedRevision: 4, latestCheckpointedRevision: 4 } },
+    { binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 2, state: "active" } },
+    { room: null },
+  ])("retains protection when server ownership is unsafe: %j", async overrides => {
+    const { coordinator } = await setup(overrides);
+    expect(await coordinator.reconcileDormantOwnership()).toBe(0);
+    expect(coordinator.isFenced(PATH)).toBe(true);
+  });
+
+  it("retains protection when the Gateway is unreachable", async () => {
+    const { coordinator } = await setup({}, true);
+    expect(await coordinator.reconcileDormantOwnership()).toBe(0);
+    expect(coordinator.isFenced(PATH)).toBe(true);
+  });
+
+  it("does not release or query a path with an unacknowledged edit", async () => {
+    const { coordinator, store, queries } = await setup();
+    await store.putOutbox({ key: "pending", canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", clientOperationId: "pending", update: "AA", createdAt: 1, attempts: 0 });
+    expect(await coordinator.reconcileDormantOwnership()).toBe(0);
+    expect(queries()).toBe(0);
+    expect(coordinator.isFenced(PATH)).toBe(true);
+  });
+});
 
 class FakeSocket implements HotSocket {
   readonly sent: string[] = [];
@@ -97,7 +148,7 @@ function harness(
     commitBaseline: async (path, baseline) => { baselines.push({ path, baseline }); },
     onStatus: (_path, status) => statuses.push(status),
   });
-  return { coordinator, store, sockets, baselines, statuses };
+  return { coordinator, store, sockets, baselines, statuses, client };
 }
 
 function welcomeState(): string {
@@ -116,6 +167,47 @@ async function ackLastOperation(socket: FakeSocket, session: { handleFrame(frame
 const welcome = (revision = 0) => ({ protocol: 1, type: "welcome", documentId: DOCUMENT, epoch: 1, canonicalPath: PATH, state: "active", serverRevision: revision, latestCheckpointedRevision: revision, crdtState: welcomeState(), pendingSave: false });
 
 describe("hot namespace deletion", () => {
+  it("fences both rename paths after a lost response and retries the same durable intent", async () => {
+    const { coordinator, store, sockets, client } = harness();
+    await coordinator.open({ canonicalPath: PATH, editor: fakeEditor(""), localText: "" });
+    sockets[0].emit(welcome());
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const namespace = vi.spyOn(client, "namespace").mockRejectedValueOnce(new Error("response lost"));
+    namespace.mockImplementation(async intent => ({ protocol: 1, operationId: intent.operationId, type: "rename", outcome: "applied", phase: "acked", canonicalPath: "renamed.md", fromPath: PATH, binding: null, identity: { documentId: DOCUMENT, epoch: 2 } }));
+    // Override the first verdict after installing the implementation.
+    namespace.mockRejectedValueOnce(new Error("response lost"));
+    vi.useFakeTimers();
+    try {
+      expect((await coordinator.rename(PATH, "renamed.md")).outcome).toBe("pending");
+      expect(coordinator.isFenced(PATH)).toBe(true);
+      expect(coordinator.isFenced("renamed.md")).toBe(true);
+      expect(coordinator.fencedPaths()).toContain("renamed.md");
+      const intent = (await store.loadSessions())[0]!.pendingRename!;
+      expect(intent.toPath).toBe("renamed.md");
+      expect((await coordinator.close({ canonicalPath: "renamed.md", localText: "" })).outcome).toBe("handoff-pending");
+      await vi.advanceTimersByTimeAsync(6500);
+      expect(namespace.mock.calls.at(-1)![0]).toEqual(intent);
+      expect(coordinator.sessionFor("renamed.md")?.session?.epoch).toBe(2);
+      expect((await store.loadSessions())[0]!.pendingRename).toBeUndefined();
+    } finally { coordinator.shutdown(); vi.useRealTimers(); }
+  });
+
+  it("restores both path fences and recovers a rename after plugin restart", async () => {
+    const { coordinator, store, client } = harness();
+    const intent = { protocol: 1, type: "rename" as const, operationId: "persisted-rename", clientId: "device-a", fromPath: PATH, toPath: "renamed.md", documentId: DOCUMENT, expectedEpoch: 1, expectedFromBinding: { documentId: DOCUMENT, epoch: 1 }, expectedToPathState: { state: "absent" as const } };
+    await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "hot", lastAcceptedRevision: 0, lastCheckpointedRevision: 0, pendingSave: false, requestedRevision: null, updatedAt: 1, pendingRename: intent });
+    const namespace = vi.spyOn(client, "namespace").mockResolvedValue({ protocol: 1, type: "rename", operationId: intent.operationId, outcome: "applied", phase: "acked", canonicalPath: intent.toPath, binding: null, identity: { documentId: DOCUMENT, epoch: 2 } });
+    vi.useFakeTimers();
+    try {
+      await coordinator.restore();
+      expect(coordinator.isFenced(PATH)).toBe(true);
+      expect(coordinator.isFenced(intent.toPath)).toBe(true);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(namespace).toHaveBeenCalledWith(intent);
+      expect(await store.loadSessions()).toEqual([expect.objectContaining({ canonicalPath: intent.toPath, epoch: 2 })]);
+      expect((await store.loadSessions())[0]!.pendingRename).toBeUndefined();
+    } finally { coordinator.shutdown(); vi.useRealTimers(); }
+  });
   it("moves the live bridge, epoch, and durable record when a hot file is renamed", async () => {
     const toPath = "notes/renamed.md";
     const renameResult = {
@@ -763,28 +855,37 @@ describe("hot conflict resolution", () => {
       editor: {
         getValue: () => value,
         setValue: (next: string) => { value = next; },
-        transaction: () => {},
+        transaction: (transaction: EditorTransaction) => {
+          const offset = (position: EditorPosition) => value.split("\n").slice(0, position.line).reduce((length, line) => length + line.length + 1, 0) + position.ch;
+          for (const change of [...(transaction.changes ?? [])].reverse()) {
+            const from = offset(change.from);
+            const to = change.to ? offset(change.to) : from;
+            value = value.slice(0, from) + change.text + value.slice(to);
+          }
+        },
       } as unknown as Editor,
     };
   }
 
   /** The harness, with the resolution transport and the disk reader wired. */
-  function resolutionHarness(options: { disk?: string; resolve?: { status: number; body: unknown } } = {}) {
+  function resolutionHarness(options: { disk?: string; staleDocument?: string; room?: Record<string, unknown>; resolve?: { status: number; body: unknown } } = {}) {
     const sockets: FakeSocket[] = [];
     const calls: Array<Record<string, unknown>> = [];
     const resolved: string[] = [];
+    const written: string[] = [];
     const transport = async (request: HotHttpRequest): Promise<HotHttpResponse> => {
       if (request.url.endsWith("/hot/acquire")) {
         return { status: 200, text: JSON.stringify({ protocol: 1, outcome: "created", canonicalPath: PATH, binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 }, remote: null, identity: { documentId: DOCUMENT, epoch: 1 }, serverRevision: 0, latestCheckpointedRevision: 0, roomState: "active", sessionTicket: "ticket-1" }) };
       }
       if (request.url.endsWith("/hot/resolve")) {
         calls.push(JSON.parse(request.body ?? "{}") as Record<string, unknown>);
+        if (options.staleDocument && calls.length === 1) return { status: 404, text: JSON.stringify({ outcome: "not-found" }) };
         const answer = options.resolve ?? { status: 200, body: { outcome: "resolved" } };
         return { status: answer.status, text: JSON.stringify(answer.body) };
       }
       if (request.url.includes("/hot/path")) {
         // What the coordinator asks when a conflict outlived its pane: who owns this path now.
-        return { status: 200, text: JSON.stringify({ binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 }, remote: { exists: true, etag: "R1", size: 7, deleted: false }, hotOwned: true }) };
+        return { status: 200, text: JSON.stringify({ binding: { canonicalPath: PATH, documentId: options.staleDocument ?? DOCUMENT, epoch: 1, state: "active", updatedAt: 1 }, remote: { exists: true, etag: "R1", size: 7, deleted: false }, hotOwned: true, room: options.room }) };
       }
       return { status: 200, text: "{}" };
     };
@@ -799,13 +900,14 @@ describe("hot conflict resolution", () => {
       store,
       clientId: "device-a",
       readLocalText: async () => options.disk,
+      writeLocalText: async (_path, text) => { written.push(text); },
       onResolved: (path, decision) => resolved.push(`${path}:${decision}`),
     });
-    return { coordinator, store, sockets, calls, resolved };
+    return { coordinator, store, sockets, calls, resolved, written };
   }
 
   it("takes the disk version when the user keeps the file, as an ordinary local edit", async () => {
-    const { coordinator, sockets } = resolutionHarness({ disk: "external bytes\n" });
+    const { coordinator, sockets, written } = resolutionHarness({ disk: "external bytes\n" });
     const pane = mutableEditor("mine\n");
     await coordinator.open({ canonicalPath: PATH, editor: pane.editor, localText: "mine\n" });
     sockets[0].emit(welcome());
@@ -827,7 +929,7 @@ describe("hot conflict resolution", () => {
   });
 
   it("puts the session's version back on disk when the user takes the other side", async () => {
-    const { coordinator, sockets } = resolutionHarness({ disk: "external bytes\n" });
+    const { coordinator, sockets, written } = resolutionHarness({ disk: "external bytes\n" });
     const pane = mutableEditor("mine\n");
     await coordinator.open({ canonicalPath: PATH, editor: pane.editor, localText: "mine\n" });
     sockets[0].emit(welcome());
@@ -843,23 +945,82 @@ describe("hot conflict resolution", () => {
     expect(coordinator.hotConflicts()).toEqual([]);
     // Rewriting the buffer to the document's own content is not an edit, so nothing is sent.
     expect(sockets[0].sent.length).toBe(before);
+    expect(written).toEqual(["mine\n"]);
+    pane.editor.setValue("mine\nnext keystroke");
+    await coordinator.handleEditorChange(PATH);
+    expect(coordinator.bindingFor(PATH)?.text()).toBe("mine\nnext keystroke");
+    expect(coordinator.hotConflicts()).toEqual([]);
   });
 
-  it("forwards a server conflict and gives up ownership when the user accepts the remote version", async () => {
-    const { coordinator, store, calls, resolved } = resolutionHarness({ resolve: { status: 200, body: { outcome: "abandoned" } } });
-    await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "conflict", lastAcceptedRevision: 3, lastCheckpointedRevision: 1, pendingSave: true, requestedRevision: null, updatedAt: 1 });
-    await coordinator.restore();
-    expect(coordinator.fenceReason(PATH)).toBe("conflict");
-
-    const result = await coordinator.resolveConflict(PATH, "accept-remote");
-
-    expect(result.outcome).toBe("abandoned");
-    expect(calls).toEqual([expect.objectContaining({ decision: "accept-remote", documentId: DOCUMENT, epoch: 1 })]);
-    // The fence is gone entirely: the cold path is what reconciles the file with R2 from here.
-    expect(coordinator.fenceReason(PATH)).toBeNull();
-    expect(coordinator.fencedPaths()).toEqual([]);
-    expect(await store.loadSessions()).toEqual([]);
+  it("accepts the fresh server room, writes disk, and keeps subsequent typing hot", async () => {
+    const { coordinator, store, sockets, calls, resolved, written } = resolutionHarness({ disk: "old local", staleDocument: "CurrentRoomDocumentId", resolve: { status: 200, body: { outcome: "abandoned" } } });
+    const pane = mutableEditor("old local");
+    await coordinator.open({ canonicalPath: PATH, editor: pane.editor, localText: "old local" });
+    sockets[0].emit(welcome());
+    await new Promise(resolve => setTimeout(resolve, 0));
+    sockets[0].emit({ protocol: 1, type: "document-state", documentId: DOCUMENT, epoch: 1, state: "conflicted", canonicalPath: PATH, reason: "external-conflict" });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const pending = coordinator.resolveConflict(PATH, "accept-remote", pane.editor);
+    for (let attempt = 0; attempt < 100 && sockets.length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    const doc = new Y.Doc();
+    doc.getText("markdown").insert(0, "server version");
+    sockets[1].emit({ ...welcome(), crdtState: encodeHotPayload(Y.encodeStateAsUpdate(doc)) });
+    expect((await pending).outcome).toBe("resolved");
+    expect(calls).toEqual([expect.objectContaining({ decision: "accept-remote", documentId: DOCUMENT, epoch: 1 }), expect.objectContaining({ decision: "accept-remote", documentId: "CurrentRoomDocumentId", epoch: 1 })]);
+    expect(written).toEqual(["server version"]);
+    expect(coordinator.fenceReason(PATH)).toBe("hot");
+    expect(coordinator.hotConflicts()).toEqual([]);
     expect(resolved).toEqual([`${PATH}:accept-remote`]);
+    pane.editor.setValue("server version typed");
+    await coordinator.handleEditorChange(PATH);
+    expect(coordinator.bindingFor(PATH)?.text()).toBe("server version typed");
+    coordinator.shutdown();
+  });
+
+  it("applies a version-bound decision in the existing incarnation and continues typing", async () => {
+    const { coordinator, sockets, written, calls } = resolutionHarness({ disk: "local", resolve: { status: 200, body: { outcome: "saved", revision: 49 } } });
+    const pane = mutableEditor("local");
+    const snapshot = { documentId: DOCUMENT, epoch: 1, revision: 48, checkpointedRevision: 47, expectedRemoteETag: "old", content: "room pending", contentHash: await hotContentHash("room pending"), state: "conflicted" as const, remoteETag: "R1", remoteContent: "R2 saved" };
+    const pending = coordinator.applyUnifiedResolution(PATH, snapshot, "merged result", "manual-unified", await hotContentHash("local"), await hotContentHash("local"), pane.editor);
+    for (let attempt = 0; attempt < 100 && sockets.length === 0; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    const doc = new Y.Doc();
+    doc.getText("markdown").insert(0, "merged result");
+    sockets[0].emit({ ...welcome(), serverRevision: 49, latestCheckpointedRevision: 49, crdtState: encodeHotPayload(Y.encodeStateAsUpdate(doc)) });
+    expect((await pending).outcome).toBe("saved");
+    expect(calls).toEqual([expect.objectContaining({ decision: "merged", documentId: DOCUMENT, expectedRevision: 48, expectedRemoteETag: "R1", content: "merged result" })]);
+    expect(written).toEqual(["merged result"]);
+    pane.editor.setValue("merged result typed");
+    await coordinator.handleEditorChange(PATH);
+    expect(coordinator.bindingFor(PATH)?.text()).toBe("merged result typed");
+    coordinator.shutdown();
+  });
+
+  it("refuses a manual result when the editor changed since the review", async () => {
+    const { coordinator, calls } = resolutionHarness({ disk: "local" });
+    const snapshot = { documentId: DOCUMENT, epoch: 1, revision: 48, checkpointedRevision: 47, expectedRemoteETag: "old", content: "room", contentHash: await hotContentHash("room"), state: "active" as const, remoteETag: "R1", remoteContent: "remote" };
+    const result = await coordinator.applyUnifiedResolution(PATH, snapshot, "old draft", "manual-stale", await hotContentHash("local"), await hotContentHash("local"), mutableEditor("new typing").editor);
+    expect(result.outcome).toBe("stale");
+    expect(calls).toEqual([]);
+  });
+
+  it("resolves a discovered orphan room by accepting R2, then keeps typing hot", async () => {
+    const { coordinator, sockets, written, calls } = resolutionHarness({ disk: "", room: { state: "conflicted", clients: 0, pendingSave: true, latestAcceptedRevision: 48, latestCheckpointedRevision: 47 }, resolve: { status: 200, body: { outcome: "abandoned" } } });
+    await coordinator.discoverRemoteConflict(PATH);
+    expect(coordinator.hotConflicts()).toHaveLength(1);
+    const pane = mutableEditor("");
+    const pending = coordinator.resolveConflict(PATH, "accept-remote", pane.editor);
+    for (let attempt = 0; attempt < 100 && sockets.length === 0; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    const doc = new Y.Doc();
+    doc.getText("markdown").insert(0, "server version");
+    sockets[0].emit({ ...welcome(), crdtState: encodeHotPayload(Y.encodeStateAsUpdate(doc)) });
+    expect((await pending).outcome).toBe("resolved");
+    expect(calls).toEqual([expect.objectContaining({ decision: "accept-remote", documentId: DOCUMENT, epoch: 1 })]);
+    expect(written).toEqual(["server version"]);
+    pane.editor.setValue("server version typed");
+    await coordinator.handleEditorChange(PATH);
+    expect(coordinator.bindingFor(PATH)?.text()).toBe("server version typed");
+    expect(coordinator.hotConflicts()).toEqual([]);
+    coordinator.shutdown();
   });
 
   it("keeps the conflict frozen when the decision cannot be delivered", async () => {
@@ -874,6 +1035,75 @@ describe("hot conflict resolution", () => {
     expect(coordinator.fenceReason(PATH)).toBe("conflict");
     expect(coordinator.hotConflicts()).toHaveLength(1);
     expect(resolved).toEqual([]);
+  });
+
+  /**
+   * The merged decision is the fourth answer, and the only one that carries content.
+   *
+   * It exists because a fence cannot be dropped by a decision that never lands, and because the merged
+   * text is readable by neither side that could otherwise be asked for it: R2 holds one losing side and
+   * the disk holds the other. So the text has to travel into the room. These tests pin the two halves
+   * that matter — it reaches the document as a local edit (never as a seed), and a path whose conflict
+   * was only ever a disk record can take it too.
+   */
+  it("carries a merged result into the room that owns the path", async () => {
+    const { coordinator, sockets, resolved } = resolutionHarness({ disk: "local\n", resolve: { status: 200, body: { outcome: "abandoned" } } });
+    const pane = mutableEditor("local\n");
+    await coordinator.open({ canonicalPath: PATH, editor: pane.editor, localText: "local\n" });
+    sockets[0].emit(welcome());
+    await new Promise(resolve => setTimeout(resolve, 0));
+    sockets[0].emit({ protocol: 1, type: "document-state", documentId: DOCUMENT, epoch: 1, state: "conflicted", canonicalPath: PATH, reason: "remote-changed" });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(coordinator.fenceReason(PATH)).toBe("conflict");
+
+    const pending = coordinator.resolveConflict(PATH, "merged", pane.editor, "local\nremote\n");
+    // The decision retires the refused room and joins a fresh one, so the merged text has to reach the
+    // *new* socket — the one the room that will publish it is listening on.
+    for (let attempt = 0; attempt < 200 && sockets.length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(sockets.length, "a merged decision has to reach a room").toBeGreaterThan(1);
+    sockets[1].emit(welcome());
+    const result = await pending;
+
+    expect(result.outcome).toBe("resolved");
+    // It became a document revision the room can forward, which a seed would not have been.
+    expect(sockets[1].sent.some(frame => frame.includes("\"type\":\"operation\""))).toBe(true);
+    expect(coordinator.hotConflicts()).toEqual([]);
+    expect(resolved).toEqual([`${PATH}:merged`]);
+    coordinator.shutdown();
+  });
+
+  it("lets a conflict that was only ever a disk record take a merged result", async () => {
+    // No binding, no socket: this is the shape `未命名.md` was stuck in. The record alone has to be
+    // enough, or the fence and the cold intent deadlock each other and a click can never finish.
+    const { coordinator, store, sockets } = resolutionHarness({ disk: "local\n" });
+    await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "conflict", lastAcceptedRevision: 3, lastCheckpointedRevision: 1, pendingSave: true, requestedRevision: null, updatedAt: 1 });
+    await coordinator.restore();
+    expect(coordinator.bindingFor(PATH)).toBeUndefined();
+    expect(coordinator.fenceReason(PATH)).toBe("conflict");
+
+    const pending = coordinator.resolveConflict(PATH, "merged", undefined, "local\nremote\n");
+    // A path with no socket has to open one before the merged text can be applied at all.
+    for (let attempt = 0; attempt < 200 && sockets.length === 0; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(sockets.length, "a restored conflict still has to reach a room").toBeGreaterThan(0);
+    sockets[0].emit(welcome());
+    const result = await pending;
+
+    expect(result.outcome).toBe("resolved");
+    expect(coordinator.bindingFor(PATH) ?? coordinator.sessionFor(PATH)).toBeDefined();
+    expect(coordinator.hotConflicts()).toEqual([]);
+    coordinator.shutdown();
+  });
+
+  it("leaves the conflict frozen when a merged result arrives without its text", async () => {
+    const { coordinator, store } = resolutionHarness();
+    await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "conflict", lastAcceptedRevision: 3, lastCheckpointedRevision: 1, pendingSave: true, requestedRevision: null, updatedAt: 1 });
+    await coordinator.restore();
+
+    const result = await coordinator.resolveConflict(PATH, "merged");
+
+    expect(result).toEqual({ outcome: "failed", detail: "missing-merged-text" });
+    expect(coordinator.fenceReason(PATH)).toBe("conflict");
+    expect(coordinator.hotConflicts()).toHaveLength(1);
   });
 
   it("ignores a decision for a path that is not conflicted", async () => {
@@ -901,17 +1131,137 @@ describe("hot conflict resolution", () => {
     expect(resolved).toEqual([`${PATH}:keep-local`]);
   });
 
-  it("releases a stuck handoff when the user gives up on this device's version", async () => {
+  it("keeps a decision visible if the abandoned handoff's file cannot be read", async () => {
     const { coordinator, store } = resolutionHarness({ resolve: { status: 200, body: { outcome: "abandoned" } } });
     await store.putHandoff({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, requiredRevision: 4, contentHash: "abc", r2ETag: null, createdAt: 1 });
     await coordinator.restore();
-
     const result = await coordinator.resolveConflict(PATH, "accept-remote");
+    expect(result.outcome).toBe("failed");
+    expect(result.detail).toBe("local-unreadable");
+    expect(coordinator.fenceReason(PATH)).toBe("conflict");
+  });
 
-    expect(result.outcome).toBe("abandoned");
-    expect(coordinator.fenceReason(PATH)).toBeNull();
-    expect(coordinator.hotConflicts()).toEqual([]);
-    expect(await store.loadHandoffs()).toEqual([]);
+  /**
+   * Giving up a room the authority will not let cold writes past.
+   *
+   * Letting the merge past the *local* fence is only half the fix: the cold write still needs a lease, and
+   * the Gateway refuses one while a room holds the path. The plugin is the only party that knows the room
+   * on this device is a husk, and this is how it says so.
+   */
+  describe("releaseRefusedRoom", () => {
+    it("retires a room that was refused, so the cold write can be authorised", async () => {
+      const { coordinator, store, calls } = resolutionHarness({ room: { clients: 0, pendingSave: false }, resolve: { status: 200, body: { outcome: "abandoned" } } });
+      await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 2, clientId: "device-a", status: "conflict", lastAcceptedRevision: 3, lastCheckpointedRevision: 1, pendingSave: true, requestedRevision: null, updatedAt: 1 });
+      await coordinator.restore();
+
+      expect(await coordinator.releaseRefusedRoom(PATH)).toBe(true);
+      // The identity comes from the live binding status, not from the stale record: the record's epoch may
+      // describe an incarnation the server has already replaced.
+      expect(calls).toEqual([expect.objectContaining({ decision: "accept-remote", documentId: DOCUMENT })]);
+      expect(coordinator.fenceReason(PATH)).toBeNull();
+    });
+
+    it("does not let a cold draft discard an unseen pending room revision", async () => {
+      const { coordinator, store, calls } = resolutionHarness({ disk: "", room: { clients: 0, pendingSave: true, currentContentHash: await hotContentHash("uncheckpointed work") } });
+      await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "conflict", lastAcceptedRevision: 48, lastCheckpointedRevision: 47, pendingSave: true, requestedRevision: null, updatedAt: 1 });
+      await coordinator.restore();
+      expect(await coordinator.releaseRefusedRoom(PATH)).toBe(false);
+      expect(calls).toEqual([]);
+      expect(coordinator.fenceReason(PATH)).toBe("conflict");
+    });
+
+    it("refuses to retire a room whose session is still live", async () => {
+      // An external edit underneath a bound editor: the room still holds the side the user is looking at,
+      // so giving it up here would discard real work.
+      const { coordinator, sockets, calls } = resolutionHarness({ disk: "external\n" });
+      const pane = mutableEditor("mine\n");
+      await coordinator.open({ canonicalPath: PATH, editor: pane.editor, localText: "mine\n" });
+      sockets[0].emit(welcome());
+      await new Promise(resolve => setTimeout(resolve, 0));
+      coordinator.flagExternalEdit(PATH);
+      expect(coordinator.fenceReason(PATH)).toBe("conflict");
+
+      expect(await coordinator.releaseRefusedRoom(PATH)).toBe(false);
+      expect(calls).toEqual([]);
+      expect(coordinator.fenceReason(PATH)).toBe("conflict");
+    });
+
+    it("leaves an unproven handoff alone", async () => {
+      const { coordinator, store, calls } = resolutionHarness();
+      await store.putHandoff({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, requiredRevision: 4, contentHash: "abc", r2ETag: null, createdAt: 1 });
+      await coordinator.restore();
+
+      expect(await coordinator.releaseRefusedRoom(PATH)).toBe(false);
+      expect(calls).toEqual([]);
+      expect(coordinator.fenceReason(PATH)).toBe("handoff-pending");
+    });
+
+    it("does nothing for a path that is not conflicted", async () => {
+      const { coordinator, calls } = resolutionHarness();
+      expect(await coordinator.releaseRefusedRoom(PATH)).toBe(false);
+      expect(calls).toEqual([]);
+    });
+  });
+});
+
+describe("cold authority discovers server conflicts", () => {
+  it("settles deletion with the original lease operation identity", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const client = new HotGatewayClient({ endpoint: "https://gateway.test", token: "t", channel: CHANNEL }, async request => {
+      bodies.push(JSON.parse(request.body!));
+      return { status: 200, text: JSON.stringify(request.url.endsWith("acquire") ? { outcome: "granted", token: "delete-token" } : { outcome: "recorded", hotOwned: false }) };
+    }, () => new FakeSocket());
+    const coordinator = new HotSyncCoordinator({ client, store: new MemoryHotStateStore(), clientId: "device-a" });
+    expect(await coordinator.authorizeColdMutation(PATH, "old-etag", "delete-remote")).toBe("granted");
+    await coordinator.settleColdMutation(PATH);
+    expect(bodies[0]!.operation).toBe("delete");
+    expect(bodies[1]).toMatchObject({ token: "delete-token", operation: "delete", operationId: bodies[0]!.operationId });
+  });
+  it("downloads a saved checkpoint without asking for the other device's writer lease", async () => {
+    let requests = 0;
+    const client = new HotGatewayClient({ endpoint: "https://gateway.test", token: "t", channel: CHANNEL }, async () => {
+      requests += 1;
+      return { status: 200, text: JSON.stringify({ outcome: "denied", reason: "hot-owned" }) };
+    }, () => new FakeSocket());
+    const coordinator = new HotSyncCoordinator({ client, store: new MemoryHotStateStore(), clientId: "device-a" });
+    expect(await coordinator.authorizeColdMutation(PATH, null, "download")).toBe("granted");
+    await coordinator.settleColdMutation(PATH);
+    expect(requests).toBe(0);
+    expect(await coordinator.authorizeColdMutation(PATH, null, "upload")).toBe("deferred");
+    expect(requests).toBeGreaterThan(0);
+  });
+
+  it("continues to block downloads into this device's retained hot path", async () => {
+    const { coordinator, store } = harness();
+    await store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, clientId: "device-a", status: "hot", lastAcceptedRevision: 2, lastCheckpointedRevision: 1, pendingSave: true, requestedRevision: null, updatedAt: 1 });
+    await coordinator.restore();
+    expect(await coordinator.authorizeColdMutation(PATH, null, "download")).toBe("deferred");
+  });
+
+  it("persists an orphaned server conflict even with no local hot session", async () => {
+    const store = new MemoryHotStateStore();
+    const notifications: string[] = [];
+    const client = new HotGatewayClient({ endpoint: "https://gateway.test", token: "t", channel: CHANNEL }, async request => {
+      if (request.url.endsWith("/cold/acquire")) return { status: 200, text: JSON.stringify({ outcome: "denied", reason: "hot-owned" }) };
+      return { status: 200, text: JSON.stringify({ binding: { canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, state: "active" }, hotOwned: true,
+        room: { state: "conflicted", clients: 0, pendingSave: true, latestAcceptedRevision: 48, latestCheckpointedRevision: 47 } }) };
+    }, () => new FakeSocket());
+    const coordinator = new HotSyncCoordinator({ client, store, clientId: "device-a", onConflict: (_path, reason) => notifications.push(reason) });
+    expect(await coordinator.authorizeColdMutation(PATH, null, "resolve-merged")).toBe("deferred");
+    expect(coordinator.hotConflicts()).toEqual([{ canonicalPath: PATH, reason: "conflict" }]);
+    expect(notifications).toEqual(["remote-room-conflict"]);
+    const restored = new HotSyncCoordinator({ client, store, clientId: "device-a" });
+    await restored.restore();
+    expect(restored.fenceReason(PATH)).toBe("conflict");
+  });
+
+  it("keeps a denied lease denied when its diagnostic request fails", async () => {
+    const client = new HotGatewayClient({ endpoint: "https://gateway.test", token: "t", channel: CHANNEL }, async request => {
+      if (request.url.endsWith("/cold/acquire")) return { status: 200, text: JSON.stringify({ outcome: "denied", reason: "hot-owned" }) };
+      throw new Error("offline");
+    }, () => new FakeSocket());
+    const coordinator = new HotSyncCoordinator({ client, store: new MemoryHotStateStore(), clientId: "device-a" });
+    expect(await coordinator.authorizeColdMutation(PATH)).toBe("deferred");
   });
 });
 
@@ -1020,6 +1370,82 @@ describe("hot path fence", () => {
     await coordinator.restore();
     expect(coordinator.fenceReason(PATH)).toBe("conflict");
     expect(coordinator.statusOf(PATH).reason).toBe("conflict");
+  });
+
+  /**
+   * The one operation a conflict fence must let through.
+   *
+   * A `status: conflict` record read back from disk fences twice over (`this.conflicts` and
+   * `sessionStatusFencesCold`), and there is nothing live behind it. The cold side owns both the
+   * version-bound intent and the executor that could apply it, so refusing it is a deadlock no decision
+   * can ever finish — which is exactly what froze `未命名.md`. Everything else stays refused.
+   *
+   * The distinction is the *session status*, not the presence of a binding: `open()` registers a binding
+   * before the acquire handshake finishes and leaves it behind when the join is refused, so a path can
+   * hold a binding whose room is not a writer at all.
+   */
+  describe("the merge exception", () => {
+    const restoredConflict = async () => {
+      const context = harness();
+      await context.store.putSession({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 2, clientId: "device-a", status: "conflict", lastAcceptedRevision: 3, lastCheckpointedRevision: 1, pendingSave: true, requestedRevision: null, updatedAt: 1 });
+      await context.coordinator.restore();
+      return context;
+    };
+
+    it("lets a resolved merge through a conflict whose room was refused", async () => {
+      const { coordinator } = await restoredConflict();
+      expect(coordinator.fenceReason(PATH)).toBe("conflict");
+      // No binding, no socket: the record is all there is.
+      expect(coordinator.bindingFor(PATH)).toBeUndefined();
+
+      expect(coordinator.isFencedFor(PATH, "resolve-merged")).toBe(false);
+      // Refusing the others is the whole point: they carry no decision that could justify letting them past.
+      for (const operation of ["upload", "download", "delete-local", "noop", "resolve-keep-local", "resolve-keep-remote"]) {
+        expect(coordinator.isFencedFor(PATH, operation), operation).toBe(true);
+      }
+    });
+
+    it("lets a resolved merge through when a refused room left its binding behind", async () => {
+      // The shape the real device was in. `restore()` deliberately rebuilds no session object (there is no
+      // socket behind the record), while `open()` had already registered a binding before its acquire was
+      // refused and nothing ever cleared it. A binding is not a writer, so it must not hold the fence up.
+      const { coordinator } = await restoredConflict();
+      (coordinator as unknown as { bindings: Map<string, unknown> }).bindings.set(PATH, {});
+
+      expect(coordinator.bindingFor(PATH)).toBeDefined();
+      expect(coordinator.sessionFor(PATH)).toBeUndefined();
+      expect(coordinator.isFencedFor(PATH, "resolve-merged")).toBe(false);
+    });
+
+    it("keeps refusing a merge while a session could still publish", async () => {
+      const { coordinator, sockets } = harness();
+      const pane = fakeEditor("mine\n");
+      await coordinator.open({ canonicalPath: PATH, editor: pane, localText: "mine\n" });
+      sockets[0].emit(welcome());
+      await new Promise(resolve => setTimeout(resolve, 0));
+      coordinator.flagExternalEdit(PATH);
+      expect(coordinator.fenceReason(PATH)).toBe("conflict");
+      expect(coordinator.statusOf(PATH).reason).toBe("external-local-edit");
+
+      // This session is live: something wrote the file underneath a bound editor, so the room is still a
+      // writer and the cold path must not race it.
+      expect(coordinator.isFencedFor(PATH, "resolve-merged")).toBe(true);
+    });
+
+    it("still fences a merge behind an unproven handoff", async () => {
+      const { coordinator, store } = harness();
+      await store.putHandoff({ canonicalPath: PATH, documentId: DOCUMENT, epoch: 1, requiredRevision: 4, contentHash: "abc", r2ETag: null, createdAt: 1 });
+      await coordinator.restore();
+
+      expect(coordinator.fenceReason(PATH)).toBe("handoff-pending");
+      expect(coordinator.isFencedFor(PATH, "resolve-merged")).toBe(true);
+    });
+
+    it("fences nothing for a path that is not fenced at all", async () => {
+      const { coordinator } = harness();
+      expect(coordinator.isFencedFor(PATH, "upload")).toBe(false);
+      expect(coordinator.isFencedFor(PATH, "resolve-merged")).toBe(false);
+    });
   });
 
   it("raises an external-modification conflict once, and keeps the path fenced", async () => {

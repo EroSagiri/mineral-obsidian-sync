@@ -6,9 +6,15 @@ removes only that device-local baseline entry. This baseline GC does not touch a
 
 ## Logical remote deletion
 
-The plugin never uses R2 `DeleteObject`. Instead it creates an immutable JSON tombstone under the
-reserved remote-prefix namespace `.mineral-sync/tombstones/<sha256(path,etag)>.json` with
+The plugin first archives the exact retired bytes under
+`.mineral/versions/deleted-<tombstone identity>/<original path>`, then creates an immutable JSON tombstone under the
+reserved remote-prefix namespace `.mineral/tombstones/<sha256(path,etag)>.json` with
 conditional `If-None-Match: *` creation:
+
+Legacy `.mineral-sync/tombstones/` records remain readable only during migration. New writes use
+`.mineral/tombstones/`; MCP backup and delete copies share `.mineral/versions/`. The migration tool
+`scripts/migrate-internal-storage.mjs` preserves the original R2 acceptance time as `r2AcceptedAt`.
+All writers must be paused and every backend/plugin upgraded before retiring old keys.
 
 ```json
 {"protocol":1,"path":"notes/a.md","deletedRemoteETag":"ETAG_A","createdAt":"2026-09-22T00:00:00.000Z"}
@@ -20,8 +26,15 @@ metadata-key mismatch fail the remote scan closed; they never mean a file was de
 
 Effective remote state is: object A plus tombstone(A) is deleted; object B plus tombstone(A) is B;
 and an absent object plus a valid tombstone is deleted. Thus recreating a path writes B and is not
-blocked by an old tombstone(A). Old R2 objects intentionally remain stored: physical R2 garbage
-collection is deferred because an unconditional DELETE could erase a concurrent version.
+blocked by an old tombstone(A). After successful archival and tombstone creation, the source version
+is checked again and the original object is removed. Hot deletion and rename retirement use the same
+archive-before-remove sequence. Archive failure leaves the original intact. Existing logical deletions
+are not bulk-purged automatically.
+
+R2 does not implement conditional DELETE. Gateway coordination excludes participating writers, but
+the final version check cannot atomically exclude an external S3 writer between checking and deletion.
+Writers bypassing the Gateway must be paused during deletion or migration. Recycle copies remain outside
+ordinary sync scans and use the existing version restore mechanism.
 
 Before tombstoning a locally deleted file, the executor conditionally HEADs the expected ETag and
 then conditionally creates the tombstone. Ambiguous tombstone PUTs do not retire `previous`; the next
@@ -33,5 +46,5 @@ Local trashing, baseline GC, and local restores do not notify it.
 `local-modified-remote-deleted` offers **Keep Local / Restore** or **Accept Remote Delete**.
 `local-deleted-remote-modified` offers **Restore Remote** or **Accept Local Delete**. Each button
 persists a version-bound `ResolutionIntent`; only the planner and SafeExecutor can apply it. Text
-conflicts remain separate. Automatic three-way text merge, rename inference, physical R2 GC, queues,
+conflicts remain separate. Automatic three-way text merge, rename inference, archive retention, queues,
 and remote polling are outside this phase.

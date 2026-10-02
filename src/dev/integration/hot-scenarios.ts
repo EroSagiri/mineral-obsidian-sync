@@ -33,11 +33,11 @@ import { formatRunId } from "./test-namespace";
 /**
  * The local root the protocol group uses.
  *
- * It lives inside the sync filter's ignored `.mineral-sync/` namespace on purpose: the note must not be
+ * It lives inside the sync filter's ignored `.mineral/` namespace on purpose: the note must not be
  * a cold-sync candidate, because an ordinary upload landing between the room's acquisition and its
  * first checkpoint would turn a passing run into a precondition failure.
  */
-export const HOT_SELF_TEST_ROOT = ".mineral-sync/selftest/";
+export const HOT_SELF_TEST_ROOT = ".mineral/selftest/";
 
 /**
  * The root a device that refuses dot-directories has to use instead.
@@ -275,7 +275,7 @@ async function editorValueInPane(app: App, path: string): Promise<string | undef
 /**
  * Runs the hot self-test.
  *
- * It never touches a canonical path: the protocol group lives under the ignored `.mineral-sync/`
+ * It never touches a canonical path: the protocol group lives under the ignored `.mineral/`
  * namespace and the wiring group under `.mineral-sync-test/<run>/`, and both halves are removed by the
  * cleanup scenario (a namespace delete for the remote side, a Vault delete for the local one).
  */

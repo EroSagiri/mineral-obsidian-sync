@@ -1,3 +1,4 @@
+import type { HotResolutionSnapshot } from "@mineral/sync-core/hot-protocol";
 import type { LocalEntry, RemoteDeletionIdentity } from "../sync/types";
 import type { BranchOrder } from "./handoff";
 
@@ -57,7 +58,15 @@ export interface HandoffEvidence {
   order?: BranchOrder;
 }
 
+export interface HotResolutionContext {
+  snapshot: HotResolutionSnapshot;
+  localHash: string;
+  editorHash?: string;
+}
+
 export interface ConflictRecord {
+  hotPending?: boolean;
+  hotResolution?: HotResolutionContext;
   protocolVersion: typeof CONFLICT_PROTOCOL_VERSION;
   conflictId: string;
   channel: string;
@@ -83,6 +92,8 @@ export type ResolutionIntentType = "keep-local" | "keep-remote" | "accept-remote
  * writes one of these, and the planner decides whether it is still applicable.
  */
 export interface ResolutionIntent {
+  hotPending?: { content: string; revision?: number };
+  hotResolution?: HotResolutionContext;
   protocolVersion: typeof CONFLICT_PROTOCOL_VERSION;
   conflictId: string;
   channel: string;

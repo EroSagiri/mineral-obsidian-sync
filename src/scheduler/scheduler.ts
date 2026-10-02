@@ -147,6 +147,7 @@ export class SyncScheduler {
     const localWrites = new Map<string, LocalEntry>();
     const resultDetails = new Map<string, number>();
     const conflicts: ConflictObservation[] = [];
+    const observedPaths = new Set<string>();
     const handshake: RemoteGenerationHandshake = { startFailed: false, observationComplete: true };
     const incremental = reason === "remote-change" && this.incrementalStateTrusted ? this.pendingRemoteChanges.shift() : undefined;
     const useRemoteIncremental = Boolean(incremental && this.dependencies.remoteChange?.canApplyIncrementally(incremental.generation));
@@ -193,6 +194,7 @@ export class SyncScheduler {
           const observations = { local, remote, previous: useRemoteIncremental || useLocalIncremental ? stored : cycle.filterPrevious(stored) };
           const plan = await cycle.buildPlan(local, remote, observations.previous);
           if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict"), observations));
+          for (const operation of plan.operations) observedPaths.add(operation.key);
           const planCounts = new Map<string, number>();
           for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);
           this.dependencies.debug?.(`cycle plan operations=${plan.operations.length} counts=${JSON.stringify(Object.fromEntries(planCounts))}`);
@@ -200,9 +202,12 @@ export class SyncScheduler {
           for (const operation of plan.operations) {
             if (this.shouldStop(generation)) { halted = true; break; }
             // The fence is checked here, at the mutation boundary, and not in the planner: a plan can be
-            // built while a path is cold and reach the executor after it became hot.
-            if (this.dependencies.hotDeferral?.isFenced(operation.key)) {
+            // built while a path is cold and reach the executor after it became hot. The operation travels
+            // with the question because one of them — a resolved merge — *is* the decision the fence was
+            // waiting for, and refusing it is how a conflicted path deadlocks.
+            if (this.dependencies.hotDeferral?.isFenced(operation.key, operation.type)) {
               this.dependencies.hotDeferral.noteDeferred(operation.key);
+              observedPaths.delete(operation.key);
               counts.deferred++;
               deferredByHot = true;
               this.dependencies.debug?.("cycle operation deferred-by-hot-ownership");
@@ -211,15 +216,26 @@ export class SyncScheduler {
             // The authority is asked before the mutation and released after it: a lease that was
             // released before the write would guard nothing.
             let authority: HotAuthorityVerdict | undefined;
+            // A resolved merge is the one operation that answers a frozen conflict, and the room that
+            // conflict belongs to can be holding the very lease this write needs. A room with nothing left
+            // to publish is given up first, or the decision is refused by the Gateway forever — the local
+            // fence yielding is only half of it. The plugin decides whether there is anything to release;
+            // a live session, an external edit and an unproven handoff are all left alone (see
+            // `releaseRefusedRoom`).
+            if (operation.type === "resolve-merged" && this.dependencies.hotConflictRelease) {
+              try { await this.dependencies.hotConflictRelease.release(operation.key); }
+              catch { this.dependencies.debug?.("cycle could not release the refused room; the fence stands"); }
+            }
             // The cross-device lease protects mutations, not observations. Asking the Gateway for
             // hundreds of `noop`/`conflict` rows turns a control-plane outage into a multi-minute cold
             // scan even though those rows cannot write either side. Keep the authority boundary exactly
             // around operations that can reach the executor.
             const mutates = operation.type !== "noop" && operation.type !== "conflict";
             if (mutates && this.dependencies.hotAuthority) {
-              authority = await this.dependencies.hotAuthority.authorize(operation.key);
+              authority = await this.dependencies.hotAuthority.authorize(operation.key, operation.type);
               if (authority === "deferred") {
-                counts.deferred++;
+                observedPaths.delete(operation.key);
+              counts.deferred++;
                 deferredByHot = true;
                 this.dependencies.debug?.("cycle operation deferred-by-hot-authority");
                 continue;
@@ -238,6 +254,7 @@ export class SyncScheduler {
                 try { await this.dependencies.hotAuthority.settle(operation.key, authority); } catch { /* bookkeeping only */ }
               }
             }
+            if (operation.type.startsWith("resolve-") && result.status !== "applied") observedPaths.delete(operation.key);
             counts[result.status]++;
             if (result.status === "applied" && result.localWrite) localWrites.set(result.localWrite.key, result.localWrite);
             const detail = resultDetail(result);
@@ -345,11 +362,10 @@ export class SyncScheduler {
     // rewrites the plan that just ran; a resolution the coordinator records is applied by a later
     // cycle, which keeps `planner` the only decision maker and `event != operation` intact.
     //
-    // The hook runs on *every* cycle, including one with no conflicts at all. An empty list is
-    // meaningful: it is how the coordinator learns that records it still holds are no longer active
-    // and must be dropped. Skipping the call would leave a resolved conflict visible in the UI forever.
-    if (this.dependencies.onConflicts) {
-      try { await this.dependencies.onConflicts(conflicts); }
+    // An empty conflict list proves convergence only for paths actually observed and processed.
+    // Failed scans, incremental omissions and deferred resolutions must preserve prior decisions.
+    if (this.dependencies.onConflicts && failure === undefined && !halted) {
+      try { await this.dependencies.onConflicts(conflicts, [...observedPaths]); }
       catch { this.dependencies.debug?.("conflict coordination failed"); }
     }
     // An executor-originated Vault write emits the same event as a user edit. Consume it only after

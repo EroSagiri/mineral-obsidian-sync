@@ -41,9 +41,13 @@ export async function buildBootstrapResult(
   signal?: AbortSignal,
   remoteIdentity?: RemoteIdentity,
   ignorePolicy?: string,
+  options: { verifyConflicts?: boolean; deferPath?: (key: string) => boolean } = {},
 ): Promise<BootstrapResult> {
   const allKeys = [...new Set([...local.keys(), ...remote.keys()])].sort((a, b) => a.localeCompare(b));
-  const keys = allKeys.filter((key) => candidate(local.get(key), remote.get(key), previous.get(key)));
+  // A stale baseline can describe a conflict even though both devices have already converged.
+  // Verify that exact pair rather than repeatedly asking for a merge with no ancestor.
+  const conflicts = options.verifyConflicts ? new Set(buildSyncPlan(local, remote, previous, undefined, { deferPath: options.deferPath }).operations.filter(operation => operation.type === "conflict").map(operation => operation.key)) : new Set<string>();
+  const keys = allKeys.filter((key) => !options.deferPath?.(key) && (candidate(local.get(key), remote.get(key), previous.get(key)) || (conflicts.has(key) && local.get(key)?.size === remote.get(key)?.size && Boolean(remote.get(key)?.etag))));
   const metadataDifferent = allKeys.filter((key) => {
     const here = local.get(key), there = remote.get(key), before = previous.get(key);
     return Boolean(here && there && here.size !== there.size && (!before || !before.local || !before.remote));

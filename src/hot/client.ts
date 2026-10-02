@@ -1,3 +1,4 @@
+import type { HotResolutionSnapshot, HotMergedResolution, HotMergedResolutionResult } from "@mineral/sync-core/hot-protocol";
 import type { ColdAuthorityCommit, ColdAuthorityRequest, ColdAuthorityResult, DocumentEpoch, HotAcquireRequest, HotAcquireResult, HotReleaseRequest, HotReleaseResult, HotRemoteObservation, PathBinding } from "@mineral/sync-core/hot-protocol";
 import type { NamespaceIntent, NamespaceResult } from "@mineral/sync-core/namespace-protocol";
 
@@ -27,6 +28,20 @@ export interface HotHttpRequest {
 }
 
 export interface HotHttpResponse { status: number; text: string; }
+
+export interface HotPathStatus {
+  binding: PathBinding | null;
+  remote: HotRemoteObservation | null;
+  hotOwned: boolean;
+  room?: {
+    state: string;
+    clients: number;
+    pendingSave: boolean;
+    latestAcceptedRevision: number;
+    latestCheckpointedRevision: number;
+    currentContentHash: string | null;
+  } | null;
+}
 
 export type HotTransport = (request: HotHttpRequest) => Promise<HotHttpResponse>;
 
@@ -127,9 +142,21 @@ export class HotGatewayClient {
     return body as unknown as NamespaceResult;
   }
 
-  async pathStatus(canonicalPath: string): Promise<{ binding: PathBinding | null; remote: HotRemoteObservation | null; hotOwned: boolean }> {
+  async pathStatus(canonicalPath: string): Promise<HotPathStatus> {
     const { body } = await this.request("path", undefined, `?path=${encodeURIComponent(canonicalPath)}`);
-    return body as unknown as { binding: PathBinding | null; remote: HotRemoteObservation | null; hotOwned: boolean };
+    return body as unknown as HotPathStatus;
+  }
+
+  async resolutionSnapshot(path: string): Promise<HotResolutionSnapshot | null> {
+    const response = await this.transport({ url: this.url("path", `?path=${encodeURIComponent(path)}&resolution=1`), method: "GET", headers: {}, timeoutMs: CONTROL_TIMEOUT_MS });
+    if (response.status !== 200) throw new HotClientError({ kind: "server", status: response.status }, "resolution snapshot unavailable");
+    return JSON.parse(response.text) as HotResolutionSnapshot | null;
+  }
+
+  async applyMergedResolution(input: HotMergedResolution): Promise<HotMergedResolutionResult> {
+    const { body } = await this.request("resolve", input);
+    if (!["saved", "pending", "stale", "not-found"].includes(String(body.outcome))) throw new HotClientError({ kind: "malformed" }, "invalid resolution outcome");
+    return body as unknown as HotMergedResolutionResult;
   }
 
   /**
@@ -169,5 +196,4 @@ export class HotGatewayClient {
     return this.now();
   }
 }
-
 

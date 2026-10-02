@@ -15,6 +15,30 @@ function reader(localBodies: Record<string, string | Uint8Array>, remoteBodies: 
 }
 
 describe("buildBootstrapResult", () => {
+  it("repairs an obsolete complete baseline only after a conflicted pair has identical bytes", async () => {
+    const locals = new Map([["same", local("same", 3, 10)], ["different", local("different", 3, 10)]]);
+    const remotes = new Map([["same", remote("same", 3, "e2")], ["different", remote("different", 3, "e2")]]);
+    const result = await buildBootstrapResult(locals, remotes, new Map([["same", previous("same")], ["different", previous("different")]]), reader({ same: "abc", different: "abc" }, { same: "abc", different: "xyz" }), undefined, undefined, undefined, { verifyConflicts: true });
+    expect([...result.baselineCandidates.keys()]).toEqual(["same"]);
+    expect(result.baselineCandidates.get("same")).toMatchObject({ local: { mtime: 10 }, remote: { etag: "e2" } });
+    expect(result.plan.operations).toEqual([expect.objectContaining({ key: "different", type: "conflict" }), expect.objectContaining({ key: "same", type: "noop" })]);
+  });
+
+  it("does not read or rebaseline a conflicted pair owned by hot sync", async () => {
+    let reads = 0;
+    const source: BootstrapContentReader = { readLocal: async () => { reads++; return encoder.encode("abc").buffer; }, readRemote: async () => { reads++; return encoder.encode("abc").buffer; } };
+    const result = await buildBootstrapResult(new Map([["a", local("a", 3, 10)]]), new Map([["a", remote("a", 3, "e2")]]), new Map([["a", previous("a")]]), source, undefined, undefined, undefined, { verifyConflicts: true, deferPath: () => true });
+    expect(reads).toBe(0);
+    expect(result.baselineCandidates.size).toBe(0);
+  });
+
+  it("preserves an obsolete baseline if conditional conflict verification becomes stale", async () => {
+    const source: BootstrapContentReader = { readLocal: async () => encoder.encode("abc").buffer, readRemote: async () => { throw new RemoteObjectChangedError(); } };
+    const result = await buildBootstrapResult(new Map([["a", local("a", 3, 10)]]), new Map([["a", remote("a", 3, "e2")]]), new Map([["a", previous("a")]]), source, undefined, undefined, undefined, { verifyConflicts: true });
+    expect(result.baselineCandidates.size).toBe(0);
+    expect(result.plan.operations[0].type).toBe("conflict");
+  });
+
   it("baselines equal-size, SHA-256-identical bytes and gives the pure planner a noop", async () => {
     const result = await buildBootstrapResult(new Map([["a.bin", local("a.bin", 3)]]), new Map([["a.bin", remote("a.bin", 3)]]), new Map(), reader({ "a.bin": "abc" }, { "a.bin": "abc" }));
     expect(result.diagnostics).toMatchObject({ bootstrapCandidates: 1, verifiedIdentical: 1, hashedFiles: 1, hashedBytes: 6, unresolved: 0 });

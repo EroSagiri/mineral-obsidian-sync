@@ -30,5 +30,10 @@ describe("vault path filter", () => {
     expect(filter.ignores("folder/Thumbs.db")).toBe(true);
     expect(filter.ignores("folder/note.tmp")).toBe(true);
     expect(filter.ignores("normal.md")).toBe(false);
+    expect(filter.ignores(".mineral/versions/time/note.md")).toBe(true);
+    expect(filter.ignores(".mineral/tombstones/record.json")).toBe(true);
+    expect(filter.ignores(".mineral-sync/tombstones/record.json")).toBe(true);
+    expect(filter.ignores(".history/time/note.md")).toBe(true);
+    expect(filter.ignores(".trash/time/note.md")).toBe(true);
   });
 });

@@ -1,12 +1,13 @@
+import type { HotResolutionSnapshot, HotMergedResolutionResult } from "@mineral/sync-core/hot-protocol";
 import type { Editor } from "obsidian";
 import { hotContentHash, type HotAcquireResult, type HotRemoteObservation, type PathBinding } from "@mineral/sync-core/hot-protocol";
 import type { NamespaceIntent, NamespaceResult } from "@mineral/sync-core/namespace-protocol";
-import type { HotGatewayClient } from "./client";
+import type { HotGatewayClient, HotPathStatus } from "./client";
 import { HotEditorBinding } from "./editor-binding";
 import { HeadlessEditor, asEditor } from "./headless-editor";
 import type { HotStateStore } from "./store";
 import { HotDocumentSession, type HotCloseOutcome } from "./session";
-import { sessionStatusFencesCold, type HotBaseline, type HotSessionRecord, type HotSessionStatus } from "./types";
+import { sessionStatusFencesCold, sessionStatusIsOperational, type HotBaseline, type HotSessionRecord, type HotSessionStatus } from "./types";
 import { pathDigest } from "../sync/path";
 
 /**
@@ -57,7 +58,7 @@ export interface HotCoordinatorDependencies {
   /** Applies a room-originated namespace rename to the local Vault/UI owner. */
   onRenamed?(fromPath: string, toPath: string): void | Promise<void>;
   /** A human decision landed; the caller asks the cold path to look at the path again. */
-  onResolved?(canonicalPath: string, decision: "keep-local" | "accept-remote"): void;
+  onResolved?(canonicalPath: string, decision: "keep-local" | "accept-remote" | "merged"): void;
   debug?(message: string): void;
 }
 
@@ -83,6 +84,8 @@ let operationCounter = 0;
 
 export class HotSyncCoordinator implements HotPathFence {
   private readonly sessions = new Map<string, HotDocumentSession>();
+  private readonly openingPaths = new Map<string, number>();
+  private dormantRecovery?: Promise<number>;
   private readonly bindings = new Map<string, HotEditorBinding>();
   private readonly hotPaths = new Set<string>();
   private readonly handoffPaths = new Set<string>();
@@ -104,7 +107,12 @@ export class HotSyncCoordinator implements HotPathFence {
   private readonly unavailable = new Map<string, string>();
   private readonly deferred = new Map<string, number>();
   /** Cold-mutation leases this device holds right now, by path. */
-  private readonly coldLeases = new Map<string, string>();
+  private readonly coldLeases = new Map<string, { token: string; operationId: string; operation: "put" | "delete" }>();
+  private readonly pendingRenames = new Map<string, { intent: Extract<NamespaceIntent, { type: "rename" }>; finish?: () => void; nextPath?: string }>();
+  private renameRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private renameRetryRunning = false;
+  private stopped = false;
+  private readonly reservedRenamePaths = new Set<string>();
 
   constructor(private readonly deps: HotCoordinatorDependencies) {}
 
@@ -123,6 +131,10 @@ export class HotSyncCoordinator implements HotPathFence {
     const sessions = await this.deps.store.loadSessions();
     const handoffs = await this.deps.store.loadHandoffs();
     for (const record of sessions) {
+      if (record.pendingRename) {
+        this.pendingRenames.set(record.pendingRename.operationId, { intent: record.pendingRename, nextPath: record.nextRenamePath });
+        if (record.nextRenamePath) this.reservedRenamePaths.add(record.nextRenamePath);
+      }
       if (record.status === "closed") {
         await this.deps.store.deleteSession(record.canonicalPath);
         continue;
@@ -132,6 +144,7 @@ export class HotSyncCoordinator implements HotPathFence {
       else this.hotPaths.add(record.canonicalPath);
     }
     for (const handoff of handoffs) this.handoffPaths.add(handoff.canonicalPath);
+    if (this.pendingRenames.size) this.scheduleRenameRecovery();
     this.deps.debug?.(`hot restore: sessions=${sessions.length} handoffs=${handoffs.length}`);
     return { sessions, handoffs: handoffs.length };
   }
@@ -141,6 +154,7 @@ export class HotSyncCoordinator implements HotPathFence {
    * ------------------------------------------------------------------------------------------ */
 
   fenceReason(canonicalPath: string): HotFenceReason | null {
+    if (this.hasPendingRename(canonicalPath)) return "handoff-pending";
     if (this.conflicts.has(canonicalPath)) return "conflict";
     if (this.handoffPaths.has(canonicalPath)) return "handoff-pending";
     const session = this.sessions.get(canonicalPath);
@@ -153,12 +167,96 @@ export class HotSyncCoordinator implements HotPathFence {
     return this.fenceReason(canonicalPath) !== null;
   }
 
+  /**
+   * Whether the cold path may run **this** operation for the path.
+   *
+   * Several cold operations can write a path, and only one of them is the answer to a frozen conflict. A
+   * resolved merge is the user's decision, already recorded and bound to the exact versions they were
+   * shown (`resolve-merged` carries `expectedLocal` and `expectedRemoteETag`, and the executor re-checks
+   * both), so the fence has nothing left to protect — the thing it was holding the path for has happened.
+   *
+   * Without this the path deadlocks, and no decision can ever finish it:
+   *
+   * - the conflict is a session record read back from disk, so `fenceReason` says `conflict` twice over —
+   *   once through `this.conflicts`, once through `sessionStatusFencesCold("conflict")`;
+   * - the cold side owns the version-bound intent and the executor that could apply it, but cannot run;
+   * - the hot side can only be resolved by writing *through a room*, which for a path with no live binding
+   *   means re-joining one — and the user has no reason to go looking there, because the conflict they can
+   *   see is the one the cold resolver lists.
+   *
+   * The exception is deliberately narrow. `external-local-edit` never yields: its session is perfectly
+   * live — something wrote the file underneath a *bound editor* — so the room is still a writer and the
+   * cold side must not race it. It yields only for a conflict that means the room was **refused** and has
+   * no live pane behind it, and never for an upload, download or delete: those carry no decision that
+   * could justify letting them past the fence.
+   *
+   * A binding alone is not "live". `open()` registers one before the acquire handshake finishes and leaves
+   * it there if the join is refused, so a path can hold a binding whose room never published anything.
+   * That is not a writer, and treating it as one is what leaves the decision with nowhere to land.
+   *
+   * A *restored* record is not a live session either: `restore()` rebuilds the fence from the path sets
+   * (`this.conflicts`, `this.handoffPaths`, `this.hotPaths`) and deliberately does not put it back in
+   * `this.sessions`, because there is no socket, no editor and no room behind it. So the only sessions
+   * that can be operational here are ones an `open()` created in this run.
+   */
+  isFencedFor(canonicalPath: string, operation: string): boolean {
+    const reason = this.fenceReason(canonicalPath);
+    if (reason === null) return false;
+    if (reason !== "conflict" || operation !== "resolve-merged") return true;
+    // The session is the writer, not the binding: `hot`-family statuses are the ones that publish.
+    const status = this.sessions.get(canonicalPath)?.session?.status;
+    return status !== undefined && sessionStatusIsOperational(status);
+  }
+
   fencedPaths(): string[] {
-    return [...new Set([...this.hotPaths, ...this.handoffPaths, ...this.conflicts.keys()])];
+    return [...new Set([...this.hotPaths, ...this.handoffPaths, ...this.conflicts.keys(), ...this.reservedRenamePaths, ...[...this.pendingRenames.values()].flatMap(({ intent }) => [intent.fromPath, intent.toPath])])];
   }
 
   plannerFact(canonicalPath: string): "deferred-by-hot-ownership" | null {
     return this.isFenced(canonicalPath) ? "deferred-by-hot-ownership" : null;
+  }
+
+  /** Retained ownership without a socket must eventually return to ordinary reconciliation. */
+  reconcileDormantOwnership(): Promise<number> {
+    if (this.dormantRecovery) return this.dormantRecovery;
+    const task = this.recoverDormantOwnership();
+    this.dormantRecovery = task;
+    void task.finally(() => { if (this.dormantRecovery === task) this.dormantRecovery = undefined; }).catch(() => undefined);
+    return task;
+  }
+
+  private async recoverDormantOwnership(): Promise<number> {
+    const [records, outbox, handoffs] = await Promise.all([
+      this.deps.store.loadSessions(), this.deps.store.loadOutbox(), this.deps.store.loadHandoffs(),
+    ]);
+    let released = 0;
+    for (const record of records) {
+      const path = record.canonicalPath;
+      if (record.pendingRename || this.hasPendingRename(path)) continue;
+      if (!this.isFenced(path) || this.openingPaths.has(path) || this.sessions.has(path) || this.bindings.has(path)
+        || this.conflicts.has(path) || this.handoffPaths.has(path) || record.pendingSave
+        || record.lastAcceptedRevision > record.lastCheckpointedRevision
+        || handoffs.some(entry => entry.canonicalPath === path)
+        || outbox.some(entry => entry.canonicalPath === path)) continue;
+      let status: HotPathStatus;
+      try { status = await this.deps.client.pathStatus(path); }
+      catch { continue; }
+      const room = status.room;
+      // A query failure, a different incarnation, another client or unsaved work cannot earn release.
+      if (status.hotOwned || !status.binding || status.binding.documentId !== record.documentId
+        || status.binding.epoch !== record.epoch || status.binding.state !== "active"
+        || !room || room.state !== "active" || room.clients !== 0 || room.pendingSave
+        || room.latestAcceptedRevision > room.latestCheckpointedRevision) continue;
+      // The query awaited the network: opening this path meanwhile must keep its fence.
+      if (this.openingPaths.has(path) || this.sessions.has(path) || this.bindings.has(path) || this.conflicts.has(path)
+        || this.handoffPaths.has(path)) continue;
+      await this.deps.store.deleteSession(path);
+      this.hotPaths.delete(path);
+      this.deferred.delete(path);
+      released += 1;
+      this.deps.debug?.(`hot dormant ownership released path-digest=${pathDigest(path)}`);
+    }
+    return released;
   }
 
   /**
@@ -177,6 +275,8 @@ export class HotSyncCoordinator implements HotPathFence {
 
   /** Terminates every live in-process bridge and socket when the plugin instance is unloaded. */
   shutdown(): void {
+    this.stopped = true;
+    if (this.renameRetryTimer) clearTimeout(this.renameRetryTimer);
     for (const binding of this.bindings.values()) binding.detach();
     for (const session of this.sessions.values()) session.shutdown();
     this.bindings.clear();
@@ -227,6 +327,20 @@ export class HotSyncCoordinator implements HotPathFence {
    * belongs to the server, and `conflict` is its answer.
    */
   async open(input: { canonicalPath: string; editor: Editor; localText: string; adoptRemote?: boolean; isCurrent?: () => boolean }): Promise<HotOpenOutcome> {
+    const path = input.canonicalPath;
+    this.openingPaths.set(path, (this.openingPaths.get(path) ?? 0) + 1);
+    try {
+      await this.dormantRecovery;
+      return await this.openInternal(input);
+    }
+    finally {
+      const remaining = (this.openingPaths.get(path) ?? 1) - 1;
+      if (remaining > 0) this.openingPaths.set(path, remaining);
+      else this.openingPaths.delete(path);
+    }
+  }
+
+  private async openInternal(input: { canonicalPath: string; editor: Editor; localText: string; adoptRemote?: boolean; isCurrent?: () => boolean }): Promise<HotOpenOutcome> {
     const existing = this.sessions.get(input.canonicalPath);
     if (existing) return { outcome: "hot", session: existing };
 
@@ -433,6 +547,7 @@ export class HotSyncCoordinator implements HotPathFence {
    * cold path becomes allowed to touch the file again. On anything else the fence stays up.
    */
   async close(input: { canonicalPath: string; localText: string; checkpoint?: boolean }): Promise<HotCloseOutcome> {
+    if (this.hasPendingRename(input.canonicalPath)) return { outcome: "handoff-pending", detail: "rename-unconfirmed" };
     const session = this.sessions.get(input.canonicalPath);
     if (!session) return { outcome: "not-hot" };
     const outcome = await session.close({
@@ -529,6 +644,7 @@ export class HotSyncCoordinator implements HotPathFence {
     this.hotPaths.delete(canonicalPath);
     this.handoffPaths.delete(canonicalPath);
     this.conflicts.delete(canonicalPath);
+    this.conflictOrigins.delete(canonicalPath);
     await this.deps.store.deleteSession(canonicalPath).catch(() => undefined);
     await this.deps.store.deleteHandoff(canonicalPath).catch(() => undefined);
     this.deps.onStatus?.(canonicalPath, "idle", "abandoned");
@@ -550,12 +666,63 @@ export class HotSyncCoordinator implements HotPathFence {
     const target = decision === "keep-local" ? await this.deps.readLocalText?.(canonicalPath) : binding.text();
     if (target === undefined) return false;
     await binding.applyTextAsLocalEdit(target);
+    if (decision === "accept-remote") await this.deps.writeLocalText?.(canonicalPath, target);
     this.deps.onStatus?.(canonicalPath, "hot", "resolved");
     return true;
   }
 
   private clearConflict(canonicalPath: string): void {
     this.conflicts.delete(canonicalPath);
+  }
+
+  /**
+   * Puts a hand-made result into the room, which is the only writer for a live path.
+   *
+   * The merged text comes from the person, not from R2 and not from the disk, so unlike `keep-local` it
+   * cannot be read back out of the Vault — it has to be carried in. It is applied through
+   * `applyTextAsLocalEdit`, which is the same path a keystroke takes: the binding diffs the merged text
+   * against the document, records one operation, and forwards it. Seeding the document instead would be
+   * the one thing this file must never do, because a seed that skips `onLocalUpdate` never reaches R2.
+   *
+   * **The stale session is abandoned first, and that is the whole point.** `open()` prefers
+   * `session.resume()` whenever a record exists, and the record behind a conflict is exactly the session
+   * the authority already refused — so joining without clearing it re-asks the same question and is told
+   * "no" for the same reason. `accept-remote` is the forward that tells the server to retire that room;
+   * after it, the join is a genuinely fresh incarnation, and the merged text goes into the new document
+   * rather than into the one that was frozen.
+   *
+   * Returns `false` when there is no room to accept it; the caller leaves the conflict frozen, because a
+   * decision that could not be delivered must not drop the fence.
+   */
+  async mergeThroughHot(canonicalPath: string, mergedText: string, editor?: Editor): Promise<boolean> {
+    const carrier = editor ?? this.bindings.get(canonicalPath)?.editorInstance() ?? asEditor(new HeadlessEditor(mergedText));
+    // Retire the room the authority refused. Without this the re-join resumes it and is refused again.
+    if (this.conflicts.has(canonicalPath)) {
+      const forwarded = await this.forwardServerResolve(canonicalPath, "accept-remote");
+      if (!forwarded) {
+        this.deps.debug?.("hot merge: the server still owns a room it will not re-point; the conflict stays");
+        return false;
+      }
+    }
+    // Joining with an empty local text is deliberate: the merged result is pushed afterwards, as a local
+    // edit, so it becomes a document revision the room forwards. Passing it here would only seed.
+    if (!(await this.joinAndDecide(canonicalPath, "accept-remote", "", carrier))) return false;
+    const binding = this.bindingFor(canonicalPath);
+    const session = this.sessionFor(canonicalPath);
+    if (binding) {
+      // The binding owns both halves: it diffs the merged text into the document and puts it in the pane.
+      await binding.applyTextAsLocalEdit(mergedText);
+      // The file is written too. A result that lives in R2 and in the editor but leaves disk holding one
+      // of the losing sides makes the next cold cycle see a divergence the user never created.
+      if (this.deps.writeLocalText) await this.deps.writeLocalText(canonicalPath, mergedText);
+    } else if (this.deps.writeLocalText) {
+      // No pane and no binding: the file is the only place the result can land, and the room was joined
+      // with an empty local text, so nothing else carries it.
+      await this.deps.writeLocalText(canonicalPath, mergedText);
+    }
+    const revision = session?.session?.lastAcceptedRevision;
+    if (session && revision !== undefined) void session.requestCheckpoint(revision + 1).catch(() => undefined);
+    return true;
   }
 
   /**
@@ -598,14 +765,12 @@ export class HotSyncCoordinator implements HotPathFence {
      */
     const forwarded = await this.forwardServerResolve(canonicalPath, decision);
     if (!forwarded) return false;
-    // `accept-remote` is complete here: this device has given the path up and the cold path reconciles the
-    // file against R2 with its ordinary rules (including asking, if both sides moved).
-    if (decision === "accept-remote") return true;
+    // Retirement only changes authority. Rejoin the R2-backed incarnation to apply the chosen bytes.
     return await this.joinAndDecide(canonicalPath, decision, diskText, carrier);
   }
 
   /** One attempt at convergence: join without claiming local content, then apply the decision to it. */
-  private async joinAndDecide(canonicalPath: string, decision: "keep-local" | "accept-remote", diskText: string, carrier: Editor): Promise<boolean> {
+  private async joinAndDecide(canonicalPath: string, decision: "keep-local" | "accept-remote", diskText: string, carrier: Editor, allowEmpty = false): Promise<boolean> {
     const joined = await this.open({ canonicalPath, editor: carrier, localText: diskText, adoptRemote: true });
     if (joined.outcome !== "hot") {
       this.deps.debug?.(`hot resolution: the join was refused (${joined.outcome}${joined.reason ? "/" + joined.reason : ""})`);
@@ -627,7 +792,7 @@ export class HotSyncCoordinator implements HotPathFence {
       const remoteText = binding.text();
       // Never empty a file that has content: an empty document means the two sides still disagree, and that
       // call belongs to the user with the sizes in front of them, not to a write-back.
-      if (remoteText.length === 0 && diskText.length > 0) {
+      if (!allowEmpty && remoteText.length === 0 && diskText.length > 0) {
         this.deps.debug?.("hot resolution: refusing to write an empty document over a non-empty file");
         return false;
       }
@@ -745,32 +910,79 @@ export class HotSyncCoordinator implements HotPathFence {
    *   decision is forwarded: `keep-local` re-points the room's precondition at what R2 holds now, and
    *   `accept-remote` gives up ownership and lets cold sync reconcile the file.
    *
+   * **`merged`** is the fourth answer, and it is the one that must *write*, so it takes the local half of
+   * `keep-local` (the room is re-pointed) and carries its own text instead of reading the disk. Two things
+   * make it necessary rather than convenient: a fence cannot be dropped by a decision that never lands
+   * (below), and the merged text exists nowhere the room can read it — not in R2, which holds one losing
+   * side, and not on disk, which holds the other. Handing it to the cold executor instead is what froze
+   * `未命名.md`: the cold side holds the version-bound intent, but the live room fences it, and the fence
+   * only comes down when the *room* has accepted the result. So the decision goes through the room, which
+   * is the path's only writer, and the cold intent is retired by `clearResolution` once it lands.
+   *
    * A failed resolution leaves the conflict exactly where it was. Losing the fence because a decision
    * could not be delivered would be the one outcome worse than a frozen file.
    */
-  async resolveConflict(canonicalPath: string, decision: "keep-local" | "accept-remote", editor?: Editor): Promise<{ outcome: "resolved" | "abandoned" | "pending-confirmation" | "failed"; detail?: string }> {
+  async resolveConflict(
+    canonicalPath: string,
+    decision: "keep-local" | "accept-remote" | "merged",
+    editor?: Editor,
+    mergedText?: string,
+  ): Promise<{ outcome: "resolved" | "abandoned" | "pending-confirmation" | "failed"; detail?: string }> {
     // A pending handoff is on the same list but not in the same map: it is a different fact about the
     // path, and it is resolved differently (see below).
     const pendingHandoff = this.handoffPaths.has(canonicalPath);
     const reason = this.conflicts.get(canonicalPath) ?? (pendingHandoff ? "handoff-pending" : undefined);
     if (!reason) return { outcome: "failed", detail: "no-conflict" };
 
+    // The result is this device's own text, so it takes the local-edit path rather than the remote one:
+    // the room has to forward it, which is also what makes it durable in R2.
+    if (decision === "merged") {
+      if (mergedText === undefined) return { outcome: "failed", detail: "missing-merged-text" };
+      try {
+        if (reason === "external-local-edit") {
+          // The document here is already this device's version; only the file and the pane still disagree.
+          const binding = this.bindings.get(canonicalPath);
+          if (!binding) return { outcome: "failed", detail: "no-editor" };
+          await binding.applyTextAsLocalEdit(mergedText);
+          if (this.deps.writeLocalText) await this.deps.writeLocalText(canonicalPath, mergedText);
+        } else if (!(await this.mergeThroughHot(canonicalPath, mergedText, editor))) {
+          // Never a dropped fence: the conflict stays listed so the decision can be delivered later.
+          return { outcome: "failed", detail: "join-refused" };
+        }
+        this.clearConflict(canonicalPath);
+        this.deps.onResolved?.(canonicalPath, "merged");
+        return { outcome: "resolved" };
+      } catch (error) {
+        return { outcome: "failed", detail: error instanceof Error ? error.message : "unknown" };
+      }
+    }
+
     if (reason === "external-local-edit") {
-      const resolved = await this.resolveExternalEdit(canonicalPath, decision);
-      if (resolved) this.clearConflict(canonicalPath);
-      return resolved ? { outcome: "resolved" } : { outcome: "failed", detail: "no-editor" };
+      try {
+        const resolved = await this.resolveExternalEdit(canonicalPath, decision);
+        if (resolved) this.clearConflict(canonicalPath);
+        return resolved ? { outcome: "resolved" } : { outcome: "failed", detail: "no-editor" };
+      } catch (error) {
+        return { outcome: "failed", detail: error instanceof Error ? error.message : "unknown" };
+      }
     }
 
     // The mismatch case is settled locally, by content, and never by asking the server to re-point a room
     // whose document is not the version the user chose.
     if (this.conflictOrigins.get(canonicalPath) === "mismatch" && this.conflicts.has(canonicalPath)) {
-      const converged = await this.convergeMismatch(canonicalPath, decision, editor);
-      if (converged) {
-        this.clearConflict(canonicalPath);
-        this.deps.onResolved?.(canonicalPath, decision);
-        return { outcome: "resolved" };
+      try {
+        const converged = await this.convergeMismatch(canonicalPath, decision, editor);
+        if (converged) {
+          this.clearConflict(canonicalPath);
+          this.deps.onResolved?.(canonicalPath, decision);
+          return { outcome: "resolved" };
+        }
+        this.conflicts.set(canonicalPath, "conflict");
+        return { outcome: "failed", detail: "join-refused" };
+      } catch (error) {
+        this.conflicts.set(canonicalPath, "conflict");
+        return { outcome: "failed", detail: error instanceof Error ? error.message : "unknown" };
       }
-      return { outcome: "failed", detail: "join-refused" };
     }
 
     const session = this.sessions.get(canonicalPath);
@@ -793,13 +1005,21 @@ export class HotSyncCoordinator implements HotPathFence {
       return { outcome: "abandoned" };
     }
     try {
-      const result = await this.deps.client.resolveConflict({
+      let result = await this.deps.client.resolveConflict({
         operationId: this.nextOperationId("resolve"),
         canonicalPath,
         documentId: identity.documentId,
         epoch: identity.epoch,
         decision,
       });
+      // A restored session can name an incarnation already replaced on the server. Accepting R2
+      // must retire the current losing room, rather than only dropping this device's stale record.
+      if (result.outcome === "not-found" && decision === "accept-remote") {
+        const current = (await this.deps.client.pathStatus(canonicalPath)).binding;
+        if (current?.documentId && current.state !== "deleted" && (current.documentId !== identity.documentId || current.epoch !== identity.epoch)) {
+          result = await this.deps.client.resolveConflict({ operationId: this.nextOperationId("resolve-current"), canonicalPath, documentId: current.documentId, epoch: current.epoch, decision });
+        }
+      }
       /**
        * The server has no document for this path any more — it was deleted, or its incarnation was retired.
        *
@@ -814,8 +1034,22 @@ export class HotSyncCoordinator implements HotPathFence {
       }
       if (result.outcome === "abandoned") {
         await this.abandon(canonicalPath);
+        const diskText = await this.deps.readLocalText?.(canonicalPath);
+        if (diskText === undefined) {
+          this.conflicts.set(canonicalPath, "conflict");
+          this.conflictOrigins.set(canonicalPath, "mismatch");
+          return { outcome: "failed", detail: "local-unreadable" };
+        }
+        const carrier = editor ?? asEditor(new HeadlessEditor(diskText));
+        const adopted = await this.joinAndDecide(canonicalPath, "accept-remote", diskText, carrier);
+        if (!adopted) {
+          this.conflicts.set(canonicalPath, "conflict");
+          this.conflictOrigins.set(canonicalPath, "mismatch");
+          return { outcome: "failed", detail: "join-refused" };
+        }
+        this.clearConflict(canonicalPath);
         this.deps.onResolved?.(canonicalPath, decision);
-        return { outcome: "abandoned" };
+        return { outcome: "resolved" };
       }
       // Keep local: the room now owns a document it considers unsaved, so its next checkpoint writes
       // this device's content over the revision that lost. When the pane is still open, ask for that
@@ -844,6 +1078,7 @@ export class HotSyncCoordinator implements HotPathFence {
       this.deps.onResolved?.(canonicalPath, decision);
       return { outcome: "resolved" };
     } catch (error) {
+      this.conflicts.set(canonicalPath, "conflict");
       return { outcome: "failed", detail: error instanceof Error ? error.message : "unknown" };
     }
   }
@@ -925,25 +1160,30 @@ export class HotSyncCoordinator implements HotPathFence {
         binding: null,
       };
     }
+    const waiting = [...this.pendingRenames.values()].find(item => item.intent.documentId === record.documentId);
+    if (waiting) {
+      if (toPath !== waiting.intent.toPath) {
+        if (waiting.nextPath && waiting.nextPath !== toPath) {
+          this.reservedRenamePaths.delete(waiting.nextPath);
+          this.sessions.delete(waiting.nextPath);
+          this.bindings.delete(waiting.nextPath);
+        }
+        waiting.nextPath = toPath;
+        this.reservedRenamePaths.add(toPath);
+        this.sessions.set(toPath, session);
+        const binding = this.bindings.get(canonicalPath);
+        if (binding) this.bindings.set(toPath, binding);
+        await session.rememberRename(waiting.intent, toPath);
+      }
+      return this.pendingRenameResult(waiting.intent);
+    }
     const operationId = this.nextOperationId("rename");
     const finishTransition = session.beginNamespaceTransition();
     try {
       // No old-epoch operation may still be in flight when the room quiesces. New typing waits at the
       // session barrier and will be persisted with whichever epoch this operation leaves active.
-      if (!(await session.drain())) {
-        return {
-          protocol: 1,
-          operationId,
-          type: "rename",
-          outcome: "rejected",
-          reason: "checkpoint-failed",
-          phase: "failed",
-          canonicalPath: toPath,
-          fromPath: canonicalPath,
-          binding: null,
-        };
-      }
-      const result = await this.deps.client.namespace({
+      const intent: Extract<NamespaceIntent, { type: "rename" }> = {
+        protocol: 1,
         type: "rename",
         operationId,
         clientId: this.deps.clientId,
@@ -953,26 +1193,215 @@ export class HotSyncCoordinator implements HotPathFence {
         expectedEpoch: record.epoch,
         expectedFromBinding: { documentId: record.documentId, epoch: record.epoch },
         expectedToPathState: { state: "absent" },
-      });
-      if (result.outcome === "applied" && result.identity) {
-        await session.adoptRename(toPath, result.identity.epoch);
-      }
-      return result;
+      };
+      await session.rememberRename(intent);
+      this.pendingRenames.set(operationId, { intent, finish: finishTransition });
+      // Keep the renamed editor attached while its new path is fenced from the cold executor.
+      this.sessions.set(toPath, session);
+      const binding = this.bindings.get(canonicalPath);
+      if (binding) this.bindings.set(toPath, binding);
+      return await this.confirmPendingRename(intent);
     } finally {
-      finishTransition();
+      if (!this.pendingRenames.has(operationId)) {
+        this.reservedRenamePaths.delete(toPath);
+        finishTransition();
+      }
+    }
+  }
+
+  hasPendingRename(path: string): boolean {
+    return this.reservedRenamePaths.has(path) || [...this.pendingRenames.values()].some(({ intent }) => intent.fromPath === path || intent.toPath === path);
+  }
+
+  /** Fence the target at the Vault event, before the serialized transition queue can yield. */
+  reserveLocalRename(fromPath: string, toPath: string): void {
+    const session = this.sessions.get(fromPath);
+    if (!session) return;
+    this.reservedRenamePaths.add(toPath);
+  }
+
+  private pendingRenameResult(intent: Extract<NamespaceIntent, { type: "rename" }>): NamespaceResult {
+    return { protocol: 1, operationId: intent.operationId, type: "rename", outcome: "pending", phase: "requested", reason: "unavailable", canonicalPath: intent.toPath, fromPath: intent.fromPath, binding: null };
+  }
+
+  private scheduleRenameRecovery(): void {
+    if (this.stopped || this.renameRetryTimer || !this.pendingRenames.size) return;
+    this.renameRetryTimer = setTimeout(() => {
+      this.renameRetryTimer = undefined;
+      if (this.renameRetryRunning || this.stopped) return;
+      this.renameRetryRunning = true;
+      void (async () => {
+        for (const { intent } of [...this.pendingRenames.values()]) {
+          if (this.stopped) break;
+          await this.confirmPendingRename(intent);
+        }
+      })().catch(error => this.deps.debug?.(`hot rename recovery failed: ${String(error)}`)).finally(() => {
+        this.renameRetryRunning = false;
+        this.scheduleRenameRecovery();
+      });
+    }, 3000);
+  }
+
+  private async confirmPendingRename(intent: Extract<NamespaceIntent, { type: "rename" }>): Promise<NamespaceResult> {
+    const live = this.sessions.get(intent.fromPath) ?? this.sessions.get(intent.toPath);
+    if (live && !(await live.drain())) {
+      this.scheduleRenameRecovery();
+      return this.pendingRenameResult(intent);
+    }
+    let result: NamespaceResult;
+    try { result = await this.deps.client.namespace(intent); }
+    catch {
+      this.deps.debug?.("hot rename result unconfirmed; both paths remain fenced");
+      this.scheduleRenameRecovery();
+      return this.pendingRenameResult(intent);
+    }
+    if (this.stopped) return this.pendingRenameResult(intent);
+    const applied = (result.outcome === "applied" || result.outcome === "duplicate") && result.identity;
+    if (!applied && result.phase !== "failed") {
+      this.scheduleRenameRecovery();
+      return this.pendingRenameResult(intent);
+    }
+    const pending = this.pendingRenames.get(intent.operationId);
+    const session = this.sessions.get(intent.fromPath) ?? this.sessions.get(intent.toPath);
+    if (session) {
+      await session.rememberRename(undefined);
+      if (applied) await session.adoptRename(intent.toPath, result.identity!.epoch);
+      else {
+        this.sessions.delete(intent.toPath);
+        this.bindings.delete(intent.toPath);
+      }
+    } else {
+      const record = (await this.deps.store.loadSessions()).find(row => row.pendingRename?.operationId === intent.operationId);
+      if (record) {
+        const next = { ...record, ...(applied ? { canonicalPath: intent.toPath, epoch: result.identity!.epoch } : {}) };
+        delete next.pendingRename;
+        delete next.nextRenamePath;
+        await this.deps.store.putSession(next);
+        if (applied) { await this.deps.store.deleteSession(intent.fromPath); this.hotPaths.delete(intent.fromPath); this.hotPaths.add(intent.toPath); }
+      }
+    }
+    this.pendingRenames.delete(intent.operationId);
+    this.reservedRenamePaths.delete(intent.toPath);
+    pending?.finish?.();
+    if (applied && !session) await this.deps.onRenamed?.(intent.fromPath, intent.toPath);
+    if (applied && pending?.nextPath && pending.nextPath !== intent.toPath) {
+      if (session) await this.rename(intent.toPath, pending.nextPath);
+      else {
+        const nextIntent = { ...intent, operationId: this.nextOperationId("rename"), fromPath: intent.toPath, toPath: pending.nextPath, expectedEpoch: result.identity!.epoch, expectedFromBinding: { documentId: intent.documentId, epoch: result.identity!.epoch } };
+        const record = (await this.deps.store.loadSessions()).find(row => row.canonicalPath === intent.toPath);
+        if (record) await this.deps.store.putSession({ ...record, pendingRename: nextIntent });
+        this.pendingRenames.set(nextIntent.operationId, { intent: nextIntent });
+        this.scheduleRenameRecovery();
+      }
+    }
+    return applied ? { ...result, outcome: "applied" } : result;
+  }
+
+  /**
+   * Gives up the room that is blocking a cold write, when the room has nothing left to publish.
+   *
+   * The fence has two halves and this is the second one. Letting a resolved merge past the *local* fence is
+   * not enough: the cold write still asks the Gateway for a lease, and the Gateway refuses while a room is
+   * bound to the path — it has no way to know the room on this device is a husk. The plugin is the only one
+   * that can tell it, and `accept-remote` is exactly that message: retire this binding and let the cold path
+   * reconcile the file.
+   *
+   * Narrow on purpose, and it mirrors `isFencedFor`:
+   *
+   * - `external-local-edit` is never released. That session is live, the room still holds this device's
+   *   version, and retiring it would throw away the side the user is looking at.
+   * - An operational session is never released: it can publish, so the cold writer must not race it.
+   * - `handoff-pending` is never released here; its content is unproven and it has its own screen.
+   *
+   * Returns whether ownership was actually given up, so a caller can tell "nothing to release" from
+   * "released" without guessing.
+   */
+  async releaseRefusedRoom(canonicalPath: string): Promise<boolean> {
+    if (this.conflicts.get(canonicalPath) !== "conflict") return false;
+    const status = this.sessions.get(canonicalPath)?.session?.status;
+    if (status !== undefined && sessionStatusIsOperational(status)) return false;
+    if (this.handoffPaths.has(canonicalPath)) return false;
+    // A cold draft does not include an unseen, uncheckpointed room revision. Automatic merges may
+    // only retire it when its complete text is already protected by the local file.
+    const remote = await this.deps.client.pathStatus(canonicalPath);
+    if (!remote.room || remote.room.clients > 0) return false;
+    if (remote.room.pendingSave) {
+      const local = await this.deps.readLocalText?.(canonicalPath);
+      if (local === undefined || await hotContentHash(local) !== remote.room.currentContentHash) return false;
+    }
+    const forwarded = await this.forwardServerResolve(canonicalPath, "accept-remote");
+    this.deps.debug?.(`hot release refused room outcome=${forwarded ? "released" : "refused"}`);
+    return forwarded;
+  }
+
+  resolutionSnapshot(path: string): Promise<HotResolutionSnapshot | null> {
+    return this.deps.client.resolutionSnapshot(path);
+  }
+
+  async retryUnifiedResolution(path: string, snapshot: HotResolutionSnapshot, content: string, operationId: string): Promise<HotMergedResolutionResult> {
+    const result = await this.deps.client.applyMergedResolution({ protocol: 1, operationId, canonicalPath: path,
+      documentId: snapshot.documentId, epoch: snapshot.epoch, decision: "merged", confirmOnly: true, expectedRevision: snapshot.revision,
+      expectedContentHash: snapshot.contentHash, expectedRemoteETag: snapshot.remoteETag, content });
+    return result;
+  }
+
+  async applyUnifiedResolution(path: string, snapshot: HotResolutionSnapshot, content: string, operationId: string,
+    expectedLocalHash: string, expectedEditorHash?: string, editor?: Editor, accepted = false): Promise<HotMergedResolutionResult> {
+    if (!accepted && this.sessions.get(path) && !(await this.sessions.get(path)!.drain())) return { outcome: "stale" };
+    const local = await this.deps.readLocalText?.(path);
+    if (local === undefined || (!accepted && await hotContentHash(local) !== expectedLocalHash)) return { outcome: "stale" };
+    if (!accepted && expectedEditorHash && (!editor || await hotContentHash(editor.getValue()) !== expectedEditorHash)) return { outcome: "stale" };
+    const result = await this.deps.client.applyMergedResolution({ protocol: 1, operationId, canonicalPath: path,
+      documentId: snapshot.documentId, epoch: snapshot.epoch, decision: "merged", expectedRevision: snapshot.revision,
+      expectedContentHash: snapshot.contentHash, expectedRemoteETag: snapshot.remoteETag, content });
+    if (result.outcome !== "saved" && result.outcome !== "pending") return result;
+    const existing = this.sessions.get(path);
+    if (existing?.session?.status === "hot" && this.bindings.get(path) && !this.bindings.get(path)!.isFrozen()) {
+      const deadline = Date.now() + 8000;
+      while (existing.observedServerRevision < (result.revision ?? 0) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      if (existing.observedServerRevision < (result.revision ?? 0) || this.bindings.get(path)!.isFrozen()) return { outcome: "pending", revision: result.revision };
+      // The server operation travels through the existing CRDT bridge; subsequent typing is retained.
+      const current = this.bindings.get(path)!.text();
+      if (this.deps.writeLocalText) await this.deps.writeLocalText(path, current);
+    } else {
+      // A frozen/headless client rejoins the same incarnation after the accepted resolution.
+      if (expectedEditorHash && editor && await hotContentHash(editor.getValue()) !== expectedEditorHash) return { outcome: "pending", revision: result.revision };
+      await this.abandon(path);
+      const carrier = editor ?? asEditor(new HeadlessEditor(content));
+      if (!(await this.joinAndDecide(path, "accept-remote", local, carrier, true))) return { outcome: "pending", revision: result.revision };
+    }
+    if (result.outcome === "saved") this.clearConflict(path);
+    return result;
+  }
+
+  /** Discovers a frozen server room without acquiring a session or changing either version. */
+  async discoverRemoteConflict(canonicalPath: string): Promise<void> {
+    if (this.conflicts.has(canonicalPath) || this.handoffPaths.has(canonicalPath) || this.sessions.has(canonicalPath)) return;
+    const status = await this.deps.client.pathStatus(canonicalPath).catch(() => undefined);
+    const room = status?.room;
+    const binding = status?.binding;
+    if (room?.state === "conflicted" && binding?.documentId) {
+      await this.deps.store.putSession({ canonicalPath, documentId: binding.documentId, epoch: binding.epoch,
+        clientId: this.deps.clientId, status: "conflict", lastAcceptedRevision: room.latestAcceptedRevision,
+        lastCheckpointedRevision: room.latestCheckpointedRevision, pendingSave: room.pendingSave,
+        requestedRevision: null, updatedAt: this.deps.now ? this.deps.now() : Date.now() }).catch(() => undefined);
+      this.conflicts.set(canonicalPath, "conflict");
+      this.deps.onConflict?.(canonicalPath, "remote-room-conflict");
+      this.deps.debug?.(`hot discovered remote conflict path-digest=${pathDigest(canonicalPath)} accepted=${room.latestAcceptedRevision} checkpointed=${room.latestCheckpointedRevision}`);
     }
   }
 
   /** The cold-mutation authority a cold write must hold while hot sessions exist. */
-  async acquireColdAuthority(canonicalPath: string, expectedRemoteETag: string | null): Promise<{ granted: boolean; token?: string; reason?: string }> {
+  async acquireColdAuthority(canonicalPath: string, expectedRemoteETag: string | null, operation: "put" | "delete" = "put"): Promise<{ granted: boolean; token?: string; operationId?: string; reason?: string }> {
+    const operationId = this.nextOperationId("cold");
     const result = await this.deps.client.coldAcquire({
-      operationId: this.nextOperationId("cold"),
-      operation: "put",
+      operationId,
+      operation,
       canonicalPath,
       clientId: this.deps.clientId,
       expectedRemoteETag,
     });
-    return result.outcome === "granted" ? { granted: true, ...(result.token ? { token: result.token } : {}) } : { granted: false, ...(result.reason ? { reason: result.reason } : {}) };
+    return result.outcome === "granted" ? { granted: true, operationId, ...(result.token ? { token: result.token } : {}) } : { granted: false, ...(result.reason ? { reason: result.reason } : {}) };
   }
 
   /**
@@ -981,12 +1410,23 @@ export class HotSyncCoordinator implements HotPathFence {
    * The token stays here rather than travelling with the caller, so there is exactly one place that
    * knows which leases this device still holds — and exactly one place that can leak one.
    */
-  async authorizeColdMutation(canonicalPath: string, expectedRemoteETag: string | null = null): Promise<"granted" | "deferred" | "unreachable"> {
-    if (this.isFenced(canonicalPath)) return "deferred";
+  async authorizeColdMutation(canonicalPath: string, expectedRemoteETag: string | null = null, operation?: string): Promise<"granted" | "deferred" | "unreachable"> {
+    if (this.isFencedFor(canonicalPath, operation ?? "")) return "deferred";
+    // Downloading an R2 checkpoint is a local read consumer, not another remote writer.
+    // The executor guards the GET by ETag and the local write by its observed version.
+    // Another device's live editor must not block delivery of its saved checkpoints here.
+    if (operation === "download" || operation === "resolve-accept-remote" || operation === "resolve-accept-remote-delete" || operation === "delete-local") return "granted";
     try {
-      const acquired = await this.acquireColdAuthority(canonicalPath, expectedRemoteETag);
-      if (!acquired.granted || !acquired.token) return "deferred";
-      this.coldLeases.set(canonicalPath, acquired.token);
+      const mutation = operation === "delete-remote" || operation === "resolve-accept-local-delete" ? "delete" : "put";
+      const acquired = await this.acquireColdAuthority(canonicalPath, expectedRemoteETag, mutation);
+      if (!acquired.granted || !acquired.token) {
+        this.deps.debug?.(`hot cold authority path-digest=${pathDigest(canonicalPath)} denied=${acquired.reason ?? "missing-token"}`);
+        if (acquired.reason === "hot-owned" && !this.conflicts.has(canonicalPath)) {
+          await this.discoverRemoteConflict(canonicalPath);
+        }
+        return "deferred";
+      }
+      this.coldLeases.set(canonicalPath, { token: acquired.token, operationId: acquired.operationId!, operation: mutation });
       return "granted";
     } catch {
       // Unreachable is not denied: it is the documented degradation, and R2's own preconditions plus the
@@ -996,14 +1436,14 @@ export class HotSyncCoordinator implements HotPathFence {
   }
 
   async settleColdMutation(canonicalPath: string): Promise<void> {
-    const token = this.coldLeases.get(canonicalPath);
-    if (!token) return;
+    const lease = this.coldLeases.get(canonicalPath);
+    if (!lease) return;
     this.coldLeases.delete(canonicalPath);
     await this.deps.client.coldCommit({
-      token,
-      operationId: this.nextOperationId("cold-commit"),
+      token: lease.token,
+      operationId: lease.operationId,
       clientId: this.deps.clientId,
-      operation: "put",
+      operation: lease.operation,
       canonicalPath,
       etag: null,
       size: null,
@@ -1024,7 +1464,7 @@ export class HotSyncCoordinator implements HotPathFence {
     });
   }
 
-  async pathStatus(canonicalPath: string): Promise<{ binding: PathBinding | null; remote: HotRemoteObservation | null; hotOwned: boolean }> {
+  async pathStatus(canonicalPath: string): Promise<HotPathStatus> {
     return this.deps.client.pathStatus(canonicalPath);
   }
 

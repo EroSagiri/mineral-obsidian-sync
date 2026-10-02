@@ -14,7 +14,9 @@ import type { HotConflictReason } from "../hot/coordinator";
  * - **It has to close its own loop.** Once nothing is frozen, the window goes away.
  *
  * A hot conflict is not a cold one, and the cold resolver cannot settle it: the two versions are "what
- * this device has" versus "what the authority has", not two files to diff. The choice stays binary.
+ * this device has" versus "what the authority has", not two files to diff. When a cold merge has already
+ * been prepared, it is offered here as a third answer — the text travels into the room through this
+ * screen because the room is the path's only writer.
  */
 export interface HotConflictEntry {
   canonicalPath: string;
@@ -23,7 +25,20 @@ export interface HotConflictEntry {
   localSize?: number;
   /** Bytes the server holds for this path, when it could be asked. */
   remoteSize?: number;
+  pendingRoomRevision?: number;
+  /**
+   * A hand-made result that is already sitting in the cold conflict's resolution intent.
+   *
+   * The cold resolver can compose a merge but cannot apply it while this path is hot: the room is the
+   * only writer, and a cold write is exactly what the fence prevents. Rather than making the user retype
+   * a result they already prepared, the same text is offered here, where applying it goes through the
+   * room. Absent when there is no such intent, in which case the choice stays binary.
+   */
+  mergedDraft?: string;
 }
+
+/** A decision the hot side can carry out, including one that has to bring its own text. */
+export type HotConflictDecision = "keep-local" | "accept-remote" | "merged";
 
 export class HotConflictModal extends Modal {
   private readonly decided = new Set<string>();
@@ -31,7 +46,7 @@ export class HotConflictModal extends Modal {
   constructor(
     app: App,
     private readonly conflicts: HotConflictEntry[],
-    private readonly decide: (canonicalPath: string, decision: "keep-local" | "accept-remote") => Promise<{ outcome: string; detail?: string }>,
+    private readonly decide: (canonicalPath: string, decision: HotConflictDecision, mergedText?: string) => Promise<{ outcome: string; detail?: string }>,
   ) {
     super(app);
   }
@@ -57,6 +72,13 @@ export class HotConflictModal extends Modal {
       row.addButton(button => button.setButtonText(labels.acceptRemote).setWarning().onClick(async () => {
         await this.apply(conflict, "accept-remote", row);
       }));
+      // The prepared result is the one answer that preserves both sides, so it is offered first and
+      // carries the text, because the room cannot read it from anywhere else.
+      if (conflict.mergedDraft !== undefined) {
+        row.addButton(button => button.setButtonText("使用已准备好的合并结果").setCta().onClick(async () => {
+          await this.apply(conflict, "merged", row, conflict.mergedDraft);
+        }));
+      }
     }
   }
 
@@ -66,13 +88,13 @@ export class HotConflictModal extends Modal {
    * A failed decision leaves the row actionable on purpose: the conflict is still there, and hiding that
    * would be worse than an error message.
    */
-  private async apply(conflict: HotConflictEntry, decision: "keep-local" | "accept-remote", row: Setting): Promise<void> {
+  private async apply(conflict: HotConflictEntry, decision: HotConflictDecision, row: Setting, mergedText?: string): Promise<void> {
     if (this.decided.has(conflict.canonicalPath)) return;
     this.decided.add(conflict.canonicalPath);
     row.setDesc(`${explain(conflict.reason)}\n正在处理…`);
     let result: { outcome: string; detail?: string };
     try {
-      result = await this.decide(conflict.canonicalPath, decision);
+      result = await this.decide(conflict.canonicalPath, decision, mergedText);
     } catch (error) {
       result = { outcome: "failed", detail: error instanceof Error ? error.message : "unknown" };
     }
@@ -88,7 +110,12 @@ export class HotConflictModal extends Modal {
       ? "已请求重新保存。该文件会保持冻结，直到确认内容确实写入 R2（重新打开该文件即可继续核对）。"
       : result.outcome === "abandoned"
         ? "已放弃本机的热会话，该文件交回冷同步；如果两端内容不同，冷同步会弹出它自己的冲突窗口。"
-        : "已按你的选择处理，该文件会重新开始同步。";
+        // A merge is this device's own edit, so it lands in the document and the file first; the room
+        // then saves it on its own schedule. Saying "已保存" here would claim a receipt that has not
+        // arrived, which is the one thing this screen must not do.
+        : decision === "merged"
+          ? "合并结果已写入文档与文件，并已请求房间保存到服务器。该文件会重新开始同步。"
+          : "已按你的选择处理，该文件会重新开始同步。";
     row.setDesc(message);
     row.settingEl.addClass("mineral-sync-hot-conflict--resolved");
     new Notice(`Mineral Sync：${conflict.canonicalPath} — ${message}`);
@@ -100,7 +127,8 @@ export class HotConflictModal extends Modal {
 function sizes(conflict: HotConflictEntry): string {
   const local = conflict.localSize === undefined ? "未知" : `${conflict.localSize} 字节`;
   const remote = conflict.remoteSize === undefined ? "未知" : `${conflict.remoteSize} 字节`;
-  return `本机文件：${local}　服务器当前版本：${remote}`;
+  const pending = conflict.pendingRoomRevision === undefined ? "" : `\n热会话还有第 ${conflict.pendingRoomRevision} 次修改尚未保存。采用服务器版本会放弃这份未保存修改；使用合并结果会用合并文本替换它。`;
+  return `本机文件：${local}　服务器已保存版本：${remote}${pending}`;
 }
 
 /**

@@ -88,6 +88,7 @@ const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 15_000;
 
 export class HotDocumentSession {
+  observedServerRevision = 0;
   private record: HotSessionRecord | null = null;
   private socket: HotSocket | null = null;
   private outbox = new Map<string, HotOutboxEntry>();
@@ -209,6 +210,16 @@ export class HotDocumentSession {
     const previousPath = record.canonicalPath;
     await this.setRecord({ ...record, canonicalPath, epoch, status: "hot", updatedAt: this.now() }, false);
     if (previousPath !== canonicalPath) await this.events.onRenamed?.(previousPath, canonicalPath, epoch);
+  }
+
+  async rememberRename(intent: HotSessionRecord["pendingRename"], nextPath?: string): Promise<void> {
+    if (!this.record) throw new Error("cannot persist rename without a session");
+    const next = { ...this.record };
+    if (intent) next.pendingRename = intent;
+    else delete next.pendingRename;
+    if (nextPath) next.nextRenamePath = nextPath;
+    else delete next.nextRenamePath;
+    await this.setRecord(next, false);
   }
 
   /**
@@ -403,6 +414,7 @@ export class HotDocumentSession {
     const record = this.record;
     switch (frame.type) {
       case "welcome": {
+        this.observedServerRevision = Math.max(this.observedServerRevision, frame.serverRevision);
         if (!record) return;
         this.deps.doc.applyState(frame.crdtState);
         await this.setRecord({
@@ -419,6 +431,7 @@ export class HotDocumentSession {
         return;
       }
       case "operation": {
+        this.observedServerRevision = Math.max(this.observedServerRevision, frame.serverRevision);
         // The Gateway normally suppresses an operation for every socket belonging to its source
         // client. Keep the identity check here as a protocol boundary as well: rolling deployments,
         // reconnect overlap, or an older Gateway must never turn our own Yjs update into a remote

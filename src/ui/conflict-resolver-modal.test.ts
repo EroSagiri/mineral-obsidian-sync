@@ -51,6 +51,22 @@ async function open(records: ConflictRecord[], propose: (intent: ResolutionInten
 }
 
 describe("conflict resolver UI safety", () => {
+  it("shows a retry when loading fails instead of claiming every conflict is resolved", async () => {
+    const container = new FakeElement("div");
+    const { ConflictResolverModal } = await import("./conflict-resolver-modal");
+    let attempts = 0;
+    const modal = new ConflictResolverModal({} as never, {
+      list: async () => { if (++attempts === 1) throw new Error("offline"); return [record()]; },
+      propose: async () => {},
+    });
+    installModalContainer(modal, container);
+    await modal.onOpen();
+    expect(container.allText).toContain("无法加载冲突");
+    expect(container.allText).not.toContain("All conflicts resolved");
+    container.button("重试")!.click();
+    await vi.waitFor(() => expect(container.allText).toContain("Use suggested result"));
+  });
+
   it("is constructed from exactly two capabilities, none of which can write content", async () => {
     const source = await import("node:fs").then((fs) => fs.readFileSync(new URL("./conflict-resolver-modal.ts", import.meta.url), "utf8"));
     const interfaceBlock = source.slice(source.indexOf("export interface ConflictResolverDependencies"), source.indexOf("type Draft"));
@@ -293,5 +309,22 @@ describe("several conflicts", () => {
     expect(container.find((element) => element.text === "All conflicts resolved")).toBeDefined();
     container.button("Done")!.click();
     expect(closed).toBe(true);
+  });
+});
+
+
+describe("unified hot conflict review", () => {
+  it("shows the uncheckpointed room version and carries its identity in the decision", async () => {
+    const snapshot = { documentId: "ZyXwVuTsRqPoNmLkJiHgFe", epoch: 1, revision: 48, checkpointedRevision: 47,
+      expectedRemoteETag: "old", contentHash: "hash", content: "uncheckpointed room text", state: "conflicted" as const, remoteETag: "R2", remoteContent: "saved text" };
+    const context = { snapshot, localHash: "disk-hash", editorHash: "editor-hash" };
+    const proposed: ResolutionIntent[] = [];
+    const { container } = await open([record({ autoMergeStatus: "clean", snapshot: { local: "mine", remote: "saved text", draft: "merge", baseAvailable: false }, hotResolution: context })], async intent => { proposed.push(intent); });
+    expect(container.allText).toContain("uncheckpointed room text");
+    const button = container.button("使用已准备好的合并结果")!;
+    button.click();
+    for (let attempt = 0; attempt < 20 && proposed.length === 0; attempt++) await new Promise(resolve => setTimeout(resolve, 0));
+    expect(proposed[0]?.hotResolution).toEqual(context);
+    expect(proposed[0]?.origin).toBe("manual");
   });
 });

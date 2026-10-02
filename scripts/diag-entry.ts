@@ -25,10 +25,9 @@ class NodeFetchTransport implements HttpTransport {
 }
 
 /**
- * Diagnostic-only guarded delete. The **plugin never deletes**, and Phase 3A/4C keep
- * `delete-local`/`delete-remote` hard-blocked; this exists solely so this session's probe objects can
- * be removed from R2. It is guarded with `If-Match`, so it can only remove the exact version that was
- * listed a moment earlier — if anything changed the object, R2 answers 412 and nothing is removed.
+ * Diagnostic-only cleanup for caller-owned disposable probe objects.
+ * R2 ignores If-Match on DELETE: this helper does NOT protect concurrent writes. Never use it
+ * for user-file deletion; recycleObject archives the retired bytes and retains deletion identity.
  */
 export async function deleteObjectIfMatch(config: R2Configuration, key: string, etag: string): Promise<number> {
   const transport = new NodeFetchTransport();

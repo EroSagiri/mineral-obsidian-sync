@@ -115,7 +115,7 @@ export interface SchedulerDependencies {
    * post-cycle hook rather than something the planner calls: a cycle's plan is never rewritten while
    * it is running, so any resolution this produces is applied by a *later* cycle.
    */
-  onConflicts?(conflicts: ConflictObservation[]): Promise<void>;
+  onConflicts?(conflicts: ConflictObservation[], observedPaths?: readonly string[]): Promise<void>;
   /**
    * Reports that a resolution actually applied, so its conflict record and intent can be retired.
    * Only `applied` is reported: a `stale` or `partial` resolution must keep its conflict visible,
@@ -141,11 +141,33 @@ export interface SchedulerDependencies {
    * sessions, and only the Gateway knows whether *another* device is editing the path right now.
    */
   hotAuthority?: HotMutationAuthorityPort;
+  /**
+   * The escape hatch for a decision that the server would otherwise refuse forever.
+   *
+   * A resolved merge needs a cold-write lease, and the Gateway will not grant one while a room is bound to
+   * the path — even when that room is a husk this device cannot use. Called immediately before a merge is
+   * attempted; the implementation decides whether there is anything worth releasing and is a no-op when
+   * there is not.
+   */
+  hotConflictRelease?: HotConflictReleasePort;
+}
+
+/** Gives up a room that is blocking a cold write it will never be able to make itself. */
+export interface HotConflictReleasePort {
+  /** Returns whether ownership was actually given up. */
+  release(key: string): Promise<boolean>;
 }
 
 /** What the cold path needs to know about hot ownership of one path. */
 export interface HotDeferralPort {
-  isFenced(key: string): boolean;
+  /**
+   * Whether this operation may run for the key.
+   *
+   * The operation is part of the question, not decoration: a resolved merge is the decision the fence was
+   * waiting for, so it is allowed through a conflict that has nothing live behind it, while an upload,
+   * download or delete is still refused. See `HotSyncCoordinator.isFencedFor`.
+   */
+  isFenced(key: string, operation?: string): boolean;
   /** Records the deferral for diagnostics: a skipped operation must be visible, never silent. */
   noteDeferred(key: string): void;
 }
@@ -160,7 +182,12 @@ export interface HotDeferralPort {
 export type HotAuthorityVerdict = "granted" | "deferred" | "unreachable";
 
 export interface HotMutationAuthorityPort {
-  authorize(key: string): Promise<HotAuthorityVerdict>;
+  /**
+   * Asks for the lease. The operation is part of the question for the same reason it is on
+   * `HotDeferralPort`: the local half of this guard refuses a fenced path before the Gateway is ever
+   * consulted, and a resolved merge has to be let through both halves or neither.
+   */
+  authorize(key: string, operation?: string): Promise<HotAuthorityVerdict>;
   /** Releases whatever the request held. Never a write, never a decision: bookkeeping. */
   settle(key: string, verdict: HotAuthorityVerdict): Promise<void>;
 }

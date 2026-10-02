@@ -78,7 +78,7 @@ export class ConflictCoordinator {
    * The proposals the next plan may act on. Synchronous by design: `buildSyncPlan` must not do I/O,
    * and this map was computed from a real, completed cycle's observations.
    */
-  resolutions(): Map<string, { intent: ResolutionIntent }> { return this.active; }
+  resolutions(): Map<string, { intent: ResolutionIntent }> { return new Map([...this.active].filter(([, proposal]) => !proposal.intent.hotResolution)); }
 
   /** The conflict records the resolver UI should show. */
   async list(): Promise<ConflictRecord[]> {
@@ -97,11 +97,18 @@ export class ConflictCoordinator {
    * Called once per cycle with the conflicts the planner produced. Returns the intents that are valid
    * for the current observations, which the next cycle's planner is allowed to act on.
    */
-  async handleConflicts(conflicts: ConflictDetectionInput[]): Promise<void> {
+  async handleConflicts(conflicts: ConflictDetectionInput[], observedPaths?: readonly string[]): Promise<void> {
     if (!this.dependencies.channel) return;
     const active = new Map<string, string>();
-    // Both outcomes need a follow-up cycle: a recorded conflict (so the user sees it, and so the
-    // intent list is refreshed) and an automatic merge (so the planner can actually apply it).
+    const observed = observedPaths === undefined ? undefined : new Set(observedPaths);
+    // Deferred or unobserved paths have supplied no evidence that their disagreement disappeared.
+    if (observed) {
+      for (const record of await this.dependencies.conflicts.listConflicts(this.dependencies.channel)) {
+        if (!observed.has(record.path)) active.set(record.path, record.conflictId);
+      }
+    }
+    // Only an actionable resolution needs another cycle. The status is refreshed by this cycle;
+    // recording a manual conflict must not become its own source of reconciliation requests.
     let followUp = false;
     for (const conflict of conflicts) {
       const record = await this.inspect(conflict);
@@ -125,13 +132,12 @@ export class ConflictCoordinator {
       this.attempted.add(record.conflictId);
       await this.safePutConflict(record);
       this.dependencies.debug?.(`conflict detected path-hash=${shortConflictId(record.conflictId)} base=${record.snapshot.baseAvailable ? "available" : "unavailable"} autoMerge=${record.autoMergeStatus}`);
-      followUp = true;
     }
     // Only conflicts that are still active survive; a superseded identity is dropped so a stale user
     // decision can never be applied to it later.
     try { await this.dependencies.conflicts.reconcile(this.dependencies.channel, active); } catch { this.dependencies.debug?.("conflict store reconcile failed"); }
     // Refresh the proposals the *next* plan may apply, from this cycle's real observations.
-    const intentBecameValid = await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])));
+    const intentBecameValid = await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])), observed);
     // A manual choice is persisted between cycles. Its first follow-up cycle is deliberately still
     // a conflict while this method validates it against fresh observations; now that it is valid,
     // schedule one immediate *additional* cycle for the planner to execute it. Without this, the
@@ -141,12 +147,14 @@ export class ConflictCoordinator {
   }
 
   /** Reads the intents that match the current observations and caches them for the planner. */
-  private async refreshValidIntents(observations: Map<string, ConflictDetectionInput>): Promise<boolean> {
+  private async refreshValidIntents(observations: Map<string, ConflictDetectionInput>, observed?: Set<string>): Promise<boolean> {
     const previouslyActive = new Map(this.active);
     this.active.clear();
+    if (observed) for (const [path, proposal] of previouslyActive) if (!observed.has(path)) this.active.set(path, proposal);
     if (!this.dependencies.channel) return false;
     const stale: string[] = [];
     for (const intent of await this.intents()) {
+      if (intent.hotResolution) continue;
       const observation = observations.get(intent.path);
       if (!observation) continue;
       const currentId = await this.identityOf(observation);

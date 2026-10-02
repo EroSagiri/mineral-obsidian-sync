@@ -230,8 +230,22 @@ describe("a locally-changed path is answered with one HEAD", () => {
 
     const observed = await observeLocalDelta(["foo.md"], localDependencies(calls, withoutTombstone));
 
-    expect(calls).toEqual(["head:foo.md", "get:missing"]);
+    expect(calls).toEqual(["head:foo.md", "get:missing", "get:missing"]);
     expect(observed.remote.get("foo.md")?.deleted).toBeUndefined();
+  });
+
+  it("keeps an old deletion effective when only the legacy namespace has its record", async () => {
+    const calls: Calls = [];
+    const client = await withTombstone(calls);
+    const legacyKey = (await tombstoneKey(TOMBSTONE.path, TOMBSTONE.deletedRemoteETag)).replace(".mineral/", ".mineral-sync/");
+    const legacyClient: R2Client = { ...client, getObject: async key => {
+      calls.push(key === legacyKey ? "get:legacy" : "get:missing");
+      if (key !== legacyKey) throw new RemoteHttpError("GetObject", 404);
+      return encodeTombstone(TOMBSTONE);
+    } };
+    const observed = await observeLocalDelta(["foo.md"], localDependencies(calls, legacyClient));
+    expect(calls).toEqual(["head:foo.md", "get:missing", "get:legacy"]);
+    expect(observed.remote.get("foo.md")?.deleted).toMatchObject({ deletedRemoteETag: "E", objectPresent: true });
   });
 
   it("never asks about a tombstone while the local file is still here", async () => {

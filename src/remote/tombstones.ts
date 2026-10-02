@@ -1,7 +1,9 @@
 import { canonicalKey } from "../sync/path";
+import { VERSION_NAMESPACE } from "@mineral/sync-core/storage";
+export { TOMBSTONE_NAMESPACE, TOMBSTONE_READ_NAMESPACES, tombstoneReadKeys } from "@mineral/sync-core/tombstones";
+import { TOMBSTONE_NAMESPACE, TOMBSTONE_READ_NAMESPACES } from "@mineral/sync-core/tombstones";
 
 /** Reserved below every configured remote prefix. It is never a Vault path. */
-export const TOMBSTONE_NAMESPACE = ".mineral-sync/tombstones/";
 export const TOMBSTONE_PROTOCOL = 1;
 
 /**
@@ -21,6 +23,8 @@ export interface RemoteTombstone {
   path: string;
   deletedRemoteETag: string;
   createdAt: string;
+  /** Preserves R2's original acceptance time across namespace migration. */
+  r2AcceptedAt?: string;
 }
 
 export interface RemoteDeletion {
@@ -41,7 +45,7 @@ export interface RemoteDeletion {
 }
 
 export function isInternalRemoteKey(key: string): boolean {
-  return canonicalKey(key).startsWith(TOMBSTONE_NAMESPACE);
+  return TOMBSTONE_READ_NAMESPACES.some(prefix => canonicalKey(key).startsWith(prefix));
 }
 
 function base64url(bytes: Uint8Array): string {
@@ -80,6 +84,7 @@ export function validateTombstone(value: unknown): asserts value is RemoteTombst
   if (!value || typeof value !== "object") throw new Error("Malformed tombstone record");
   const record = value as Partial<RemoteTombstone>;
   if (record.protocol !== TOMBSTONE_PROTOCOL || typeof record.path !== "string" || typeof record.deletedRemoteETag !== "string" || !record.deletedRemoteETag || typeof record.createdAt !== "string" || !record.createdAt) throw new Error("Unsupported or incomplete tombstone record");
-  if (canonicalKey(record.path) !== record.path || isInternalRemoteKey(record.path)) throw new Error("Tombstone contains an invalid path");
+  if (canonicalKey(record.path) !== record.path || isInternalRemoteKey(record.path) || record.path.startsWith(VERSION_NAMESPACE)) throw new Error("Tombstone contains an invalid path");
   if (!Number.isFinite(Date.parse(record.createdAt))) throw new Error("Tombstone has an invalid creation time");
+  if (record.r2AcceptedAt !== undefined && (typeof record.r2AcceptedAt !== "string" || !Number.isFinite(Date.parse(record.r2AcceptedAt)))) throw new Error("Tombstone has an invalid acceptance time");
 }

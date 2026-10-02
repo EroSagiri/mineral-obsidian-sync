@@ -43,7 +43,7 @@ export interface R2SyncSettings extends R2Configuration, GatewaySettings, Mutati
   enabledLogTags: string[] | "*";
   ignoredPaths: string[];
   integrityReconcileIntervalMinutes: number;
-  /** This device's hot-session identity; minted once, never shown to the user. */
+  /** Legacy copied identity, retained for settings compatibility; hot sync uses device-local storage. */
   hotClientId: string;
   /**
    * Hot (realtime) collaboration, opt-in.
@@ -154,5 +154,4 @@ export class R2SyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName(t("settings.captureDebugSlice")).setDesc(t("settings.captureDebugSliceDesc")).addButton((button) => button.setButtonText(t("settings.captureDebugSliceButton")).setCta().onClick(() => this.plugin.captureDebugSlice()));
   }
 }
-
 

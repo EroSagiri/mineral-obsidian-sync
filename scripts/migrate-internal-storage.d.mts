@@ -1,0 +1,2 @@
+export function migrationTarget(key: string): string;
+export function migrateInternalStorage(config: { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; remotePrefix?: string }, options?: { apply?: boolean; deleteSource?: boolean; writersPaused?: boolean; backupDir?: string; send?: (url: string | URL, init: RequestInit) => Promise<Response> }): Promise<{ planned: number; copied: number; verified: number; removed: number }>;
