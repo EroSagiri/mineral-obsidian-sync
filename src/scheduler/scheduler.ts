@@ -235,7 +235,20 @@ export class SyncScheduler {
               authority = await this.dependencies.hotAuthority.authorize(operation.key, operation.type);
               if (authority === "deferred") {
                 observedPaths.delete(operation.key);
-              counts.deferred++;
+                // A missing local file cannot be delivered while its inferred deletion is refused.
+                // Keep the observed absence and remote version visible as a decision, so a user can
+                // restore that version instead of leaving an obsolete conflict or a silent deferral.
+                if (operation.type === "delete-remote" && !local.has(operation.key)
+                  && remote.get(operation.key)?.etag && cycle.observeConflicts) {
+                  const blocked: Extract<SyncOperation, { type: "conflict" }> = {
+                    type: "conflict", key: operation.key, conflict: "local-deleted-remote-modified",
+                    reason: "local deletion refused by remote hot ownership",
+                  };
+                  const detected = cycle.observeConflicts([blocked], observations);
+                  conflicts.push(...detected);
+                  if (detected.length) { observedPaths.add(operation.key); counts.conflict++; }
+                }
+                counts.deferred++;
                 deferredByHot = true;
                 this.dependencies.debug?.("cycle operation deferred-by-hot-authority");
                 continue;
@@ -644,7 +657,6 @@ function resultDetail(result: OperationResult | { status: "noop" | "conflict" })
   if (result.status === "unresolved" || result.status === "blocked" || result.status === "stale") return result.reason;
   return undefined;
 }
-
 
 
 

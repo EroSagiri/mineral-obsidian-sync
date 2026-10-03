@@ -80,6 +80,11 @@ export class ConflictCoordinator {
    */
   resolutions(): Map<string, { intent: ResolutionIntent }> { return new Map([...this.active].filter(([, proposal]) => !proposal.intent.hotResolution)); }
 
+  /** Validate persisted choices before planning, while an inferred delete can still be prevented. */
+  async refreshResolutionIntents(observations: ConflictDetectionInput[]): Promise<void> {
+    await this.refreshValidIntents(new Map(observations.map(input => [input.key, input])), new Set(observations.map(input => input.key)));
+  }
+
   /** The conflict records the resolver UI should show. */
   async list(): Promise<ConflictRecord[]> {
     if (!this.dependencies.channel) return [];

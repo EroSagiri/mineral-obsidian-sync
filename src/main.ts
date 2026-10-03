@@ -1705,6 +1705,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
           // Conflict observation and merge-base recording must use the same verified baseline.
           previous.set(key, entry);
         }
+        // A manual choice must be checked before a deletion can execute, even if remote content
+        // returned to the baseline ETag or the other device released its hot lease meanwhile.
+        await this.coordinator?.refreshResolutionIntents([...new Set([...local.keys(), ...remote.keys(), ...verifiedPrevious.keys()])]
+          .filter(key => !this.hotCoordinator?.isFenced(key))
+          .map(key => ({ key, previous: verifiedPrevious.get(key), observedLocal: local.get(key), observedRemote: remote.get(key) })));
         return buildSyncPlan(local, remote, verifiedPrevious, this.coordinator?.resolutions(), {
           // Ownership is a plan input, not only an execution check: a hot path must never be described as
           // an upload, a download, or a deletion inference that some later stage has to remember to skip.

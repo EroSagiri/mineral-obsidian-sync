@@ -15,6 +15,14 @@ const planWith = (resolution: { intent: { conflictId: string; type: "keep-local"
   ).operations[0];
 
 describe("planner output without resolutions is unchanged", () => {
+  it("restores a missing file after a validated keep-remote choice even at the baseline ETag", () => {
+    const remoteEntry = remote("note.md", 10, "etag-base");
+    const before = new Map([["note.md", previous()]]);
+    expect(buildSyncPlan(new Map(), new Map([["note.md", remoteEntry]]), before).operations[0]).toMatchObject({ type: "delete-remote" });
+    expect(buildSyncPlan(new Map(), new Map([["note.md", remoteEntry]]), before,
+      new Map([["note.md", { intent: { conflictId: "blocked-delete", type: "keep-remote" } }]])).operations[0])
+      .toMatchObject({ type: "resolve-keep-remote", expectedLocal: { kind: "absent" }, expectedRemoteETag: "etag-base" });
+  });
   it("still reports a conflict for a both-modified key", () => {
     const operation = planWith(undefined);
     expect(operation).toMatchObject({ type: "conflict", conflict: "both-modified" });

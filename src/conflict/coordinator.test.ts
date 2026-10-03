@@ -166,6 +166,20 @@ describe("divergence policy through the coordinator", () => {
 
   beforeEach(() => { env = setup(); remoteBodies = new Map(); reconcileReasons = []; });
 
+  it("validates a persisted restore choice before a missing file can be planned as deletion", async () => {
+    const input = { key: "note.md", previous: previous("note.md", 0, 10, "empty"), observedRemote: { key: "note.md", size: 0, etag: "empty", lastModified: 1 } };
+    const c = coordinator();
+    await c.handleConflicts([input]);
+    const record = (await c.list())[0]!;
+    await c.propose({ protocolVersion: 1, channel: CHANNEL, path: input.key, conflictId: record.conflictId, type: "keep-remote", expectedRemoteETag: "empty", createdAt: 1 });
+    const restarted = coordinator();
+    expect(restarted.resolutions().size).toBe(0);
+    await restarted.refreshResolutionIntents([input]);
+    expect(restarted.resolutions().get("note.md")?.intent.type).toBe("keep-remote");
+    await restarted.refreshResolutionIntents([{ ...input, observedRemote: { ...input.observedRemote, etag: "newer" } }]);
+    expect(restarted.resolutions().size).toBe(0);
+  });
+
   it("settles a short device handoff, records it as evidence, and proposes the combined text", async () => {
     const ancestor = "windows\nsf\n";
     const mine = "windows\nsf\nfrom windows\n";

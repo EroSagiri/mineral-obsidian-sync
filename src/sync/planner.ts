@@ -131,7 +131,11 @@ export function buildSyncPlan(
       // a permanent, unresolvable key in every future plan; forgetting it touches no user data.
       operations.push({ type: "prune-baseline", key, reason: "absent locally and remotely since the previous successful sync" });
     } else if (!here && there) {
-      if (remoteChanged(there, before)) operations.push(deletedLocalResolution(resolutions?.get(key), key, there) ?? operation("conflict", key, "local deleted while remote changed", "local-deleted-remote-modified"));
+      // A live remote writer may refuse an inferred deletion even at the baseline ETag.
+      // Its version-bound keep-remote decision must restore the missing local file.
+      const resolution = deletedLocalResolution(resolutions?.get(key), key, there);
+      if (resolution) operations.push(resolution);
+      else if (remoteChanged(there, before)) operations.push(operation("conflict", key, "local deleted while remote changed", "local-deleted-remote-modified"));
       else operations.push({ type: "delete-remote", key, reason: "local deletion since previous successful sync", expectedRemoteETag: there.etag });
     } else if (here && !there) {
       if (localChanged(here, before)) {

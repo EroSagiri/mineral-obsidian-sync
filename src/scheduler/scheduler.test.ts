@@ -28,6 +28,25 @@ function setup(capture: () => CycleDependencies, debug?: (message: string) => vo
 }
 
 describe("SyncScheduler", () => {
+  it("exposes a refused inferred deletion as a current conflict without executing the delete", async () => {
+    const seen: unknown[] = [];
+    const executed: string[] = [];
+    const timers = new FakeTimers();
+    const entry = { key: "note.md", size: 0, etag: "empty", lastModified: 1 };
+    const scheduler = new SyncScheduler({
+      captureCycle: () => ({ ...base([{ type: "delete-remote", key: "note.md", expectedRemoteETag: "empty", reason: "missing locally" }], async op => { executed.push(op.key); return { status: "applied", key: op.key }; }),
+        scanRemote: async () => new Map([["note.md", entry]]),
+        observeConflicts: (operations, observations) => operations.map(op => ({ key: op.key, observedRemote: observations.remote.get(op.key) })),
+      }),
+      visible: () => true, timers,
+      hotAuthority: { authorize: async () => "deferred", settle: async () => {} },
+      onConflicts: async (records, scope) => { seen.push({ records, scope }); },
+    });
+    scheduler.requestReconcile("manual"); timers.fire(0); await flush();
+    expect(executed).toEqual([]);
+    expect(seen).toEqual([{ records: [{ key: "note.md", observedRemote: entry }], scope: ["note.md"] }]);
+    expect(scheduler.diagnostics().lastResultCounts).toMatchObject({ conflict: 1, deferred: 1 });
+  });
   it("does not retire conflict records when observation fails", async () => {
     const observations: unknown[] = [];
     const timers = new FakeTimers();
