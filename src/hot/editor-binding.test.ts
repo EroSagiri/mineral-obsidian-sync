@@ -99,6 +99,39 @@ describe("singleChange", () => {
 });
 
 describe("hot editor binding", () => {
+  it("keeps syncing when multiline text committed before a decoration rendering error", async () => {
+    const editor = new FakeEditor("old\n| a | b |\n");
+    const { binding, freezes, updates } = bindingFor(editor);
+    const original = editor.transaction.bind(editor);
+    editor.transaction = (tx, origin) => {
+      original(tx, origin);
+      throw new RangeError("Decorations that replace line breaks may not be specified via plugins");
+    };
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "phone edit\n| a | b |\n| - | - |\n");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+    expect(editor.getValue()).toBe(binding.text());
+    expect(binding.isFrozen()).toBe(false);
+    expect(freezes).toEqual([]);
+    await binding.handleEditorChange();
+    expect(updates).toEqual([]);
+    const before = Y.encodeStateVector(room);
+    room.getText("markdown").insert(0, "next\n");
+    binding.applyRemote(encodeHotPayload(Y.encodeStateAsUpdate(room, before)));
+    expect(editor.getValue()).toBe(room.getText("markdown").toString());
+    expect(binding.isFrozen()).toBe(false);
+  });
+
+  it("still freezes if a rendering exception occurred before text committed", () => {
+    const editor = new FakeEditor("old");
+    const { binding, freezes } = bindingFor(editor);
+    editor.transaction = () => { throw new RangeError("Decorations that replace line breaks may not be specified via plugins"); };
+    const room = new Y.Doc(); room.getText("markdown").insert(0, "remote\ntext");
+    binding.applyState(encodeHotPayload(Y.encodeStateAsUpdate(room)));
+    expect(editor.getValue()).toBe("old");
+    expect(binding.isFrozen()).toBe(true);
+    expect(freezes).toHaveLength(1);
+  });
   it("writes a remote update into the editor as a single ranged transaction", () => {
     const editor = new FakeEditor("");
     const { binding } = bindingFor(editor);

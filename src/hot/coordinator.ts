@@ -522,6 +522,10 @@ export class HotSyncCoordinator implements HotPathFence {
       this.sessions.delete(input.canonicalPath);
       throw error;
     }
+    if (binding.isFrozen()) {
+      this.conflicts.set(input.canonicalPath, "conflict");
+      return { outcome: "conflict", reason: "editor-document-divergence", binding: acquired.binding, remote: acquired.remote };
+    }
     this.hotPaths.add(input.canonicalPath);
     this.conflicts.delete(input.canonicalPath);
     return {
@@ -1492,8 +1496,6 @@ export class HotSyncCoordinator implements HotPathFence {
     return `${type}:${path}`;
   }
 }
-
-
 
 
 

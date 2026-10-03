@@ -88,6 +88,7 @@ const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 250;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 15_000;
 
 export class HotDocumentSession {
+  private frozen = false;
   observedServerRevision = 0;
   private record: HotSessionRecord | null = null;
   private socket: HotSocket | null = null;
@@ -414,9 +415,13 @@ export class HotDocumentSession {
     const record = this.record;
     switch (frame.type) {
       case "welcome": {
+        if (this.frozen) return;
         this.observedServerRevision = Math.max(this.observedServerRevision, frame.serverRevision);
         if (!record) return;
         this.deps.doc.applyState(frame.crdtState);
+        // applyState can synchronously freeze this session through the editor bridge. Never
+        // overwrite that conflict with the welcome's stale pre-write record or flush its outbox.
+        if (this.frozen) return;
         await this.setRecord({
           ...record,
           canonicalPath: frame.canonicalPath,
@@ -431,6 +436,7 @@ export class HotDocumentSession {
         return;
       }
       case "operation": {
+        if (this.frozen) return;
         this.observedServerRevision = Math.max(this.observedServerRevision, frame.serverRevision);
         // The Gateway normally suppresses an operation for every socket belonging to its source
         // client. Keep the identity check here as a protocol boundary as well: rolling deployments,
@@ -748,6 +754,7 @@ export class HotDocumentSession {
    * `editor-document-divergence` lifecycle in `coordinator.ts`.
    */
   async freeze(reason: string): Promise<void> {
+    this.frozen = true;
     this.cancelReconnect();
     const socket = this.socket;
     this.socket = null;

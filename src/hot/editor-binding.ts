@@ -429,6 +429,15 @@ export class HotEditorBinding implements HotDocumentPort {
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : "unknown";
+      // CodeMirror commits state before rendering decorations. Live Preview can throw here after
+      // the text already landed; freezing that verified write strands an otherwise converged room.
+      let committed = false;
+      try { committed = this.deps.editor.getValue() === docText; } catch { /* unverifiable is frozen */ }
+      if (committed) {
+        this.writtenEditorText = docText;
+        this.deps.debug?.(`hot editor text verified despite render error during ${source}: ${detail}`);
+        return;
+      }
       this.freeze(`hot editor transaction failed during ${source}: ${detail}`);
     } finally {
       this.applying = false;

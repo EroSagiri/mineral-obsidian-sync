@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { HotServerMessage } from "@mineral/sync-core/hot-protocol";
 import * as Y from "yjs";
 import { encodeHotPayload, hotContentHash } from "@mineral/sync-core/hot-protocol";
 import { HotGatewayClient, type HotHttpRequest, type HotHttpResponse, type HotSocket } from "./client";
@@ -128,6 +129,23 @@ const welcomeFrame = { protocol: 1, type: "welcome", documentId: DOCUMENT, epoch
 const ackFrame = (revision: number, id: string, duplicate = false) => ({ protocol: 1, type: "ack", documentId: DOCUMENT, epoch: 1, clientOperationId: id, serverRevision: revision, duplicate });
 
 describe("hot session durability", () => {
+  it("does not let welcome overwrite a synchronous editor freeze or accept later updates", async () => {
+    const { session, doc, store, statuses } = harness();
+    await session.start({ local: null, operationId: "start" });
+    let frozen!: Promise<void>;
+    doc.applyState = () => { frozen = session.freeze("editor-document-divergence"); };
+    await session.handleFrame(welcomeFrame as HotServerMessage);
+    await frozen;
+    expect(session.status).toBe("conflict");
+    expect((await store.loadSessions())[0]?.status).toBe("conflict");
+    const count = statuses.length;
+    await session.handleFrame(welcomeFrame as HotServerMessage);
+    await session.handleFrame({ protocol: 1, type: "operation", documentId: DOCUMENT, epoch: 1,
+      clientId: "other-device", clientOperationId: "other-edit", parentRevision: 0, serverRevision: 1, update: "ignored" });
+    expect(session.status).toBe("conflict");
+    expect(statuses.length).toBe(count);
+    expect(doc.appliedUpdates).toEqual([]);
+  });
   it("closes the raw socket on plugin shutdown without deleting the resumable record", async () => {
     const { session, store, sockets } = harness({ reconnectInitialDelayMs: 1 });
     await session.start({ local: null, operationId: "acquire-1" });
