@@ -47,6 +47,7 @@ class FakeDocument implements HotDocumentPort {
 }
 
 function harness(options: {
+  path?: string;
   release?: (body: Record<string, unknown>) => { status: number; text: string };
   acquireBody?: Record<string, unknown>;
   acquire?: (count: number) => Promise<HotHttpResponse>;
@@ -103,7 +104,7 @@ function harness(options: {
     store,
     doc,
     clientId: "device-a",
-    canonicalPath: PATH,
+    canonicalPath: options.path ?? PATH,
     events: { onStatus: status => statuses.push(status), onConflict: reason => conflicts.push(reason) },
     receiptTimeoutMs: 60,
     drainTimeoutMs: 200,
@@ -129,6 +130,25 @@ const welcomeFrame = { protocol: 1, type: "welcome", documentId: DOCUMENT, epoch
 const ackFrame = (revision: number, id: string, duplicate = false) => ({ protocol: 1, type: "ack", documentId: DOCUMENT, epoch: 1, clientOperationId: id, serverRevision: revision, duplicate });
 
 describe("hot session durability", () => {
+  it("retries a temporarily unavailable workbench without freezing or dropping its outbox", async () => {
+    const path = "workbench.ui.md";
+    const success = { protocol: 1, outcome: "joined", canonicalPath: path, binding: { canonicalPath: path, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 }, remote: null, identity: { documentId: DOCUMENT, epoch: 1 }, serverRevision: 0, latestCheckpointedRevision: 0, roomState: "active", sessionTicket: "ticket" };
+    const { session, sockets, conflicts, store } = harness({ path, reconnectInitialDelayMs: 5, reconnectMaxDelayMs: 10, acquire: async count => ({ status: 200, text: JSON.stringify(count === 2 ? { protocol: 1, outcome: "rejected", reason: "unavailable", canonicalPath: path, binding: null, remote: null } : success) }) });
+    await session.start({ local: null, operationId: "workbench-open" });
+    sockets[0].emit({ ...welcomeFrame, canonicalPath: path });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await session.applyLocalUpdate(encodeHotPayload(new Uint8Array([1])), "workbench-pending");
+    sockets[0].close();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(sockets).toHaveLength(2); expect(conflicts).toEqual([]);
+    sockets[1].emit({ ...welcomeFrame, canonicalPath: path });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(session.status).toBe("hot");
+    expect((await store.loadOutbox()).map(v => v.clientOperationId)).toContain("workbench-pending");
+    session.abandon();
+  });
+
+
   it("does not let welcome overwrite a synchronous editor freeze or accept later updates", async () => {
     const { session, doc, store, statuses } = harness();
     await session.start({ local: null, operationId: "start" });

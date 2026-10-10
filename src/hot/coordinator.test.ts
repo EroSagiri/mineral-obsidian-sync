@@ -719,6 +719,31 @@ describe("an unavailable path is not a conflict", () => {
 });
 
 describe("joining a document never seeds it", () => {
+  it("waits for a new UI room's server screen before considering a local seed", async () => {
+    const path = "search.ui.md";
+    const sockets: FakeSocket[] = [];
+    const client = new HotGatewayClient({ endpoint: "https://gateway.test", token: "t", channel: CHANNEL }, async request => ({
+      status: 200, text: JSON.stringify(request.url.endsWith("/hot/acquire") ? {
+        protocol: 1, outcome: "created", canonicalPath: path, binding: { canonicalPath: path, documentId: DOCUMENT, epoch: 1, state: "active", updatedAt: 1 },
+        remote: null, identity: { documentId: DOCUMENT, epoch: 1 }, serverRevision: 0, latestCheckpointedRevision: 0, roomState: "active", sessionTicket: "ticket",
+      } : {}),
+    }), () => { const socket = new FakeSocket(); sockets.push(socket); return socket; });
+    const coordinator = new HotSyncCoordinator({ client, store: new MemoryHotStateStore(), clientId: "device-a" });
+    const editor = fakeEditor("original text");
+    const opening = coordinator.open({ canonicalPath: path, editor, localText: "original text" });
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    expect(sockets[0].sent.map(frame => JSON.parse(frame)).filter(frame => frame.type === "operation")).toEqual([]);
+    const room = new Y.Doc();
+    room.getText("markdown").insert(0, "# 知识库搜索\n");
+    sockets[0].emit({ protocol: 1, type: "welcome", documentId: DOCUMENT, epoch: 1, canonicalPath: path, state: "active", serverRevision: 1, latestCheckpointedRevision: 0, crdtState: encodeHotPayload(Y.encodeStateAsUpdate(room)), pendingSave: true });
+    expect((await opening).outcome).toBe("hot");
+    expect(editor.getValue()).toBe("# 知识库搜索\n");
+    expect(coordinator.bindingFor(path)?.text()).toBe("# 知识库搜索\n");
+    expect(sockets[0].sent.map(frame => JSON.parse(frame)).filter(frame => frame.type === "operation")).toEqual([]);
+    room.destroy();
+    coordinator.bindingFor(path)?.detach();
+  });
+
   it("does not duplicate the text when the room's state has not arrived yet", async () => {
     // The corruption a real device produced: the room's revision was in flight, the client seeded the same
     // text into a still-empty document, and the merge kept both copies (683 bytes became 1366 in R2). The
@@ -1467,8 +1492,6 @@ describe("hot path fence", () => {
     expect(coordinator.summary().conflicts).toBe(1);
   });
 });
-
-
 
 
 

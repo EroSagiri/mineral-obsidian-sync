@@ -299,6 +299,11 @@ export class HotDocumentSession {
   }
 
   private async adopt(acquired: HotAcquireResult, previous: HotSessionRecord | null): Promise<HotAcquireResult> {
+    if (acquired.outcome === "rejected" && acquired.reason === "unavailable" && previous?.canonicalPath.endsWith(".ui.md")) {
+      // A mobile workbench transport can briefly lose its authority; keep the durable outbox fenced and retry.
+      await this.setRecord({ ...previous, status: "disconnected", updatedAt: this.now() });
+      return acquired;
+    }
     if (acquired.outcome === "conflict" || acquired.outcome === "rejected") {
       const reason = acquired.reason ?? acquired.outcome;
       if (previous) await this.setRecord({ ...previous, status: "conflict", updatedAt: this.now() }, false);
@@ -396,6 +401,11 @@ export class HotDocumentSession {
         // the floor — a single failed handshake should not be remembered across hours of editing.
         this.reconnectDelay = this.reconnectInitialDelayMs;
         this.reconnectAttempts = 0;
+        return;
+      }
+      if (result.outcome === "rejected" && result.reason === "unavailable" && record.canonicalPath.endsWith(".ui.md")) {
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.reconnectMaxDelayMs);
+        this.scheduleReconnect();
         return;
       }
       // The server refused with a verdict (conflict / rejected); the room is the authority and the

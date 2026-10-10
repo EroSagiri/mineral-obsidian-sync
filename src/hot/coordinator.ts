@@ -506,7 +506,8 @@ export class HotSyncCoordinator implements HotPathFence {
          * path, the document cannot have content, so the seed is decided immediately — which keeps an offline
          * or slow socket from delaying every open.
          */
-        const mayHoldContent = acquired.outcome === "joined" || acquired.remote?.exists === true;
+        // A registered room app can initialize a new UI document before welcome, even with no R2 seed.
+        const mayHoldContent = acquired.outcome === "joined" || acquired.remote?.exists === true || input.canonicalPath.endsWith(".ui.md");
         if (!mayHoldContent || await this.waitForSessionReady(session, 2_000)) await binding.seedFromTextIfEmpty(input.localText);
       }
     } catch (error) {
@@ -1496,6 +1497,4 @@ export class HotSyncCoordinator implements HotPathFence {
     return `${type}:${path}`;
   }
 }
-
-
 
