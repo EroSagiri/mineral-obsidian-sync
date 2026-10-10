@@ -4,8 +4,7 @@ import type { OperationResult } from "../sync/executor";
 import type { LandedWrite } from "../gateway/mutation-ingress";
 import type { LocalEntry, SyncOperation } from "../sync/types";
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
-import { DEFERRED_BY_HOT_OWNERSHIP } from "../sync/planner";
-import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake, HotAuthorityVerdict } from "./types";
+import type { ConfirmationOutcome, ConflictObservation, CycleRemoteMutation, FailureClass, ReconcileReason, ResultCounts, SchedulerDependencies, SchedulerDiagnostics, SchedulerState, SchedulerTimers, RemoteGenerationHandshake } from "./types";
 
 const LOCAL_DEBOUNCE = 1200;
 const FOCUS_DEBOUNCE = 800;
@@ -13,7 +12,7 @@ const CONFIG_DEBOUNCE = 400;
 const RETRY_INITIAL = 5000;
 const RETRY_MAX = 60000;
 
-const emptyCounts = (): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0, deferred: 0 });
+const emptyCounts = (): ResultCounts => ({ applied: 0, stale: 0, failed: 0, unresolved: 0, blocked: 0, partial: 0, conflict: 0, noop: 0 });
 const defaultTimers: SchedulerTimers = { set: (delay, callback) => window.setTimeout(callback, delay), clear: (handle) => window.clearTimeout(handle as number) };
 
 /** Event-driven, full-reconciliation scheduler. Dirty keys are only coalescing hints. */
@@ -129,10 +128,6 @@ export class SyncScheduler {
     const startVersion = this.syncDirtyVersion;
     const generation = this.configGeneration;
     const counts = emptyCounts(); let failure: FailureClass | undefined; let stale = false; let halted = false;
-    // deferredByHot is a deterministic conclusion (like a blocked delete), so it may confirm a
-    // generation; uthorityNotified records that a write proceeded without the server's answer.
-    let deferredByHot = false;
-    let authorityUnreachable = false;
     let remoteMutation: CycleRemoteMutation | undefined;
     const remoteChanges: RemoteChange[] = [];
     /**
@@ -147,7 +142,6 @@ export class SyncScheduler {
     const localWrites = new Map<string, LocalEntry>();
     const resultDetails = new Map<string, number>();
     const conflicts: ConflictObservation[] = [];
-    const observedPaths = new Set<string>();
     const handshake: RemoteGenerationHandshake = { startFailed: false, observationComplete: true };
     const incremental = reason === "remote-change" && this.incrementalStateTrusted ? this.pendingRemoteChanges.shift() : undefined;
     const useRemoteIncremental = Boolean(incremental && this.dependencies.remoteChange?.canApplyIncrementally(incremental.generation));
@@ -163,7 +157,7 @@ export class SyncScheduler {
     const cycleMode = useRemoteIncremental ? "incremental" : useLocalIncremental ? "local-incremental" : "full-reconcile";
     this.dependencies.debug?.(`cycle start reason=${reason} mode=${cycleMode} remoteGeneration=${incremental?.generation ?? "n/a"} localPaths=${localIncrementalKeys.length} incrementalStateTrusted=${this.incrementalStateTrusted}`);
     try {
-      cycle = this.dependencies.captureCycle(reason);
+      cycle = this.dependencies.captureCycle();
       if (this.shouldStop(generation)) halted = true;
       if (!halted) {
         // The opening generation boundary is captured before any complete remote observation. It is only
@@ -192,82 +186,17 @@ export class SyncScheduler {
         if (this.shouldStop(generation)) halted = true;
         if (!halted) {
           const observations = { local, remote, previous: useRemoteIncremental || useLocalIncremental ? stored : cycle.filterPrevious(stored) };
-          const plan = await cycle.buildPlan(local, remote, observations.previous);
+          const plan = cycle.buildPlan(local, remote, observations.previous);
           if (cycle.observeConflicts) conflicts.push(...cycle.observeConflicts(plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "conflict" }> => entry.type === "conflict"), observations));
-          for (const operation of plan.operations) observedPaths.add(operation.key);
           const planCounts = new Map<string, number>();
           for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);
           this.dependencies.debug?.(`cycle plan operations=${plan.operations.length} counts=${JSON.stringify(Object.fromEntries(planCounts))}`);
           const operationsStartedAt = Date.now();
           for (const operation of plan.operations) {
             if (this.shouldStop(generation)) { halted = true; break; }
-            // The fence is checked here, at the mutation boundary, and not in the planner: a plan can be
-            // built while a path is cold and reach the executor after it became hot. The operation travels
-            // with the question because one of them — a resolved merge — *is* the decision the fence was
-            // waiting for, and refusing it is how a conflicted path deadlocks.
-            if (this.dependencies.hotDeferral?.isFenced(operation.key, operation.type)) {
-              this.dependencies.hotDeferral.noteDeferred(operation.key);
-              observedPaths.delete(operation.key);
-              counts.deferred++;
-              deferredByHot = true;
-              this.dependencies.debug?.("cycle operation deferred-by-hot-ownership");
-              continue;
-            }
-            // The authority is asked before the mutation and released after it: a lease that was
-            // released before the write would guard nothing.
-            let authority: HotAuthorityVerdict | undefined;
-            // A resolved merge is the one operation that answers a frozen conflict, and the room that
-            // conflict belongs to can be holding the very lease this write needs. A room with nothing left
-            // to publish is given up first, or the decision is refused by the Gateway forever — the local
-            // fence yielding is only half of it. The plugin decides whether there is anything to release;
-            // a live session, an external edit and an unproven handoff are all left alone (see
-            // `releaseRefusedRoom`).
-            if (operation.type === "resolve-merged" && this.dependencies.hotConflictRelease) {
-              try { await this.dependencies.hotConflictRelease.release(operation.key); }
-              catch { this.dependencies.debug?.("cycle could not release the refused room; the fence stands"); }
-            }
-            // The cross-device lease protects mutations, not observations. Asking the Gateway for
-            // hundreds of `noop`/`conflict` rows turns a control-plane outage into a multi-minute cold
-            // scan even though those rows cannot write either side. Keep the authority boundary exactly
-            // around operations that can reach the executor.
-            const mutates = operation.type !== "noop" && operation.type !== "conflict";
-            if (mutates && this.dependencies.hotAuthority) {
-              authority = await this.dependencies.hotAuthority.authorize(operation.key, operation.type);
-              if (authority === "deferred") {
-                observedPaths.delete(operation.key);
-                // A missing local file cannot be delivered while its inferred deletion is refused.
-                // Keep the observed absence and remote version visible as a decision, so a user can
-                // restore that version instead of leaving an obsolete conflict or a silent deferral.
-                if (operation.type === "delete-remote" && !local.has(operation.key)
-                  && remote.get(operation.key)?.etag && cycle.observeConflicts) {
-                  const blocked: Extract<SyncOperation, { type: "conflict" }> = {
-                    type: "conflict", key: operation.key, conflict: "local-deleted-remote-modified",
-                    reason: "local deletion refused by remote hot ownership",
-                  };
-                  const detected = cycle.observeConflicts([blocked], observations);
-                  conflicts.push(...detected);
-                  if (detected.length) { observedPaths.add(operation.key); counts.conflict++; }
-                }
-                counts.deferred++;
-                deferredByHot = true;
-                this.dependencies.debug?.("cycle operation deferred-by-hot-authority");
-                continue;
-              }
-              // A Gateway that cannot be reached may not stop R2 sync; the room's conditional
-              // checkpoint is what catches the write it could not be told about.
-              if (authority === "unreachable") authorityUnreachable = true;
-            }
             // Each operation is executed exactly once and its result classified once: the loop and
             // the `finally` block must never disagree about what counts as a shortfall.
-            let result: OperationResult | { status: "noop" | "conflict" };
-            try {
-              result = await this.apply(operation, cycle);
-            } finally {
-              if (authority === "granted" && this.dependencies.hotAuthority) {
-                try { await this.dependencies.hotAuthority.settle(operation.key, authority); } catch { /* bookkeeping only */ }
-              }
-            }
-            if (operation.type.startsWith("resolve-") && result.status !== "applied") observedPaths.delete(operation.key);
+            const result = await this.apply(operation, cycle);
             counts[result.status]++;
             if (result.status === "applied" && result.localWrite) localWrites.set(result.localWrite.key, result.localWrite);
             const detail = resultDetail(result);
@@ -306,22 +235,9 @@ export class SyncScheduler {
             if (this.shouldStop(generation)) { halted = true; break; }
           }
           this.dependencies.debug?.(`cycle operations durationMs=${Date.now() - operationsStartedAt}`);
-          if (deferredByHot) {
-            // Visible on purpose: a deferred path is work that did not happen, and the count is what
-            // keeps "nothing to do" from looking like "the hot session silently swallowed it".
-            this.dependencies.debug?.(`cycle deferred-by-hot count=${counts.deferred}`);
-          }
-          if (authorityUnreachable) {
-            // The write proceeded without the Gateway's answer, which is the documented degradation:
-            // R2 sync keeps working and the room's conditional checkpoint is what detects a collision.
-            this.dependencies.debug?.("cycle cold authority unavailable; write proceeded under R2 preconditions");
-          }
           if (!halted && cycle.observeConverged) {
             const mergeBaseStartedAt = Date.now();
-            // A deferred noop is not convergence: that path is being synchronized by a hot room, and
-            // recording a merge base for it would describe a state the cold path never verified.
-            const noops = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "noop" }> =>
-              entry.type === "noop" && entry.reason !== DEFERRED_BY_HOT_OWNERSHIP);
+            const noops = plan.operations.filter((entry): entry is Extract<SyncOperation, { type: "noop" }> => entry.type === "noop");
             try {
               await cycle.observeConverged(noops, observations);
               this.dependencies.debug?.(`cycle merge-base-backfill noops=${noops.length} durationMs=${Date.now() - mergeBaseStartedAt}`);
@@ -375,10 +291,11 @@ export class SyncScheduler {
     // rewrites the plan that just ran; a resolution the coordinator records is applied by a later
     // cycle, which keeps `planner` the only decision maker and `event != operation` intact.
     //
-    // An empty conflict list proves convergence only for paths actually observed and processed.
-    // Failed scans, incremental omissions and deferred resolutions must preserve prior decisions.
-    if (this.dependencies.onConflicts && failure === undefined && !halted) {
-      try { await this.dependencies.onConflicts(conflicts, [...observedPaths]); }
+    // The hook runs on *every* cycle, including one with no conflicts at all. An empty list is
+    // meaningful: it is how the coordinator learns that records it still holds are no longer active
+    // and must be dropped. Skipping the call would leave a resolved conflict visible in the UI forever.
+    if (this.dependencies.onConflicts) {
+      try { await this.dependencies.onConflicts(conflicts); }
       catch { this.dependencies.debug?.("conflict coordination failed"); }
     }
     // An executor-originated Vault write emits the same event as a user edit. Consume it only after
@@ -530,15 +447,12 @@ export class SyncScheduler {
  * The change one operation implies for the remote control plane, with the revision it left behind.
  *
  * The Gateway accepts `etag`/`size` as optional hints and validates them. This is the *hint* shape: a
- * delete carries the retired revision when the executor proved one, so another client can read the one
- * immutable tombstone directly instead of first issuing a HEAD.
+ * delete carries no revision here, because the Gateway's vocabulary forbids one — the fact that names the
+ * retired revision is built separately, for the journal that can verify it.
  */
 function remoteChangeForOperation(operation: SyncOperation, result: OperationResult | { status: "noop" | "conflict" }): RemoteChange | undefined {
   const revision = "remote" in result ? result.remote : undefined;
-  if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") {
-    const retired = "retired" in result ? result.retired : undefined;
-    return { op: "delete", path: operation.key, ...(retired ? { etag: retired } : {}) };
-  }
+  if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") return { op: "delete", path: operation.key };
   if (operation.type === "upload" || operation.type === "resolve-keep-local" || operation.type === "resolve-merged") {
     return { op: "put", path: operation.key, ...(revision?.etag ? { etag: revision.etag } : {}), ...(typeof revision?.size === "number" ? { size: revision.size } : {}) };
   }
@@ -657,6 +571,3 @@ function resultDetail(result: OperationResult | { status: "noop" | "conflict" })
   if (result.status === "unresolved" || result.status === "blocked" || result.status === "stale") return result.reason;
   return undefined;
 }
-
-
-

@@ -5,7 +5,6 @@ import type { R2Client } from "../remote/r2-client";
 import type { VaultPathFilter } from "../sync/ignore";
 import { observeRemoteDelta } from "../sync/remote-delta";
 import type { LocalEntry, PreviousEntry, RemoteEntry } from "../sync/types";
-import { encodeTombstone } from "../remote/tombstones";
 import { conflictIdFor } from "./identity";
 
 /**
@@ -33,7 +32,7 @@ async function fromFullScan(): Promise<RemoteEntry> {
     listObjects: async () => [{ key: "note.md", size: 5, etag: "E", lastModified: 1_000 }],
     listTombstones: async () => [{ tombstone: { protocol: 1, path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" } }],
     headObject: async () => { throw new Error("a full scan does not head"); },
-    getObject: async () => encodeTombstone({ protocol: 1, path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" }),
+    getObject: async () => { throw new Error("unused"); },
     putObject: async () => { throw new Error("a scan does not write"); },
   };
   return (await scanRemote(client, filter)).get("note.md")!;
@@ -45,10 +44,10 @@ async function fromDelta(): Promise<RemoteEntry> {
     listObjects: async () => { throw new Error("a delta must never list objects"); },
     listTombstones: async () => { throw new Error("a delta must never list tombstones"); },
     headObject: async (key: string) => ({ key, size: 5, etag: "E", lastModified: 1_000 }),
-    getObject: async () => encodeTombstone({ protocol: 1, path: "note.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" }),
+    getObject: async () => { throw new Error("unused"); },
     putObject: async () => { throw new Error("a delta does not write"); },
   };
-  const observed = await observeRemoteDelta([{ op: "delete", path: "note.md", etag: "E" }], {
+  const observed = await observeRemoteDelta([{ op: "delete", path: "note.md" }], {
     client, ignores: () => false, loadPrevious: async () => new Map([["note.md", PREVIOUS]]), statLocal: async () => null, acceptsBaseline: () => true,
   });
   return observed.remote.get("note.md")!;

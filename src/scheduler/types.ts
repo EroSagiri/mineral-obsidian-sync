@@ -3,7 +3,7 @@ import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import type { LandedWrite } from "../gateway/mutation-ingress";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry, SyncOperation, SyncPlan } from "../sync/types";
 
-export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "foreground-resume" | "integrity-check" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution" | "hot-handoff" | "hot-resolution";
+export type ReconcileReason = "startup" | "manual" | "local-event" | "editor-change" | "focus-resume" | "foreground-resume" | "integrity-check" | "config-change" | "stale" | "retry" | "remote-change" | "conflict-auto-merge" | "conflict-manual-resolution";
 export type SchedulerState = "idle" | "debouncing" | "running" | "rerun-pending" | "blocked-by-auth";
 export type FailureClass = "retryable" | "stable" | "auth";
 /**
@@ -11,7 +11,7 @@ export type FailureClass = "retryable" | "stable" | "auth";
  * half could not be completed. It is counted separately from `applied` because it deliberately leaves
  * the baseline uncommitted and needs one more reconciliation.
  */
-export type ResultKind = OperationResult["status"] | "conflict" | "noop" | "deferred";
+export type ResultKind = OperationResult["status"] | "conflict" | "noop";
 export type ResultCounts = Record<ResultKind, number>;
 
 export interface SchedulerTimers {
@@ -35,12 +35,7 @@ export interface CycleDependencies {
   localIncrementalObservations?(keys: string[]): Promise<{ local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> }>;
   loadPrevious(): Promise<Map<string, PreviousEntry>>;
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
-  /**
-   * Planning may first verify an identical local/remote pair that has no baseline yet. This happens
-   * after a hot handoff or an interrupted first download and is the only safe way to turn that pair
-   * into a cold-sync noop without asking the user to resolve a conflict.
-   */
-  buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan | Promise<SyncPlan>;
+  buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
   execute(operation: SyncOperation): Promise<OperationResult>;
   /** Confirms an executor-originated Vault write has not been changed again before its event is ignored. */
   localWriteStillMatches?(entry: LocalEntry): Promise<boolean>;
@@ -105,7 +100,7 @@ export interface SchedulerMutationIngress {
 }
 
 export interface SchedulerDependencies {
-  captureCycle(reason: ReconcileReason): CycleDependencies;
+  captureCycle(): CycleDependencies;
   visible(): boolean;
   remoteChange?: SchedulerRemoteChange;
   /** The journal that owns the truth about writes this device performed. */
@@ -115,7 +110,7 @@ export interface SchedulerDependencies {
    * post-cycle hook rather than something the planner calls: a cycle's plan is never rewritten while
    * it is running, so any resolution this produces is applied by a *later* cycle.
    */
-  onConflicts?(conflicts: ConflictObservation[], observedPaths?: readonly string[]): Promise<void>;
+  onConflicts?(conflicts: ConflictObservation[]): Promise<void>;
   /**
    * Reports that a resolution actually applied, so its conflict record and intent can be retired.
    * Only `applied` is reported: a `stale` or `partial` resolution must keep its conflict visible,
@@ -125,71 +120,6 @@ export interface SchedulerDependencies {
   timers?: SchedulerTimers;
   onStatus?(state: SchedulerState, counts: ResultCounts): void;
   debug?(message: string): void;
-  /**
-   * The hot-path fence.
-   *
-   * A hot file is not a cold candidate: the planner may still *observe* it, but nothing may be
-   * executed against it. Asking here — immediately before execution, not at plan time — is the point:
-   * a plan can be built while a path is cold and execute after it became hot, and that window is
-   * exactly what the ownership token exists to close.
-   */
-  hotDeferral?: HotDeferralPort;
-  /**
-   * The server-issued authority a cold mutation must hold.
-   *
-   * This is the cross-device half of the same guard: the local fence knows about this device's own hot
-   * sessions, and only the Gateway knows whether *another* device is editing the path right now.
-   */
-  hotAuthority?: HotMutationAuthorityPort;
-  /**
-   * The escape hatch for a decision that the server would otherwise refuse forever.
-   *
-   * A resolved merge needs a cold-write lease, and the Gateway will not grant one while a room is bound to
-   * the path — even when that room is a husk this device cannot use. Called immediately before a merge is
-   * attempted; the implementation decides whether there is anything worth releasing and is a no-op when
-   * there is not.
-   */
-  hotConflictRelease?: HotConflictReleasePort;
-}
-
-/** Gives up a room that is blocking a cold write it will never be able to make itself. */
-export interface HotConflictReleasePort {
-  /** Returns whether ownership was actually given up. */
-  release(key: string): Promise<boolean>;
-}
-
-/** What the cold path needs to know about hot ownership of one path. */
-export interface HotDeferralPort {
-  /**
-   * Whether this operation may run for the key.
-   *
-   * The operation is part of the question, not decoration: a resolved merge is the decision the fence was
-   * waiting for, so it is allowed through a conflict that has nothing live behind it, while an upload,
-   * download or delete is still refused. See `HotSyncCoordinator.isFencedFor`.
-   */
-  isFenced(key: string, operation?: string): boolean;
-  /** Records the deferral for diagnostics: a skipped operation must be visible, never silent. */
-  noteDeferred(key: string): void;
-}
-
-/**
- * The verdict of one cold-mutation authority request.
- *
- * `unreachable` is not `deferred`: a Gateway this device cannot reach may not stop R2 synchronisation
- * from working (that is the degradation table's whole point), whereas a `deferred` verdict means the
- * authority *answered* that a hot session owns this path.
- */
-export type HotAuthorityVerdict = "granted" | "deferred" | "unreachable";
-
-export interface HotMutationAuthorityPort {
-  /**
-   * Asks for the lease. The operation is part of the question for the same reason it is on
-   * `HotDeferralPort`: the local half of this guard refuses a fenced path before the Gateway is ever
-   * consulted, and a resolved merge has to be let through both halves or neither.
-   */
-  authorize(key: string, operation?: string): Promise<HotAuthorityVerdict>;
-  /** Releases whatever the request held. Never a write, never a decision: bookkeeping. */
-  settle(key: string, verdict: HotAuthorityVerdict): Promise<void>;
 }
 
 /** The minimum a conflict observation needs to carry: identity inputs, never content. */
@@ -239,5 +169,3 @@ export interface SchedulerDiagnostics {
   /** A completed cycle changed R2 during this session (confirmed or possibly). */
   lastCycleRemoteMutation: boolean;
 }
-
-

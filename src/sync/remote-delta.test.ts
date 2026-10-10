@@ -17,27 +17,21 @@ import type { PreviousEntry, RemoteEntry } from "./types";
 
 type Calls = string[];
 
-function client(options: { head?: (key: string) => Promise<RemoteEntry>; get?: (key: string) => Promise<ArrayBuffer>; calls: Calls }): R2Client {
+function client(options: { head?: (key: string) => Promise<RemoteEntry>; calls: Calls }): R2Client {
   return {
     listObjects: async () => { options.calls.push("listObjects"); throw new Error("a delta must never list objects"); },
     listTombstones: async () => { options.calls.push("listTombstones"); throw new Error("a delta must never list tombstones"); },
     headObject: async (key: string) => { options.calls.push(`head:${key}`); return options.head ? options.head(key) : { key, size: 3, etag: "E", lastModified: 1_000 }; },
-    verifyObjectVersion: async (key: string) => { options.calls.push(`verify:${key}`); },
-    getObject: async (key) => {
-      options.calls.push(key === "foo.md" ? `get:${key}` : "get:tombstone");
-      if (options.get) return options.get(key);
-      if (key === "foo.md") return new Uint8Array([1, 2, 3]).buffer;
-      return encodeTombstone({ protocol: 1, path: "foo.md", deletedRemoteETag: "E", createdAt: "2026-09-22T00:00:00.000Z" });
-    },
+    getObject: async () => { options.calls.push("getObject"); throw new Error("a delta must never read an object body"); },
     putObject: async () => { options.calls.push("putObject"); throw new Error("a delta never writes"); },
   };
 }
 
 const previous = (key: string, etag = "E"): PreviousEntry => ({ key, local: { size: 3, mtime: 10 }, remote: { size: 3, etag, lastModified: 900 }, syncedAt: 500 });
 
-function dependencies(calls: Calls, options: { head?: (key: string) => Promise<RemoteEntry>; get?: (key: string) => Promise<ArrayBuffer>; local?: Map<string, { size: number; mtime: number }>; stored?: Map<string, PreviousEntry> } = {}) {
+function dependencies(calls: Calls, options: { head?: (key: string) => Promise<RemoteEntry>; local?: Map<string, { size: number; mtime: number }>; stored?: Map<string, PreviousEntry> } = {}) {
   return {
-    client: client({ head: options.head, get: options.get, calls }),
+    client: client({ head: options.head, calls }),
     ignores: () => false,
     loadPrevious: async () => options.stored ?? new Map([[  "foo.md", previous("foo.md")]]),
     statLocal: async (key: string) => options.local?.get(key) ?? null,
@@ -45,15 +39,15 @@ function dependencies(calls: Calls, options: { head?: (key: string) => Promise<R
   };
 }
 
-describe("a Gateway delete reads only its exact tombstone", () => {
+describe("a Gateway delete is answered with one HEAD", () => {
   it("names the deleted version from the object that is still there", async () => {
     const calls: Calls = [];
-    const changes: RemoteChange[] = [{ op: "delete", path: "foo.md", etag: "E" }];
+    const changes: RemoteChange[] = [{ op: "delete", path: "foo.md" }];
 
     const observed = await observeRemoteDelta(changes, dependencies(calls));
 
-    // The event already names the version, so there is no HEAD and no listing: one exact metadata GET.
-    expect(calls).toEqual(["get:tombstone"]);
+    // One exact request for the one path, and no listing of any kind.
+    expect(calls).toEqual(["head:foo.md"]);
     // The tombstone is written without removing the object, so the deleted version is the object's own
     // ETag — and it lives *only* in the deletion identity. Nothing that describes a live object is left
     // on the entry, because a full scan produces exactly these fields and the conflict identity is
@@ -68,9 +62,9 @@ describe("a Gateway delete reads only its exact tombstone", () => {
 
   it("reads the local file as well when this device still has it", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md", etag: "E" }], dependencies(calls, { local: new Map([["foo.md", { size: 9, mtime: 42 }]]) }));
+    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md" }], dependencies(calls, { local: new Map([["foo.md", { size: 9, mtime: 42 }]]) }));
 
-    expect(calls).toEqual(["get:tombstone"]);
+    expect(calls).toEqual(["head:foo.md"]);
     expect(observed.local.get("foo.md")).toEqual({ key: "foo.md", size: 9, mtime: 42 });
   });
 
@@ -107,40 +101,28 @@ describe("a Gateway delete reads only its exact tombstone", () => {
 describe("put and rename deltas keep their exact-path shape", () => {
   it("takes a complete put fact without any request at all", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls, { local: new Map([["foo.md", { size: 5, mtime: 1 }]]) }));
+    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls));
 
     expect(calls).toEqual([]);
     expect(observed.remote.get("foo.md")).toMatchObject({ etag: "N", size: 5, lastModified: Date.parse("2026-09-22T00:00:00.000Z") });
   });
 
-  it("gets an incomplete put fact conditionally, without requiring HEAD metadata", async () => {
+  it("heads an incomplete put fact, and asserts the ETag the event claimed", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N" }], dependencies(calls, { local: new Map([["foo.md", { size: 3, mtime: 1 }]]) }));
+    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N" }], dependencies(calls));
 
-    expect(calls).toEqual(["get:foo.md"]);
-    expect(observed.remote.get("foo.md")).toMatchObject({ etag: "N", size: 3, lastModified: 900 });
+    expect(calls).toEqual(["head:foo.md"]);
+    expect(observed.remote.get("foo.md")).toMatchObject({ etag: "E" });
   });
 
   it("treats both halves of a rename as their own exact path", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "rename", from: "old.md", to: "new.md" }], dependencies(calls, { local: new Map([["new.md", { size: 3, mtime: 1 }]]) }));
+    const observed = await observeRemoteDelta([{ op: "rename", from: "old.md", to: "new.md" }], dependencies(calls));
 
     expect(calls).toEqual(["head:new.md"]);
     // The removed side carries no identity, exactly like a deletion whose object is gone.
     expect(observed.remote.has("old.md")).toBe(false);
     expect(observed.remote.get("new.md")).toMatchObject({ key: "new.md" });
-  });
-
-  it("does not resurrect a locally absent note when a delayed put names a tombstoned revision", async () => {
-    const calls: Calls = [];
-    const tombstone = encodeTombstone({ protocol: 1, path: "foo.md", deletedRemoteETag: "N", createdAt: "2026-09-22T00:00:00.000Z" });
-    const observed = await observeRemoteDelta(
-      [{ op: "put", path: "foo.md", etag: "N", size: 3 }],
-      dependencies(calls, { get: async (key) => key === "foo.md" ? new Uint8Array([1, 2, 3]).buffer : tombstone }),
-    );
-
-    expect(calls).toEqual(["verify:foo.md", "get:tombstone"]);
-    expect(observed.remote.get("foo.md")).toMatchObject({ deleted: { deletedRemoteETag: "N", objectPresent: true } });
   });
 });
 
@@ -148,16 +130,16 @@ describe("a delta observes only the paths it names", () => {
   it("filters the baseline to those paths and keeps the namespace rules", async () => {
     const calls: Calls = [];
     const stored = new Map([["foo.md", previous("foo.md")], ["other.md", previous("other.md")]]);
-    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls, { stored, local: new Map([["foo.md", { size: 5, mtime: 1 }]]) }));
+    const observed = await observeRemoteDelta([{ op: "put", path: "foo.md", etag: "N", size: 5, modified: "2026-09-22T00:00:00.000Z" }], dependencies(calls, { stored }));
 
     expect([...observed.previous.keys()]).toEqual(["foo.md"]);
-    // A baseline for a path outside the delta is never touched; the one named path keeps its local fact.
-    expect([...observed.local.keys()]).toEqual(["foo.md"]);
+    // A baseline for a path outside the delta is never touched, and never even loaded twice.
+    expect(observed.local.size).toBe(0);
   });
 
   it("drops a baseline the current namespace does not accept", async () => {
     const calls: Calls = [];
-    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md", etag: "E" }], { ...dependencies(calls), acceptsBaseline: () => false });
+    const observed = await observeRemoteDelta([{ op: "delete", path: "foo.md" }], { ...dependencies(calls), acceptsBaseline: () => false });
 
     expect(observed.previous.size).toBe(0);
     // The observation itself is unaffected: a decision never depends on a baseline being usable.
@@ -230,22 +212,8 @@ describe("a locally-changed path is answered with one HEAD", () => {
 
     const observed = await observeLocalDelta(["foo.md"], localDependencies(calls, withoutTombstone));
 
-    expect(calls).toEqual(["head:foo.md", "get:missing", "get:missing"]);
+    expect(calls).toEqual(["head:foo.md", "get:missing"]);
     expect(observed.remote.get("foo.md")?.deleted).toBeUndefined();
-  });
-
-  it("keeps an old deletion effective when only the legacy namespace has its record", async () => {
-    const calls: Calls = [];
-    const client = await withTombstone(calls);
-    const legacyKey = (await tombstoneKey(TOMBSTONE.path, TOMBSTONE.deletedRemoteETag)).replace(".mineral/", ".mineral-sync/");
-    const legacyClient: R2Client = { ...client, getObject: async key => {
-      calls.push(key === legacyKey ? "get:legacy" : "get:missing");
-      if (key !== legacyKey) throw new RemoteHttpError("GetObject", 404);
-      return encodeTombstone(TOMBSTONE);
-    } };
-    const observed = await observeLocalDelta(["foo.md"], localDependencies(calls, legacyClient));
-    expect(calls).toEqual(["head:foo.md", "get:missing", "get:legacy"]);
-    expect(observed.remote.get("foo.md")?.deleted).toMatchObject({ deletedRemoteETag: "E", objectPresent: true });
   });
 
   it("never asks about a tombstone while the local file is still here", async () => {

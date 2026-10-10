@@ -5,7 +5,7 @@
  *   production  — minified, development-only modules stubbed out entirely
  *                 (`npm run build`, the default for deployments)
  *   development — inline sourcemap and the development self-test harness kept in
- *                 the bundle, which the Android hot-sync self-test triggers
+ *                 the bundle, which the Android self-test triggers
  *
  * The development bundle is written to `build-diag/main-dev.js` (git-ignored) and
  * only copied onto `main.js` at deployment time, so a debug bundle can never be

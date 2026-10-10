@@ -166,20 +166,6 @@ describe("divergence policy through the coordinator", () => {
 
   beforeEach(() => { env = setup(); remoteBodies = new Map(); reconcileReasons = []; });
 
-  it("validates a persisted restore choice before a missing file can be planned as deletion", async () => {
-    const input = { key: "note.md", previous: previous("note.md", 0, 10, "empty"), observedRemote: { key: "note.md", size: 0, etag: "empty", lastModified: 1 } };
-    const c = coordinator();
-    await c.handleConflicts([input]);
-    const record = (await c.list())[0]!;
-    await c.propose({ protocolVersion: 1, channel: CHANNEL, path: input.key, conflictId: record.conflictId, type: "keep-remote", expectedRemoteETag: "empty", createdAt: 1 });
-    const restarted = coordinator();
-    expect(restarted.resolutions().size).toBe(0);
-    await restarted.refreshResolutionIntents([input]);
-    expect(restarted.resolutions().get("note.md")?.intent.type).toBe("keep-remote");
-    await restarted.refreshResolutionIntents([{ ...input, observedRemote: { ...input.observedRemote, etag: "newer" } }]);
-    expect(restarted.resolutions().size).toBe(0);
-  });
-
   it("settles a short device handoff, records it as evidence, and proposes the combined text", async () => {
     const ancestor = "windows\nsf\n";
     const mine = "windows\nsf\nfrom windows\n";
@@ -322,25 +308,6 @@ describe("conflict coordinator", () => {
     expect(env.stores.intents.size).toBe(0);
   });
 
-  it("surfaces a first-sync disagreement with both observed snapshots", async () => {
-    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
-    remoteBodies.set("note.md", "remote\n");
-    const observedLocal = localEntry("note.md", 6, 50);
-    const observedRemote = { key: "note.md", size: 7, etag: "B", lastModified: 1 };
-
-    await coordinator().handleConflicts([{ key: "note.md", observedLocal, observedRemote }]);
-
-    const [record] = await env.stores.listConflicts(CHANNEL);
-    expect(record).toMatchObject({
-      autoMergeStatus: "manual-required",
-      previous: { localVersion: observedLocal, remoteETag: "B" },
-      snapshot: { baseAvailable: false, local: "local\n", remote: "remote\n" },
-    });
-    expect(record.reason).toContain("no common sync baseline");
-    expect(env.stores.intents.size).toBe(0);
-    expect(env.reconcilations.length).toBe(0);
-  });
-
   it("does not use a snapshot whose baseline no longer matches", async () => {
     env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
     remoteBodies.set("note.md", "remote\n");
@@ -404,31 +371,16 @@ describe("conflict coordinator", () => {
     const instance = coordinator();
     const input = { key: "note.md", previous: previous("note.md", 6, 10, "A"), observedLocal: localEntry("note.md", 6, 50), observedRemote: { key: "note.md", size: 7, etag: "B", lastModified: 1 } };
     await instance.handleConflicts([input]);
-    expect(env.reconcilations.length).toBe(0);
+    expect(env.reconcilations.length).toBe(1);
     // A second cycle with the same conflict must not propose anything again.
     await instance.handleConflicts([input]);
-    expect(env.reconcilations.length).toBe(0);
+    expect(env.reconcilations.length).toBe(1);
   });
 
   it("never records a conflict for a channel-less coordinator", async () => {
     const instance = coordinator({ channel: "" });
     await instance.handleConflicts([{ key: "note.md", previous: previous("note.md", 1, 1, "A") }]);
     expect(env.stores.conflicts.size).toBe(0);
-  });
-
-  it("retains a deferred cold conflict and its validated intent across an unrelated delta", async () => {
-    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
-    remoteBodies.set("note.md", "remote\n");
-    const input = { key: "note.md", previous: previous("note.md", 6, 10, "A"), observedLocal: localEntry("note.md", 6, 50), observedRemote: { key: "note.md", size: 7, etag: "B", lastModified: 1 } };
-    const conflictId = await conflictIdFor({ channel: CHANNEL, path: "note.md", previous: input.previous, observedLocal: input.observedLocal, observedRemote: input.observedRemote });
-    const instance = coordinator();
-    await instance.propose({ protocolVersion: CONFLICT_PROTOCOL_VERSION, conflictId, channel: CHANNEL, path: "note.md", type: "keep-local", expectedLocalVersion: input.observedLocal, expectedRemoteETag: "B", createdAt: 1 });
-    await instance.handleConflicts([input], ["note.md"]);
-    await instance.handleConflicts([], ["other.md"]);
-    expect((await env.stores.listConflicts(CHANNEL)).map(record => record.path)).toEqual(["note.md"]);
-    expect(instance.resolutions().has("note.md")).toBe(true);
-    await instance.handleConflicts([], ["note.md"]);
-    expect(await env.stores.listConflicts(CHANNEL)).toEqual([]);
   });
 
   it("validates an intent against the current observations, not just the path", async () => {
@@ -455,19 +407,6 @@ describe("conflict coordinator", () => {
     expect(await instance.list()).toHaveLength(1);
     await instance.handleConflicts([]);
     expect(await instance.list()).toHaveLength(0);
-  });
-
-  it("does not restart sync when status retires a manual conflict and the same old baseline reappears", async () => {
-    env.vault.files.set("note.md", { bytes: new TextEncoder().encode("local\n"), mtime: 50 });
-    remoteBodies.set("note.md", "remote\n");
-    const instance = coordinator();
-    const input = { key: "note.md", previous: previous("note.md", 6, 10, "A"), observedLocal: localEntry("note.md", 6, 50), observedRemote: { key: "note.md", size: 7, etag: "B", lastModified: 1 } };
-    await instance.handleConflicts([input]);
-    const [record] = await instance.list();
-    await instance.clear(record.conflictId, "note.md");
-    await instance.handleConflicts([input]);
-    expect(reconcileReasons).toEqual([]);
-    expect(await instance.list()).toHaveLength(1);
   });
 
   it("survives a remote read failure by staying manual-required", async () => {

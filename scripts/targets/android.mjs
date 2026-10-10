@@ -5,7 +5,7 @@
  *
  *   1. A new `main.js` dropped into an existing plugin directory does **not**
  *      change the code Obsidian runs — plugins are keyed by directory path, and
- *      the loaded bundle is cached per path (see `docs/hot-sync.md`, "部署坑").
+ *      the loaded bundle is cached per path.
  *      `--rotate` installs into a fresh `<pluginId>-deploy-<version>-<stamp>/`
  *      directory and repoints `community-plugins.json`, which is the only
  *      reliable way to make the device execute the new build.

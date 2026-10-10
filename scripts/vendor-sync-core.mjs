@@ -28,7 +28,7 @@
  *   9. Update the hash table in `<consumer>/vendor/README.md`. Hand-written prose and the
  *      "What this revision carries" / "Rebuilding this artifact" sections are left alone —
  *      only the seven rows of the table are rewritten.
- *  10. Smoke test: `node --input-type=module -e "import('@mineral/sync-core/hot-protocol')..."`
+ *  10. Smoke test: import the shared channel contract from the consumer.
  *      from the consumer dir. Bail if the package cannot resolve.
  *
  * Flags:
@@ -316,11 +316,11 @@ await step(
 /* ---- step 9: smoke test the consumer's resolution ------------------------------------- */
 
 if (!args.skipSmoke) {
-  await step("smoke test @mineral/sync-core resolves and exports hotContentHash", async () => {
+  await step("smoke test @mineral/sync-core resolves and exports deriveRemoteChangeChannel", async () => {
     await run("node", [
       "--input-type=module",
       "-e",
-      "import('@mineral/sync-core/hot-protocol').then((m) => { if (typeof m.hotContentHash !== 'function') throw new Error('hotContentHash missing'); console.log('smoke OK'); }).catch((e) => { console.error(e); process.exit(1); });",
+      "import('@mineral/sync-core/channel').then((m) => { if (typeof m.deriveRemoteChangeChannel !== 'function') throw new Error('deriveRemoteChangeChannel missing'); console.log('smoke OK'); }).catch((e) => { console.error(e); process.exit(1); });",
     ], { cwd: consumerDir });
   });
 } else {

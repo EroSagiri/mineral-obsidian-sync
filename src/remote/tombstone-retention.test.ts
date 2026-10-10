@@ -93,7 +93,7 @@ function client(overrides: Partial<R2Client> = {}): { client: R2Client; calls: s
 describe("cleanup", () => {
   const expired = deletion("old.md", ago(TOMBSTONE_RETENTION_MS + 1));
 
-  it("keeps the current deletion even after the retention window", async () => {
+  it("removes the hidden bytes and then the record, for expired content nothing local needs", async () => {
     const logs: string[] = [];
     const { client: subject, calls } = client({
       listTombstones: async () => [expired, deletion("fresh.md", ago(1_000)), deletion("held.md", ago(TOMBSTONE_RETENTION_MS + 1))],
@@ -101,9 +101,14 @@ describe("cleanup", () => {
 
     const result = await pruneExpiredTombstones(subject, { now: NOW, protect: (path) => path === "held.md", debug: (message) => logs.push(message) });
 
-    expect(calls).toEqual(["head:old.md"]);
-    expect(result).toEqual({ removed: 0, retained: 3, objects: 0 });
-    expect(logs).toContain("tombstone cleanup removed=0 retained=3 objects=0");
+    // Bytes first, record second, and only for the one path that was neither protected nor fresh.
+    expect(calls).toEqual(["head:old.md", "object:old.md", "record:old.md"]);
+    // Both counts are reported, because "nothing was old enough" and "everything was protected" are
+    // different situations that look identical from the outside; the object count says how much content
+    // actually left R2.
+    expect(result).toEqual({ removed: 1, retained: 2, objects: 1 });
+    expect(logs).toContain("tombstone cleanup removed=1 retained=2 objects=1");
+    expect(logs.some((line) => line.startsWith("tombstone cleanup object removed path-digest="))).toBe(true);
   });
 
   it("keeps an unexpired record, and its bytes, even when nothing protects it", async () => {
@@ -117,8 +122,8 @@ describe("cleanup", () => {
     // A pending deletion is exactly the case the retention window must not overrule.
     const result = await pruneExpiredTombstones(subject, { now: NOW, protect: (path) => path === "pending.md" });
 
-    expect(result).toEqual({ removed: 0, retained: 2, objects: 0 });
-    expect(calls).toEqual(["head:old.md"]);
+    expect(result).toEqual({ removed: 1, retained: 1, objects: 1 });
+    expect(calls).toEqual(["head:old.md", "object:old.md", "record:old.md"]);
   });
 });
 
@@ -131,7 +136,7 @@ describe("cleanup", () => {
 describe("what may be physically removed", () => {
   const expired = deletion("old.md", ago(TOMBSTONE_RETENTION_MS + 1));
 
-  it("keeps the record when the object is gone because it is the remaining deletion evidence", async () => {
+  it("leaves both alone when the object is gone, and still retires the record", async () => {
     const { client: subject, calls } = client({
       listTombstones: async () => [expired],
       headObject: async (key: string) => { calls.push(`head:${key}`); throw new RemoteHttpError("HeadObject", 404); },
@@ -139,8 +144,9 @@ describe("what may be physically removed", () => {
 
     const result = await pruneExpiredTombstones(subject, { now: NOW, protect: () => false });
 
-    expect(calls).toEqual(["head:old.md"]);
-    expect(result).toEqual({ removed: 0, retained: 1, objects: 0 });
+    // Nothing physical was left to remove, so only the record goes.
+    expect(calls).toEqual(["head:old.md", "record:old.md"]);
+    expect(result).toEqual({ removed: 1, retained: 0, objects: 0 });
   });
 
   it("retires only the record when the path was revived with different content", async () => {
@@ -202,7 +208,7 @@ describe("what may be physically removed", () => {
     expect(calls).toEqual(["head:old.md"]);
   });
 
-  it("never attempts to remove the current bytes or record", async () => {
+  it("keeps the record when the bytes were removed but the record could not be", async () => {
     const { client: subject, calls } = client({
       listTombstones: async () => [expired],
       deleteTombstone: async (record) => { calls.push(`record:${record.path}`); throw new RemoteHttpError("DeleteTombstone", 403); },
@@ -210,8 +216,10 @@ describe("what may be physically removed", () => {
 
     const result = await pruneExpiredTombstones(subject, { now: NOW, protect: () => false });
 
-    expect(calls).toEqual(["head:old.md"]);
-    expect(result).toEqual({ removed: 0, retained: 1, objects: 0 });
+    // "Object gone, record present" is a normal deleted state, so this is a safe place to stop: the next
+    // pass finds nothing to remove physically and retires the record.
+    expect(calls).toEqual(["head:old.md", "object:old.md", "record:old.md"]);
+    expect(result).toEqual({ removed: 1, retained: 0, objects: 1 });
   });
 
   it("is a no-op, not a failure, for a client without the capability", async () => {
@@ -223,19 +231,17 @@ describe("what may be physically removed", () => {
     const logs: string[] = [];
     const { client: subject, calls } = client({
       listTombstones: async () => [expired, deletion("second.md", ago(TOMBSTONE_RETENTION_MS + 1))],
-      headObject: async (key: string) => {
-        calls.push(`head:${key}`);
-        return key === "old.md"
-          ? { key, size: 12, etag: `etag-${key}`, lastModified: RECORD_ACCEPTED_AT - 60_000 }
-          : { key, size: 8, etag: "revived", lastModified: RECORD_ACCEPTED_AT + 60_000 };
+      deleteObject: async (key: string) => {
+        calls.push(`object:${key}`);
+        if (key === "old.md") throw new RemoteHttpError("DeleteObject", 403);
       },
     });
 
     const result = await pruneExpiredTombstones(subject, { now: NOW, protect: () => false, debug: (message) => logs.push(message) });
 
-    // The current deletion stays; the demonstrably revived path loses only stale metadata.
-    expect(calls).toEqual(["head:old.md", "head:second.md", "record:second.md"]);
-    expect(result).toEqual({ removed: 1, retained: 1, objects: 0 });
+    // The failed path keeps both halves and is retried next pass; the other path is unaffected.
+    expect(calls).toEqual(["head:old.md", "object:old.md", "head:second.md", "object:second.md", "record:second.md"]);
+    expect(result).toEqual({ removed: 1, retained: 1, objects: 1 });
     // Only a digest is ever logged, never the path.
     expect(logs.join("\n")).not.toContain("old.md");
   });

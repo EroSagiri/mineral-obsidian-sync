@@ -206,20 +206,21 @@ export class SafeExecutor {
     if (!etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     if (!this.r2.putTombstone) return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
     try {
-      await this.verifyRemoteVersion(operation.key, etag);
+      await this.r2.headObject(operation.key, { ifMatch: etag });
     } catch (error) {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
       return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
     }
     const record: RemoteTombstone = { protocol: TOMBSTONE_PROTOCOL, path: operation.key, deletedRemoteETag: etag, createdAt: new Date().toISOString() };
     try {
-      if (this.r2.recycleObject) await this.r2.recycleObject(record);
-      else await this.r2.putTombstone(record);
-      // The immutable tombstone preserves deletion identity after the source moves to versions.
-      // Baseline pruning below decides whether the whole operation may be reported as applied.
+      await this.r2.putTombstone(record);
+      // The tombstone is the durable half of this deletion: the object deliberately stays where it is,
+      // and this immutable record is what makes every later reader see "deleted" rather than "never
+      // existed". Logged as soon as the PUT landed, because that is the R2 fact; the baseline pruning
+      // below decides whether the operation as a whole may be reported as applied.
       this.log(`local delete landed path-digest=${pathDigest(operation.key)} tombstone=written`);
     } catch (error) {
-      // Archive, tombstone and source removal are separate requests; failure can be partial.
+      // A received 4xx means no record was accepted; a transport failure or 5xx remains ambiguous.
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
       return uploadFailure("PutObject tombstone", operation.key, error);
     }
@@ -322,7 +323,7 @@ export class SafeExecutor {
   private async acceptRemoteDelete(operation: Extract<SyncOperation, { type: "resolve-accept-remote-delete" }>): Promise<OperationResult> {
     // Reconfirm the physical object still is the version named by the tombstone. A later B object
     // survives tombstone(A), and must also stop an old "accept delete" click from trashing local B.
-    if (operation.expectedDeletion.objectPresent) try { await this.verifyRemoteVersion(operation.key, operation.expectedDeletion.deletedRemoteETag); }
+    if (operation.expectedDeletion.objectPresent) try { await this.r2.headObject(operation.key, { ifMatch: operation.expectedDeletion.deletedRemoteETag }); }
     catch (error) {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "conflict-superseded" };
       return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
@@ -377,12 +378,6 @@ export class SafeExecutor {
    */
   private landed(result: Extract<OperationResult, { status: "unresolved" | "partial" }>, remote: RemoteVersion): OperationResult {
     return { ...result, remote };
-  }
-
-  /** A delete needs only the conditional verdict; object metadata belongs to observation, not mutation. */
-  private async verifyRemoteVersion(key: string, etag: string): Promise<void> {
-    if (this.r2.verifyObjectVersion) return this.r2.verifyObjectVersion(key, etag);
-    await this.r2.headObject(key, { ifMatch: etag });
   }
 
   private async commit(entry: PreviousEntry): Promise<Extract<OperationResult, { status: "unresolved" }> | undefined> {

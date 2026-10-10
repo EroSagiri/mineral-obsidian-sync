@@ -78,12 +78,7 @@ export class ConflictCoordinator {
    * The proposals the next plan may act on. Synchronous by design: `buildSyncPlan` must not do I/O,
    * and this map was computed from a real, completed cycle's observations.
    */
-  resolutions(): Map<string, { intent: ResolutionIntent }> { return new Map([...this.active].filter(([, proposal]) => !proposal.intent.hotResolution)); }
-
-  /** Validate persisted choices before planning, while an inferred delete can still be prevented. */
-  async refreshResolutionIntents(observations: ConflictDetectionInput[]): Promise<void> {
-    await this.refreshValidIntents(new Map(observations.map(input => [input.key, input])), new Set(observations.map(input => input.key)));
-  }
+  resolutions(): Map<string, { intent: ResolutionIntent }> { return this.active; }
 
   /** The conflict records the resolver UI should show. */
   async list(): Promise<ConflictRecord[]> {
@@ -102,18 +97,11 @@ export class ConflictCoordinator {
    * Called once per cycle with the conflicts the planner produced. Returns the intents that are valid
    * for the current observations, which the next cycle's planner is allowed to act on.
    */
-  async handleConflicts(conflicts: ConflictDetectionInput[], observedPaths?: readonly string[]): Promise<void> {
+  async handleConflicts(conflicts: ConflictDetectionInput[]): Promise<void> {
     if (!this.dependencies.channel) return;
     const active = new Map<string, string>();
-    const observed = observedPaths === undefined ? undefined : new Set(observedPaths);
-    // Deferred or unobserved paths have supplied no evidence that their disagreement disappeared.
-    if (observed) {
-      for (const record of await this.dependencies.conflicts.listConflicts(this.dependencies.channel)) {
-        if (!observed.has(record.path)) active.set(record.path, record.conflictId);
-      }
-    }
-    // Only an actionable resolution needs another cycle. The status is refreshed by this cycle;
-    // recording a manual conflict must not become its own source of reconciliation requests.
+    // Both outcomes need a follow-up cycle: a recorded conflict (so the user sees it, and so the
+    // intent list is refreshed) and an automatic merge (so the planner can actually apply it).
     let followUp = false;
     for (const conflict of conflicts) {
       const record = await this.inspect(conflict);
@@ -137,12 +125,13 @@ export class ConflictCoordinator {
       this.attempted.add(record.conflictId);
       await this.safePutConflict(record);
       this.dependencies.debug?.(`conflict detected path-hash=${shortConflictId(record.conflictId)} base=${record.snapshot.baseAvailable ? "available" : "unavailable"} autoMerge=${record.autoMergeStatus}`);
+      followUp = true;
     }
     // Only conflicts that are still active survive; a superseded identity is dropped so a stale user
     // decision can never be applied to it later.
     try { await this.dependencies.conflicts.reconcile(this.dependencies.channel, active); } catch { this.dependencies.debug?.("conflict store reconcile failed"); }
     // Refresh the proposals the *next* plan may apply, from this cycle's real observations.
-    const intentBecameValid = await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])), observed);
+    const intentBecameValid = await this.refreshValidIntents(new Map(conflicts.map((conflict) => [conflict.key, conflict])));
     // A manual choice is persisted between cycles. Its first follow-up cycle is deliberately still
     // a conflict while this method validates it against fresh observations; now that it is valid,
     // schedule one immediate *additional* cycle for the planner to execute it. Without this, the
@@ -152,14 +141,12 @@ export class ConflictCoordinator {
   }
 
   /** Reads the intents that match the current observations and caches them for the planner. */
-  private async refreshValidIntents(observations: Map<string, ConflictDetectionInput>, observed?: Set<string>): Promise<boolean> {
+  private async refreshValidIntents(observations: Map<string, ConflictDetectionInput>): Promise<boolean> {
     const previouslyActive = new Map(this.active);
     this.active.clear();
-    if (observed) for (const [path, proposal] of previouslyActive) if (!observed.has(path)) this.active.set(path, proposal);
     if (!this.dependencies.channel) return false;
     const stale: string[] = [];
     for (const intent of await this.intents()) {
-      if (intent.hotResolution) continue;
       const observation = observations.get(intent.path);
       if (!observation) continue;
       const currentId = await this.identityOf(observation);
@@ -221,19 +208,14 @@ export class ConflictCoordinator {
    */
   private async inspect(input: ConflictDetectionInput): Promise<ConflictRecord | undefined> {
     const { key, previous, observedLocal, observedRemote, observedRemoteDeletion } = input;
-    if (!observedLocal && !observedRemote) return undefined;
+    if (!previous || (!observedLocal && !observedRemote)) return undefined;
     const conflictId = await this.identityOf(input);
-    // A first-sync disagreement has no ancestor, but it still has an exact observed pair that a user
-    // decision can be bound to. Using that pair as the record's decision identity does not invent a
-    // sync baseline: only the executor commits one, after a conditional resolution actually lands.
-    const decisionLocal = previous?.local ? { key, size: previous.local.size, mtime: previous.local.mtime } : observedLocal;
-    if (!decisionLocal) return undefined;
     const base: ConflictRecord = {
       protocolVersion: CONFLICT_PROTOCOL_VERSION,
       conflictId,
       channel: this.dependencies.channel,
       path: key,
-      previous: { localVersion: decisionLocal, remoteETag: previous?.remote?.etag ?? observedRemote?.etag },
+      previous: { localVersion: previous.local ? { key, size: previous.local.size, mtime: previous.local.mtime } : observedLocal!, remoteETag: previous.remote?.etag },
       observedLocal,
       observedRemoteETag: observedRemote?.etag,
       observedRemoteDeletion,
@@ -249,29 +231,6 @@ export class ConflictCoordinator {
     // must not even be read.
     if (!isMergeablePath(key)) return { ...base, autoMergeStatus: "unsupported", reason: "only markdown and plain-text files are merged automatically" };
     if (observedLocal.size > MAX_MERGEABLE_BYTES || observedRemote.size > MAX_MERGEABLE_BYTES) return { ...base, autoMergeStatus: "too-large", reason: `larger than the ${MAX_MERGEABLE_BYTES} byte merge ceiling` };
-
-    // With no common ancestor, automatic merging would be guesswork. Read both bounded text snapshots
-    // so the resolver can show the real alternatives, but require an explicit keep-local/keep-remote
-    // choice. The intent is still tied to `conflictId`, so either side moving invalidates the click.
-    if (!previous) {
-      const localBytes = await this.readLocal(key);
-      if (!localBytes) return { ...base, autoMergeStatus: "base-unavailable", reason: "the local file could not be read" };
-      let remoteBytes: Uint8Array;
-      try { remoteBytes = new Uint8Array(await this.dependencies.client.getObject(key, { ifMatch: observedRemote.etag })); }
-      catch (error) {
-        if (error instanceof RemoteObjectChangedError) return { ...base, autoMergeStatus: "manual-required", reason: "the remote changed while the conflict was being examined" };
-        if (error instanceof RemoteHttpError) return { ...base, autoMergeStatus: "manual-required", reason: `the remote snapshot could not be read (HTTP ${error.status})` };
-        return { ...base, autoMergeStatus: "manual-required", reason: "the remote snapshot could not be read" };
-      }
-      const local = decodeText(localBytes), remote = decodeText(remoteBytes);
-      if (!local || !remote) return { ...base, autoMergeStatus: "decode-failed", reason: "one side is not valid UTF-8 text" };
-      return {
-        ...base,
-        autoMergeStatus: "manual-required",
-        reason: "both sides exist but no common sync baseline is available",
-        snapshot: { baseAvailable: false, local: local.text, remote: remote.text },
-      };
-    }
 
     let snapshot: MergeBaseRecord | undefined;
     try { snapshot = await this.dependencies.mergeBase.get(this.dependencies.channel, key); }

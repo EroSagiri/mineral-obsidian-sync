@@ -1,7 +1,7 @@
 import type { RemoteChange } from "@mineral/sync-core/sync-change";
 import { RemoteHttpError } from "../remote/errors";
 import type { R2Client } from "../remote/r2-client";
-import { parseTombstone, tombstoneReadKeys } from "../remote/tombstones";
+import { parseTombstone, tombstoneKey } from "../remote/tombstones";
 import { canonicalKey } from "./path";
 import type { LocalEntry, PreviousEntry, RemoteDeletionIdentity, RemoteEntry } from "./types";
 
@@ -55,15 +55,12 @@ export interface RemoteDeltaObservations {
  * alone until one runs; it never errs towards resurrecting something.
  */
 export async function findLogicallyDeleted(client: R2Client, key: string, etag: string): Promise<RemoteDeletionIdentity | undefined> {
-  for (const metadataKey of await tombstoneReadKeys(key, etag)) {
-    let body: ArrayBuffer;
-    try { body = await client.getObject(metadataKey); }
-    catch (error) { if (error instanceof RemoteHttpError && error.status === 404) continue; throw error; }
-    const record = parseTombstone(body);
-    if (record.path !== key || record.deletedRemoteETag !== etag) throw new Error("Tombstone does not describe the object it was looked up for");
-    return { path: key, deletedRemoteETag: etag, createdAt: record.createdAt, objectPresent: true };
-  }
-  return undefined;
+  let body: ArrayBuffer;
+  try { body = await client.getObject(await tombstoneKey(key, etag)); }
+  catch (error) { if (error instanceof RemoteHttpError && error.status === 404) return undefined; throw error; }
+  const record = parseTombstone(body);
+  if (record.path !== key || record.deletedRemoteETag !== etag) throw new Error("Tombstone does not describe the object it was looked up for");
+  return { path: key, deletedRemoteETag: etag, createdAt: record.createdAt, objectPresent: true };
 }
 
 /**
@@ -149,56 +146,12 @@ function deletedObservation(key: string, objectETag: string | undefined, objectM
     : { key, size: 0, lastModified: objectModified ?? baselineModified ?? 0, deleted: { path: key, deletedRemoteETag: objectETag, objectPresent: true } };
 }
 
-/**
- * Materialises a Gateway fact whose ETag is already known without depending on optional HEAD metadata.
- * Mutation-journal events always carry an ETag and normally a size; when the size is absent, one
- * conditional GET both proves the version and supplies it. A timestamp omitted by the writer is not
- * invented: the last accepted baseline is retained, or zero keeps timing-based auto-merge conservative.
- */
-async function knownVersion(
-  client: R2Client,
-  key: string,
-  change: { etag?: string; size?: number; modified?: string },
-  baseline: PreviousEntry | undefined,
-): Promise<RemoteEntry> {
-  if (!change.etag) return client.headObject(key);
-  const modified = change.modified ? Date.parse(change.modified) : NaN;
-  if (typeof change.size === "number" && Number.isFinite(change.size)) {
-    // A complete journal fact needs no observation request. When only the timestamp is omitted, assert
-    // the ETag with a metadata-free conditional HEAD before accepting the remaining fields.
-    if (!Number.isFinite(modified)) {
-      if (client.verifyObjectVersion) await client.verifyObjectVersion(key, change.etag);
-      else await client.getObject(key, { ifMatch: change.etag });
-    }
-    return { key, etag: change.etag, size: change.size, lastModified: Number.isFinite(modified) ? modified : baseline?.remote?.lastModified ?? 0 };
-  }
-  const body = await client.getObject(key, { ifMatch: change.etag });
-  return { key, etag: change.etag, size: body.byteLength, lastModified: Number.isFinite(modified) ? modified : baseline?.remote?.lastModified ?? 0 };
-}
-
 export async function observeRemoteDelta(changes: readonly RemoteChange[], dependencies: RemoteDeltaDependencies): Promise<RemoteDeltaObservations> {
   const keys = deltaKeys(changes);
   const remote = new Map<string, RemoteEntry>();
   // Read the baseline store once, before any per-path request: a deletion is measured against the
   // baseline for its path, and loading the store per deleted path would turn one delta into N reads.
   const all = await dependencies.loadPrevious();
-  const local = new Map<string, LocalEntry>();
-  for (const key of keys) {
-    if (dependencies.ignores(key)) continue;
-    const stat = await dependencies.statLocal(key);
-    if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
-  }
-
-  const observeLive = async (key: string, change: { etag?: string; size?: number; modified?: string }): Promise<RemoteEntry> => {
-    const entry = await knownVersion(dependencies.client, key, change, all.get(key));
-    // A delayed put/rename notification can arrive after its exact revision was tombstoned. Only the
-    // locally absent case can resurrect a note, so pay for the exact tombstone GET only there.
-    if (!local.has(key) && entry.etag) {
-      const deletion = await findLogicallyDeleted(dependencies.client, key, entry.etag);
-      if (deletion) return deletedObservation(key, entry.etag, Date.parse(deletion.createdAt ?? "") || entry.lastModified, all.get(key)?.remote?.lastModified);
-    }
-    return entry;
-  };
 
   for (const change of changes) {
     if (change.op === "rename") {
@@ -206,36 +159,30 @@ export async function observeRemoteDelta(changes: readonly RemoteChange[], depen
       // carries no version identity, exactly like a delete whose object is already gone.
       remote.delete(canonicalKey(change.from));
       const key = canonicalKey(change.to);
-      if (!dependencies.ignores(key)) remote.set(key, await observeLive(key, change));
+      if (!dependencies.ignores(key)) remote.set(key, await dependencies.client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
       continue;
     }
     const key = canonicalKey(change.path);
     if (dependencies.ignores(key)) continue;
     if (change.op === "delete") {
       let present: RemoteEntry | undefined;
-      if (!change.etag) {
-        try { present = await dependencies.client.headObject(key); }
-        catch (error) { if (!(error instanceof RemoteHttpError && error.status === 404)) throw error; }
-      }
-      const deletedETag = change.etag ?? present?.etag;
-      if (!deletedETag) {
-        remote.set(key, deletedObservation(key, undefined, present?.lastModified, all.get(key)?.remote?.lastModified));
-        continue;
-      }
-      // A logical delete is accepted only when its immutable record names the exact version carried
-      // by the event (or by the one exact HEAD used for legacy events). Missing/malformed metadata
-      // makes this incremental observation incomplete, so the scheduler falls back to reconciliation.
-      const deletion = await findLogicallyDeleted(dependencies.client, key, deletedETag);
-      if (!deletion) throw new Error("Delete event has no matching tombstone");
-      remote.set(key, {
-        key,
-        size: 0,
-        lastModified: Date.parse(deletion.createdAt ?? "") || all.get(key)?.remote?.lastModified || present?.lastModified || 0,
-        deleted: deletion,
-      });
+      try { present = await dependencies.client.headObject(key); }
+      catch (error) { if (!(error instanceof RemoteHttpError && error.status === 404)) throw error; }
+      remote.set(key, deletedObservation(key, present?.etag, present?.lastModified, all.get(key)?.remote?.lastModified));
       continue;
     }
-    remote.set(key, await observeLive(key, change));
+    // A complete put fact avoids another request. Any omitted field is filled by one exact HEAD, and
+    // the event's ETag is still asserted when it supplied one, so a stale event cannot be recorded.
+    const modified = change.modified ? Date.parse(change.modified) : NaN;
+    if (change.etag && typeof change.size === "number" && Number.isFinite(modified)) remote.set(key, { key, etag: change.etag, size: change.size, lastModified: modified });
+    else remote.set(key, await dependencies.client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
+  }
+
+  const local = new Map<string, LocalEntry>();
+  for (const key of keys) {
+    if (dependencies.ignores(key)) continue;
+    const stat = await dependencies.statLocal(key);
+    if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
   }
   return { local, remote, previous: usableBaselines(keys, all, dependencies) };
 }

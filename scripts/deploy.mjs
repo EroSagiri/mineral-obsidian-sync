@@ -63,7 +63,7 @@ Options:
   --dry-run                         Print every action without building or writing.
   --force                           Push even when the device already has the same bytes.
   --rotate                          Install into a fresh plugin folder (Android default
-                                    when --restart is on; see docs/hot-sync.md).
+                                    when --restart is on).
   --no-rotate                       Install into the plain "<pluginId>" folder.
   --prune                           Remove other enabled Android plugin folders that
                                     declare the same plugin id (destructive).
@@ -277,7 +277,7 @@ async function main() {
  * `--rotate` installs into a fresh, uniquely named folder. This is required for
  * Android in practice: Obsidian keys loaded plugins by folder path, so overwriting
  * `main.js` in place leaves the old code running until the plugin is manually
- * disabled and re-enabled (see docs/hot-sync.md). Rotation is therefore the
+ * disabled and re-enabled. Rotation is therefore the
  * default for Android when a restart was requested, and can be forced either way.
  */
 function resolveInstallFolder(config, manifest) {

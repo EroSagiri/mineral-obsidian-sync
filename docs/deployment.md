@@ -101,7 +101,7 @@ npm run deploy:android:restart
 
 ### 为什么不是一句 `adb push`
 
-把新的 `main.js` 推进**已存在**的插件目录，**不会**改变 Android Obsidian 实际运行的代码——插件按目录路径缓存已加载的 bundle（见 [`hot-sync.md`](hot-sync.md) 的"部署坑"）。磁盘上的 manifest 是 0.4.x、`main.js` 里确实是新代码，而运行中的插件仍然报告旧版本、命令列表里没有新命令。
+把新的 `main.js` 推进**已存在**的插件目录，**不会**改变 Android Obsidian 实际运行的代码——插件按目录路径缓存已加载的 bundle。磁盘上的 manifest 是新版本、`main.js` 里确实是新代码，而运行中的插件仍然报告旧版本、命令列表里没有新命令。
 
 因此脚本做了两件事：
 
