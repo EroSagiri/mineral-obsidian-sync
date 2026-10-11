@@ -24,7 +24,7 @@ describe("sync status mapping", () => {
     expect(presentation.tone).toBe("idle");
     expect(presentation.spinning).toBe(false);
     expect(presentation.badge).toBeUndefined();
-    expect(presentation.tooltip).toBe("Mineral Sync\nUp to date");
+    expect(presentation.tooltip).toBe("Mineral Sync\n已是最新");
     expect(presentation.icon).toBe(SYNC_STATUS_ICON);
 
     const host = render(input());
@@ -38,7 +38,7 @@ describe("sync status mapping", () => {
       const presentation = presentSyncStatus(input({ state }));
       expect(presentation.tone).toBe("waiting");
       expect(presentation.spinning).toBe(false);
-      expect(presentation.tooltip).toContain("Waiting for changes to settle");
+      expect(presentation.tooltip).toContain("等待变更稳定");
       expect(status(render(input({ state }))).classes.has("mineral-sync-status--waiting")).toBe(true);
     }
   });
@@ -47,7 +47,7 @@ describe("sync status mapping", () => {
     const presentation = presentSyncStatus(input({ state: "running" }));
     expect(presentation.tone).toBe("syncing");
     expect(presentation.spinning).toBe(true);
-    expect(presentation.tooltip).toBe("Mineral Sync\nSyncing…");
+    expect(presentation.tooltip).toBe("Mineral Sync\n正在同步…");
     expect(status(render(input({ state: "running" }))).classes.has("is-spinning")).toBe(true);
   });
 
@@ -56,8 +56,8 @@ describe("sync status mapping", () => {
     expect(presentation.tone).toBe("conflict");
     expect(presentation.badge).toBe("3");
     expect(presentation.spinning).toBe(false);
-    expect(presentation.tooltip).toContain("3 conflicts need attention");
-    expect(presentation.tooltip).toContain("Click to resolve");
+    expect(presentation.tooltip).toContain("3 个冲突需要处理");
+    expect(presentation.tooltip).toContain("点击解决");
 
     const host = render(input({ state: "running", conflictCount: 3 }));
     expect(status(host).classes.has("mineral-sync-status--conflict")).toBe(true);
@@ -66,17 +66,16 @@ describe("sync status mapping", () => {
     expect(host.allText).toBe("3");
   });
 
-  it("says conflict, not conflict, for exactly one", () => {
+  it("uses the same Chinese plural form for one conflict", () => {
     const presentation = presentSyncStatus(input({ conflictCount: 1 }));
-    expect(presentation.tooltip).toContain("1 conflict need");
-    expect(presentation.tooltip).not.toContain("conflicts");
+    expect(presentation.tooltip).toContain("1 个冲突需要处理");
   });
 
   it("shows offline as red and still", () => {
     const presentation = presentSyncStatus(input({ lastFailureClass: "retryable" }));
     expect(presentation.tone).toBe("offline");
     expect(presentation.spinning).toBe(false);
-    expect(presentation.tooltip).toContain("Offline");
+    expect(presentation.tooltip).toContain("离线");
     expect(status(render(input({ lastFailureClass: "retryable" }))).classes.has("mineral-sync-status--offline")).toBe(true);
   });
 
@@ -88,7 +87,7 @@ describe("sync status mapping", () => {
     const rejected = presentSyncStatus(input({ state: "blocked-by-auth" }));
     expect(rejected.tone).toBe("error");
     expect(rejected.badge).toBe("!");
-    expect(rejected.tooltip).toContain("credentials");
+    expect(rejected.tooltip).toContain("凭据");
 
     const refused = presentSyncStatus(input({ lastFailureClass: "stable" }));
     expect(refused.tone).toBe("error");
@@ -113,7 +112,7 @@ describe("sync status mapping", () => {
   it("carries the tooltip in the attribute Obsidian reads, and colours by variables only", () => {
     const host = render(input({ conflictCount: 2 }));
     const root = status(host);
-    expect(root.getAttribute("aria-label")).toBe("Mineral Sync\n2 conflicts need attention\nClick to resolve");
+    expect(root.getAttribute("aria-label")).toBe("Mineral Sync\n2 个冲突需要处理\n点击解决");
     expect(root.getAttribute("data-tooltip-position")).toBe("top");
   });
 

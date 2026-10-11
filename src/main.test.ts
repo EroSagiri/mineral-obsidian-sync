@@ -369,7 +369,7 @@ describe("status bar wiring", () => {
     env.plugin.setSchedulerStatus("idle", counts({ unresolved: 1 }));
     const root = host.find((element) => element.classes.has("mineral-sync-status--offline"));
     expect(root).toBeDefined();
-    expect(root!.getAttribute("aria-label")).toContain("Offline");
+    expect(root!.getAttribute("aria-label")).toContain("离线");
     // Nothing readable in the bar itself: the state is carried by the colour.
     expect(host.visibleText).toBe("");
   });
@@ -379,7 +379,7 @@ describe("status bar wiring", () => {
     env.plugin.lastConflictCount = 4;
     env.plugin.setSchedulerStatus("debouncing", counts());
     const root = host.find((element) => element.classes.has("mineral-sync-status"))!;
-    expect(root.getAttribute("aria-label")).toContain("4 conflicts need attention");
+    expect(root.getAttribute("aria-label")).toContain("4 个冲突需要处理");
     // The bar itself carries no sentence; the facts are one right-click away.
     expect(host.visibleText).toBe("4");
 
@@ -745,7 +745,7 @@ describe("restoring an earlier version", () => {
 
     await env.plugin.openSyncHistory();
 
-    expect((Notice as unknown as { shown: string[] }).shown.join("\n")).toContain("sync history needs");
+    expect((Notice as unknown as { shown: string[] }).shown.join("\n")).toContain("同步历史需要先配置");
   });
 
   it("is reachable from the status bar's secondary click", async () => {
@@ -758,7 +758,7 @@ describe("restoring an earlier version", () => {
     env.plugin.openStatusMenu({ preventDefault: () => {} } as unknown as MouseEvent);
 
     const items = menus.shown[menus.shown.length - 1]!.items;
-    expect(items.map((item) => item.title)).toEqual(["Sync history", "Status details"]);
+    expect(items.map((item) => item.title)).toEqual(["同步历史", "状态详情"]);
     items[0]!.callback();
     expect(opened).toBe(1);
   });

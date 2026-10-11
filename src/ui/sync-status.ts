@@ -1,5 +1,6 @@
 import { setIcon } from "obsidian";
 import type { FailureClass, ResultCounts, SchedulerState } from "../scheduler/types";
+import { t } from "../lang";
 
 /**
  * The status bar's whole job: one icon that says what Mineral Sync is doing.
@@ -53,8 +54,6 @@ export interface SyncStatusPresentation {
   action: "resolve-conflicts" | "sync-now";
 }
 
-const plural = (count: number): string => (count === 1 ? "" : "s");
-
 /**
  * Priority, highest first: conflict, then offline/error, then syncing, then waiting, then idle.
  *
@@ -66,38 +65,38 @@ export function presentSyncStatus(input: SyncStatusInput): SyncStatusPresentatio
   if (conflicts > 0) {
     return {
       tone: "conflict", icon: SYNC_STATUS_ICON, spinning: false, badge: String(conflicts),
-      tooltip: `Mineral Sync\n${conflicts} conflict${plural(conflicts)} need attention\nClick to resolve`,
+      tooltip: `Mineral Sync\n${t("status.conflicts", { count: conflicts })}\n${t("status.clickToResolve")}`,
       action: "resolve-conflicts",
     };
   }
   if (input.state === "blocked-by-auth") {
     return {
       tone: "error", icon: SYNC_STATUS_ICON, spinning: false, badge: "!",
-      tooltip: "Mineral Sync\nSync error\nR2 rejected the stored credentials\nCheck the plugin settings",
+      tooltip: `Mineral Sync\n${t("status.syncError")}\n${t("status.authRejected")}\n${t("status.checkSettings")}`,
       action: "sync-now",
     };
   }
   if ((input.counts.unresolved ?? 0) > 0 || input.lastFailureClass === "retryable") {
     return {
       tone: "offline", icon: SYNC_STATUS_ICON, spinning: false,
-      tooltip: "Mineral Sync\nOffline\nChanges will sync when the connection resumes",
+      tooltip: `Mineral Sync\n${t("status.offline")}\n${t("status.resumesWhenOnline")}`,
       action: "sync-now",
     };
   }
   if (input.lastFailureClass === "stable" || (input.counts.failed ?? 0) > 0) {
     return {
       tone: "error", icon: SYNC_STATUS_ICON, spinning: false, badge: "!",
-      tooltip: "Mineral Sync\nSync error\nSome files could not be synced\nClick to retry",
+      tooltip: `Mineral Sync\n${t("status.syncError")}\n${t("status.someFilesFailed")}\n${t("status.clickToRetry")}`,
       action: "sync-now",
     };
   }
   if (input.state === "running") {
-    return { tone: "syncing", icon: SYNC_STATUS_ICON, spinning: true, tooltip: "Mineral Sync\nSyncing…", action: "sync-now" };
+    return { tone: "syncing", icon: SYNC_STATUS_ICON, spinning: true, tooltip: `Mineral Sync\n${t("status.syncing")}`, action: "sync-now" };
   }
   if (input.state === "debouncing" || input.state === "rerun-pending") {
-    return { tone: "waiting", icon: SYNC_STATUS_ICON, spinning: false, tooltip: "Mineral Sync\nWaiting for changes to settle…", action: "sync-now" };
+    return { tone: "waiting", icon: SYNC_STATUS_ICON, spinning: false, tooltip: `Mineral Sync\n${t("status.waiting")}`, action: "sync-now" };
   }
-  return { tone: "idle", icon: SYNC_STATUS_ICON, spinning: false, tooltip: "Mineral Sync\nUp to date", action: "sync-now" };
+  return { tone: "idle", icon: SYNC_STATUS_ICON, spinning: false, tooltip: `Mineral Sync\n${t("status.upToDate")}`, action: "sync-now" };
 }
 
 /**

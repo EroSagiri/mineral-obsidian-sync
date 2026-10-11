@@ -42,6 +42,7 @@ import { SYNC_HISTORY_CSS } from "./ui/history-styles";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
+import { pickLocaleFromMoment, setLocale as setLangLocale, t } from "./lang";
 
 type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
 
@@ -134,13 +135,17 @@ export default class R2PersonalSyncPlugin extends Plugin {
       ...current,
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
+    try {
+      const locale = (this.app as unknown as { moment?: { locale: () => string } }).moment?.locale?.();
+      setLangLocale(pickLocaleFromMoment(locale));
+    } catch { /* Chinese is the default locale. */ }
     this.addSettingTab(new R2SyncSettingTab(this.app, this));
-    this.addCommand({ id: "r2-sync-inspect-state", name: "Mineral Sync: Inspect Sync State", callback: () => this.inspectSyncState() });
-    this.addCommand({ id: "r2-sync-test-connection", name: "R2 Sync: Test Connection", callback: () => this.testConnection() });
-    this.addCommand({ id: "r2-sync-now", name: "Mineral Sync: Sync Now", callback: () => this.scheduler?.requestReconcile("manual") });
-    this.addCommand({ id: "r2-sync-gateway-status", name: "Mineral Sync: Gateway Status", callback: () => this.reportGatewayStatus() });
-    this.addCommand({ id: "r2-sync-resolve-conflicts", name: "Mineral Sync: Resolve Conflicts", callback: () => this.openConflictResolver() });
-    this.addCommand({ id: "r2-sync-history", name: "Mineral Sync: Open Sync History", callback: () => this.openSyncHistory() });
+    this.addCommand({ id: "r2-sync-inspect-state", name: t("command.inspect"), callback: () => this.inspectSyncState() });
+    this.addCommand({ id: "r2-sync-test-connection", name: t("command.testConnection"), callback: () => this.testConnection() });
+    this.addCommand({ id: "r2-sync-now", name: t("command.syncNow"), callback: () => this.scheduler?.requestReconcile("manual") });
+    this.addCommand({ id: "r2-sync-gateway-status", name: t("command.gatewayStatus"), callback: () => this.reportGatewayStatus() });
+    this.addCommand({ id: "r2-sync-resolve-conflicts", name: t("command.resolveConflicts"), callback: () => this.openConflictResolver() });
+    this.addCommand({ id: "r2-sync-history", name: t("command.openHistory"), callback: () => this.openSyncHistory() });
     // Development-only diagnostics: never registered, and not even bundled, in production.
     if (__DEV__) {
       registerDevelopmentSelfTests({
@@ -294,9 +299,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   async reportGatewayStatus(): Promise<void> {
     const { config, connection } = this.gatewayDiagnostics();
-    if (config.kind === "disabled") { new Notice("Mineral Sync: Sync Gateway is disabled. Cold sync is unaffected."); return; }
-    if (config.kind === "misconfigured") { new Notice(`Mineral Sync: Sync Gateway is misconfigured (${config.reason}). Cold sync is unaffected.`); return; }
-    if (!connection) { new Notice("Mineral Sync: Sync Gateway has not started yet."); return; }
+    if (config.kind === "disabled") { new Notice(t("notice.gatewayDisabled")); return; }
+    if (config.kind === "misconfigured") { new Notice(t("notice.gatewayMisconfigured", { reason: config.reason })); return; }
+    if (!connection) { new Notice(t("notice.gatewayNotStarted")); return; }
     const lines = [
       `channel ${connection.channelFingerprint ?? "n/a"}`,
       `state ${connection.state}`,
@@ -306,7 +311,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     ];
     if (connection.lastErrorKind) lines.push(`last error ${connection.lastErrorKind}${connection.lastStatus ? ` (HTTP ${connection.lastStatus})` : ""}`);
     this.debug(`gateway status ${lines.join(" · ")}`);
-    new Notice(`Mineral Sync Gateway — ${lines.join(" · ")}`);
+    new Notice(t("notice.gatewayReport", { lines: lines.join(" · ") }));
   }
 
   private onVisibilityChanged(visible: boolean): void {
@@ -436,8 +441,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   private openStatusMenu(event: MouseEvent): void {
     const menu = new Menu();
-    menu.addItem((item) => item.setTitle("Sync history").setIcon("history").onClick(() => void this.openSyncHistory()));
-    menu.addItem((item) => item.setTitle("Status details").setIcon("info").onClick(() => this.reportStatusDetails()));
+    menu.addItem((item) => item.setTitle(t("statusMenu.history")).setIcon("history").onClick(() => void this.openSyncHistory()));
+    menu.addItem((item) => item.setTitle(t("statusMenu.details")).setIcon("info").onClick(() => this.reportStatusDetails()));
     menu.showAtMouseEvent(event);
   }
 
@@ -451,7 +456,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   private async openSyncHistory(): Promise<void> {
     const channel = this.currentChannel() ?? await this.resolveChannel();
-    if (!channel) { new Notice("Mineral Sync: sync history needs a configured endpoint and bucket."); return; }
+    if (!channel) { new Notice(t("notice.historyNeedsConfig")); return; }
     new SyncHistoryModal(this.app, {
       list: () => this.history.list(channel),
       restore: (input) => this.restoreFromHistory(input),
@@ -474,7 +479,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     if (diagnostics?.pendingDirtyCount) lines.push(`pending local paths ${diagnostics.pendingDirtyCount}`);
     if (diagnostics?.pendingRemoteDeltaCount) lines.push(`pending remote deltas ${diagnostics.pendingRemoteDeltaCount}`);
     this.debug(`status details ${lines.join(" · ")}`);
-    new Notice(`Mineral Sync — ${lines.join("\n")}`);
+    new Notice(t("notice.statusDetails", { lines: lines.join("\n") }));
   }
   private registerVaultListeners(): void {
     const mark = (path: string) => this.scheduler?.markLocalPaths([path], (key) => createVaultPathFilter(this.settings).ignores(key));
@@ -984,11 +989,11 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
 
   async testConnection(): Promise<void> {
-    try { const remote = await scanRemote(this.client(), createVaultPathFilter(this.settings)); new Notice(`R2 connection succeeded: ${remote.size} sync-eligible object(s) visible.`); }
+    try { const remote = await scanRemote(this.client(), createVaultPathFilter(this.settings)); new Notice(t("notice.r2ConnectionOk", { count: remote.size })); }
     catch (error) {
       const diagnostic = this.safeConnectionDiagnostic(error);
       console.error("[Mineral Obsidian Sync] R2 connection failed", diagnostic);
-      new Notice(`R2 connection failed: ${diagnostic}`);
+      new Notice(t("notice.r2ConnectionFailed", { diagnostic }));
     }
   }
 
@@ -1019,7 +1024,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     } catch (error) {
       console.error("[Mineral Obsidian Sync] sync inspection failed", error instanceof Error ? error.message : "unknown error");
       this.showErrorStatus("Sync inspection failed");
-      new Notice("Sync inspection failed. Check settings, network, and R2 access.");
+      new Notice(t("notice.inspectFailed"));
     } finally { if (this.activeAnalysis === controller) this.activeAnalysis = undefined; this.scheduler?.refreshStatus(); }
   }
 }
