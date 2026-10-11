@@ -42,7 +42,7 @@ import { SYNC_HISTORY_CSS } from "./ui/history-styles";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
-import { pickLocaleFromMoment, setLocale as setLangLocale, t } from "./lang";
+import { t } from "./lang";
 
 type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
 
@@ -135,10 +135,6 @@ export default class R2PersonalSyncPlugin extends Plugin {
       ...current,
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
-    try {
-      const locale = (this.app as unknown as { moment?: { locale: () => string } }).moment?.locale?.();
-      setLangLocale(pickLocaleFromMoment(locale));
-    } catch { /* Chinese is the default locale. */ }
     this.addSettingTab(new R2SyncSettingTab(this.app, this));
     this.addCommand({ id: "r2-sync-inspect-state", name: t("command.inspect"), callback: () => this.inspectSyncState() });
     this.addCommand({ id: "r2-sync-test-connection", name: t("command.testConnection"), callback: () => this.testConnection() });
