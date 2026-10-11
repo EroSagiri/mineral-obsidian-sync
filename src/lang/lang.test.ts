@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { pickLocaleFromMoment, setLocale, t } from ".";
+import { pickLocaleFromObsidian, setLocale, t } from ".";
 
 describe("cold sync localization", () => {
   it("defaults Chinese Obsidian locales to Chinese and falls back to English", () => {
-    setLocale(pickLocaleFromMoment("zh-cn"));
+    setLocale(pickLocaleFromObsidian("zh_cn"));
     expect(t("settings.inspect")).toBe("检查同步状态");
-    setLocale(pickLocaleFromMoment("en"));
+    setLocale(pickLocaleFromObsidian("en"));
     expect(t("settings.inspect")).toBe("Inspect Sync State");
   });
 

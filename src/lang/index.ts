@@ -6,8 +6,10 @@ export type LocaleCode = "en" | "zh-CN";
 const bundles: Record<LocaleCode, LocaleStrings> = { en, "zh-CN": zhCN };
 let active: LocaleCode = "zh-CN";
 
-export function pickLocaleFromMoment(locale: string | undefined): LocaleCode {
-  return locale?.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+/** Maps Obsidian's documented language code, including its Chinese aliases. */
+export function pickLocaleFromObsidian(locale: string | undefined): LocaleCode {
+  const normalized = locale?.replace(/_/g, "-").toLowerCase();
+  return normalized === "zh" || normalized === "zh-cn" || normalized?.startsWith("zh-") ? "zh-CN" : "en";
 }
 
 export function setLocale(locale: LocaleCode): void { active = locale; }

@@ -5,7 +5,10 @@ import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings } from "./gateway/types"
 import { DEFAULT_MUTATION_INGRESS_SETTINGS, type MutationIngressSettingsFields } from "./gateway/mutation-ingress";
 import { t } from "./lang";
 
+export type InterfaceLanguage = "zh-CN" | "en" | "system";
+
 export interface R2SyncSettings extends R2Configuration, GatewaySettings, MutationIngressSettingsFields {
+  interfaceLanguage: InterfaceLanguage;
   debugLogging: boolean;
   ignoredPaths: string[];
   integrityReconcileIntervalMinutes: number;
@@ -13,7 +16,7 @@ export interface R2SyncSettings extends R2Configuration, GatewaySettings, Mutati
 export const DEFAULT_SETTINGS: R2SyncSettings = {
   ...DEFAULT_GATEWAY_SETTINGS, ...DEFAULT_MUTATION_INGRESS_SETTINGS,
   endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "",
-  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20,
+  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20, interfaceLanguage: "zh-CN",
 };
 
 export class R2SyncSettingTab extends PluginSettingTab {
@@ -21,6 +24,13 @@ export class R2SyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this; containerEl.empty(); containerEl.createEl("h2", { text: t("settings.headerVersion", { version: this.plugin.manifest.version }) });
     containerEl.createEl("p", { text: t("settings.credentialsNotice") });
+    new Setting(containerEl).setName(t("settings.interfaceLanguage")).setDesc(t("settings.interfaceLanguageDesc")).addDropdown((dropdown) => {
+      dropdown.addOption("zh-CN", t("settings.interfaceLanguageChinese"));
+      dropdown.addOption("en", t("settings.interfaceLanguageEnglish"));
+      dropdown.addOption("system", t("settings.interfaceLanguageSystem"));
+      dropdown.setValue(this.plugin.settings.interfaceLanguage);
+      dropdown.onChange(async (value) => this.plugin.setInterfaceLanguage(value));
+    });
     const text = (nameKey: string, descriptionKey: string, key: keyof R2SyncSettings, secret = false) => {
       new Setting(containerEl).setName(t(nameKey)).setDesc(t(descriptionKey)).addText((input) => {
         input.setValue(String(this.plugin.settings[key])).setPlaceholder(t(nameKey));

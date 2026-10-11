@@ -1,11 +1,11 @@
-import { MarkdownView, Menu, Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
+import { getLanguage, MarkdownView, Menu, Notice, Platform, Plugin, TFolder, type TFile } from "obsidian";
 import { scanLocal, scanLocalAdapterMetadata } from "./local/scan-local";
 import { readStableLocalBytes } from "./local/read-local";
 import { flushAction, isOwnWrite, writeChangedFile, type FileStamp } from "./local/android-editor-save";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
 import { scanRemote } from "./remote/scan-remote";
 import { pruneExpiredTombstones, protectedFromCleanup } from "./remote/tombstone-retention";
-import { DEFAULT_SETTINGS, R2SyncSettingTab, type R2SyncSettings } from "./settings";
+import { DEFAULT_SETTINGS, R2SyncSettingTab, type InterfaceLanguage, type R2SyncSettings } from "./settings";
 import { IndexedDbStateStore } from "./state/state-store";
 import { buildBootstrapResult } from "./bootstrap/bootstrap";
 import { DryRunModal } from "./ui/dry-run-modal";
@@ -42,7 +42,7 @@ import { SYNC_HISTORY_CSS } from "./ui/history-styles";
 import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON, type SyncStatusPresentation } from "./ui/sync-status";
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
-import { t } from "./lang";
+import { pickLocaleFromObsidian, setLocale, t } from "./lang";
 
 type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
 
@@ -69,6 +69,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   /** The last presentation applied, so a click can act on exactly what the user is looking at. */
   private statusPresentation?: SyncStatusPresentation;
   private scheduler?: SyncScheduler;
+  private settingsTab?: R2SyncSettingTab;
   private gateway?: GatewayClient;
   private coordinator?: ConflictCoordinator;
   private gatewayConfig: GatewayConfigState = { kind: "disabled" };
@@ -135,7 +136,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
       ...current,
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
-    this.addSettingTab(new R2SyncSettingTab(this.app, this));
+    this.applyInterfaceLanguage();
+    this.settingsTab = new R2SyncSettingTab(this.app, this);
+    this.addSettingTab(this.settingsTab);
     this.addCommand({ id: "r2-sync-inspect-state", name: t("command.inspect"), callback: () => this.inspectSyncState() });
     this.addCommand({ id: "r2-sync-test-connection", name: t("command.testConnection"), callback: () => this.testConnection() });
     this.addCommand({ id: "r2-sync-now", name: t("command.syncNow"), callback: () => this.scheduler?.requestReconcile("manual") });
@@ -243,6 +246,18 @@ export default class R2PersonalSyncPlugin extends Plugin {
     // A settings save can change the channel, the endpoint, or the token; all three must reconnect,
     // and the channel cursor is reloaded before any new socket can deliver a generation.
     await this.applyGatewayConfig(false);
+  }
+
+  async setInterfaceLanguage(value: string): Promise<void> {
+    this.settings.interfaceLanguage = value === "en" || value === "system" ? value : "zh-CN";
+    this.applyInterfaceLanguage();
+    await this.saveSettings();
+    this.settingsTab?.display();
+  }
+
+  private applyInterfaceLanguage(): void {
+    const preference: InterfaceLanguage = this.settings.interfaceLanguage === "en" || this.settings.interfaceLanguage === "system" ? this.settings.interfaceLanguage : "zh-CN";
+    setLocale(preference === "system" ? pickLocaleFromObsidian(getLanguage()) : preference);
   }
 
   /** Re-derives the channel from the current R2 identity and fences the old connection if it moved. */
