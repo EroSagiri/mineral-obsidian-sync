@@ -43,6 +43,7 @@ import { presentSyncStatus, renderSyncStatus, SYNC_STATUS_CSS, SYNC_STATUS_ICON,
 import { isRemoteDeleted, type LocalEntry, type PreviousEntry, type RemoteEntry, type RemoteIdentity, type SyncOperation } from "./sync/types";
 import type { ConflictObservation, ResultCounts, SchedulerState } from "./scheduler/types";
 import { pickLocaleFromObsidian, setLocale, t } from "./lang";
+import { DebugLogger } from "./logging/debug-logger";
 
 type CycleObservations = { local: Map<string, LocalEntry>; remote: Map<string, RemoteEntry>; previous: Map<string, PreviousEntry> };
 
@@ -69,6 +70,8 @@ export default class R2PersonalSyncPlugin extends Plugin {
   /** The last presentation applied, so a click can act on exactly what the user is looking at. */
   private statusPresentation?: SyncStatusPresentation;
   private scheduler?: SyncScheduler;
+  /** Always-on, bounded disk diagnostics for cold-sync support and incident recovery. */
+  private logger!: DebugLogger;
   private settingsTab?: R2SyncSettingTab;
   private gateway?: GatewayClient;
   private coordinator?: ConflictCoordinator;
@@ -136,6 +139,19 @@ export default class R2PersonalSyncPlugin extends Plugin {
       ...current,
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
+    this.logger = new DebugLogger(this.app, {
+      getSettings: () => ({
+        debugLogging: this.settings.debugLogging,
+        // Disk diagnostics are intentionally permanent: a stalled request or a mobile-only failure
+        // must remain inspectable after the app is restarted.
+        persistDebugLog: true,
+        persistDebugLogMaxLines: 20_000,
+        enabledLogTags: "*",
+      }),
+      pluginDir: this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+    });
+    void this.logger.restoreFromDisk();
+    this.logger.log("main", `plugin started version=${this.manifest.version}`);
     this.applyInterfaceLanguage();
     this.settingsTab = new R2SyncSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
@@ -238,6 +254,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.androidEditorSaveTimers.clear();
     // Closing the socket and cancelling reconnect timers happens before any further work can start.
     this.gateway?.stop();
+    void this.logger.flush();
   }
 
   async saveSettings(): Promise<void> {
@@ -348,7 +365,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   }
   private client(): SignedR2ListClient { return new SignedR2ListClient(this.settings); }
   /** Debug-only operational telemetry: intentionally no paths, content, credentials, or signed headers. */
-  private debug(message: string): void { if (this.settings.debugLogging) console.log(`[Mineral Obsidian Sync] ${message}`); }
+  private debug(message: string): void { this.logger.log("main", message); }
 
   /**
    * Applies a status presentation to the status bar.
