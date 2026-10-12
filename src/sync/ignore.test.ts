@@ -24,6 +24,13 @@ describe("vault path filter", () => {
     expect([...remote.keys()]).toEqual(["daily/visible.md"]);
   });
 
+  it("keeps current and legacy Mineral internal storage out of every sync plan", () => {
+    const filter = createVaultPathFilter({ ignoredPaths: [] });
+    expect(filter.ignores(".mineral/versions/note.md/20261012.bin")).toBe(true);
+    expect(filter.ignores(".mineral/tombstones/note.md.json")).toBe(true);
+    expect(filter.ignores(".mineral-sync/legacy-state.json")).toBe(true);
+  });
+
   it("always excludes plugin and common temporary paths, and safely ignores invalid entries", () => {
     const filter = createVaultPathFilter({ ignoredPaths: ["../invalid", "/../invalid"] });
     expect(filter.ignores(".obsidian/plugins/mineral-obsidian-sync/main.js")).toBe(true);

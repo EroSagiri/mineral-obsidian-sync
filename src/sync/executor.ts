@@ -359,7 +359,10 @@ export class SafeExecutor {
    * as `partial`, which keeps the window incomplete and lets the next reconciliation observe the truth.
    */
   private landingUnknown(key: string, error: unknown): OperationResult {
-    this.log(`local write landing unknown path-digest=${pathDigest(key)} result=partial`);
+    // This is a user-enabled, local-only diagnostic log.  Keeping the Vault error here is essential:
+    // a failed create and a failed post-write observation need different repairs, while the digest
+    // remains enough to correlate the event with the normal sync log.
+    this.log(`local write landing unknown path-digest=${pathDigest(key)} error=${JSON.stringify(message(error))} result=partial`);
     return { status: "partial", key, reason: "remote-write-landing-unknown", error: message(error) };
   }
 
