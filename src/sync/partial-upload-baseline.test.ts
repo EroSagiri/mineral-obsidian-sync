@@ -48,7 +48,7 @@ function mergeBases() {
  * precisely what the editor did and when.
  */
 function vaultFile(initial: { text: string; mtime: number }) {
-  const file = { path: "note.md" };
+  const file = { path: "note.md", stat: { size: sizeOf(initial.text), mtime: initial.mtime } };
   const stored = { text: initial.text, mtime: initial.mtime };
   const behaviour = {
     /** Every `stat` reports a newer mtime, as a file being typed into continuously would. */
@@ -67,19 +67,20 @@ function vaultFile(initial: { text: string; mtime: number }) {
     if (behaviour.onWrite) behaviour.onWrite(value);
     else stored.text = decoder.decode(new Uint8Array(value));
     stored.mtime += 1;
+    file.stat = { size: sizeOf(stored.text), mtime: stored.mtime };
     wrote = true;
   };
   return {
     stored,
     behaviour,
     /** An editor save: newer bytes and a newer timestamp, without going through the Vault. */
-    edit(text: string, mtime: number) { stored.text = text; stored.mtime = mtime; },
+    edit(text: string, mtime: number) { stored.text = text; stored.mtime = mtime; file.stat = { size: sizeOf(text), mtime }; },
     asVault: {
       getFileByPath: () => file,
       getAbstractFileByPath: () => file,
       readBinary: async () => bytes([...encoder.encode(stored.text)]),
       modifyBinary: async (_file: unknown, value: ArrayBuffer) => write(value),
-      createBinary: async (_key: string, value: ArrayBuffer) => write(value),
+      createBinary: async (_key: string, value: ArrayBuffer) => { write(value); return file; },
       createFolder: async () => ({ path: "" }),
       adapter: {
         stat: async () => {
@@ -274,15 +275,15 @@ describe("download: the baseline is only committed for verified bytes", () => {
     expect(base.recorded).toEqual([{ path: "note.md", remoteETag: "ETAG-R", size: 5, mtime: 101 }]);
   });
 
-  it("treats an unreadable post-write stat as landing-unknown, never as a definitive failure", async () => {
+  it("uses the write-returned TFile when the adapter has not published metadata yet", async () => {
     const editor = vaultFile({ text: "base\n", mtime: 100 });
     const saved = state();
     editor.behaviour.statsUnavailableAfterWrite = true;
 
     const result = await new SafeExecutor(editor.asVault as never, client, saved, identity, "[]").execute(download());
 
-    expect(result).toEqual({ status: "partial", key: "note.md", reason: "remote-write-landing-unknown" });
-    expect(saved.entries).toHaveLength(0);
+    expect(result).toMatchObject({ status: "applied", key: "note.md", localWrite: { size: 5, mtime: 101 } });
+    expect(saved.entries).toHaveLength(1);
   });
 
   it("treats a throwing local write as landing-unknown, never as a definitive failure", async () => {

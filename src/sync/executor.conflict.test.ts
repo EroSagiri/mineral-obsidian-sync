@@ -190,10 +190,10 @@ describe("resolve-keep-remote", () => {
     expect(result).toMatchObject({ status: "failed", httpStatus: 403 });
   });
 
-  it("reports landing-unknown, not failure, when the local write cannot be verified", async () => {
+  it("uses the TFile write result when the adapter has not published metadata", async () => {
     const local = vault({ "a.md": [1, 2, 3] });
-    // The write is attempted and then leaves no readable metadata: whether bytes landed is unknown, so
-    // the scheduler must not be told this path is settled.
+    // The adapter temporarily has no metadata, but the write-updated TFile remains readable and the
+    // bytes can still be verified without turning a successful Windows write into an endless retry.
     const modify = local.modifyBinary;
     const stat = local.adapter.stat;
     let wrote = false;
@@ -203,8 +203,8 @@ describe("resolve-keep-remote", () => {
 
     const result = await new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(keepRemote());
 
-    expect(result).toMatchObject({ status: "partial", reason: "remote-write-landing-unknown" });
-    expect(saved.entries).toHaveLength(0);
+    expect(result).toMatchObject({ status: "applied" });
+    expect(saved.entries).toHaveLength(1);
   });
 });
 

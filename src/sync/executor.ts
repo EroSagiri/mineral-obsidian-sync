@@ -333,21 +333,22 @@ export class SafeExecutor {
   }
 
   private async writeLocal(key: string, bytes: ArrayBuffer, allowCreate = false): Promise<{ version: { size: number; mtime: number } } | OperationResult> {
-    const file = this.vault.getFileByPath(key);
+    let file = this.vault.getFileByPath(key);
     if (!file) {
       if (this.vault.getAbstractFileByPath(key) !== null) return { status: "failed", key, error: `Vault path "${key}" is a folder, not a file`, reason: "target-path-is-folder" };
       if (!allowCreate) return { status: "failed", key, error: "the conflicted local file no longer exists", reason: "target-missing" };
       const folders = await ensureParentFolders(this.vault, key);
       if (!folders.ok) return { status: "failed", key, error: folders.error, reason: folders.reason };
       if (this.vault.getFileByPath(key)) return { status: "stale", key, reason: "local-changed" };
-      try { await this.vault.createBinary(key, bytes); }
+      try { file = await this.vault.createBinary(key, bytes); }
       catch (error) { return this.landingUnknown(key, error); }
     } else {
       try { await this.vault.modifyBinary(file, bytes); }
       catch (error) { return this.landingUnknown(key, error); }
     }
-    const local = await this.vault.adapter.stat(key);
-    // The write was attempted; whether it landed is exactly what an unreadable stat leaves unknown.
+    // `modifyBinary` updates the existing TFile and `createBinary` returns the new one.  Reading the
+    // TFile here avoids a second adapter lookup during the Windows Vault-index settling window.
+    const local = file?.stat;
     if (!local) return this.landingUnknown(key, new Error("Vault write did not produce a file"));
     return { version: { size: local.size, mtime: local.mtime } };
   }
@@ -492,7 +493,14 @@ export class SafeExecutor {
    * lands between the write and the stat would otherwise be recorded as a converged baseline while its
    * content was never compared. That would make the planner see `local == baseline.local` forever and
    * drop the user's edit silently. The check is therefore content-level, over bytes re-read around a
-   * stable `stat`, and the returned version is the one the verified bytes actually belong to.
+   * stable Vault-file metadata, and the returned version is the one the verified bytes actually
+   * belong to.
+   *
+   * The TFile returned by `createBinary` (or updated by `modifyBinary`) is deliberately used for
+   * metadata.  Immediately asking the adapter for the same path is not a stronger check: on Windows
+   * it can transiently throw while the Vault index is publishing an otherwise successful write.  The
+   * read-back hash remains the content authority, and comparing the TFile metadata before and after
+   * that read still detects a competing Vault write.
    *
    * `unavailable` means the file or its metadata could not be read at all — the write's landing is
    * unknown. `mismatch` means a different version is on disk — a racing editor save won the window.
@@ -502,11 +510,25 @@ export class SafeExecutor {
   > {
     const file = writtenFile ?? this.vault.getFileByPath(key);
     if (!file) return { matched: false, cause: "unavailable" };
-    const before = await this.vault.adapter.stat(key);
+    const versionFromFile = (): { size: number; mtime: number } | undefined => {
+      const stat = file.stat;
+      return Number.isFinite(stat?.size) && Number.isFinite(stat?.mtime) ? { size: stat.size, mtime: stat.mtime } : undefined;
+    };
+    // Production TFiles always carry their own stat.  Prefer a readable adapter version because it
+    // may have observed a newer competing write; when the adapter is still settling or throws on
+    // Windows, the write-returned TFile is the safe fallback rather than a reason to retry forever.
+    const version = async (): Promise<{ size: number; mtime: number } | undefined> => {
+      const direct = versionFromFile();
+      try {
+        const stat = await this.vault.adapter.stat(key);
+        return stat ? { size: stat.size, mtime: stat.mtime } : direct;
+      } catch { return direct; }
+    };
+    const before = await version();
     if (!before) return { matched: false, cause: "unavailable" };
     let actual: ArrayBuffer;
     try { actual = await this.vault.readBinary(file); } catch { return { matched: false, cause: "unavailable" }; }
-    const after = await this.vault.adapter.stat(key);
+    const after = await version();
     // A version that moved while it was being read cannot be attributed to these bytes either.
     if (!after || after.size !== before.size || after.mtime !== before.mtime) return { matched: false, cause: "mismatch" };
     const [expectedHash, actualHash] = await Promise.all([sha256(expected), sha256(actual)]);
