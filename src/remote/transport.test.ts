@@ -52,4 +52,10 @@ describe("transport and credentials", () => {
     await expect(send).rejects.toBeInstanceOf(RemoteTransportError);
     await expect(send).rejects.toMatchObject({ name: "RemoteTransportError", operation: "HEAD" });
   });
+
+  it("bounds a requestUrl call that never settles", async () => {
+    setRequestUrlHandler(async () => new Promise(() => undefined));
+    const send = new RequestUrlTransport(1).send({ method: "GET", url: RESPONSE_URL, headers: {} });
+    await expect(send).rejects.toMatchObject({ name: "RemoteTransportError", operation: "GET" });
+  });
 });

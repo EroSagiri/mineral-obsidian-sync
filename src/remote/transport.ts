@@ -6,6 +6,9 @@ import type { SignedRequest } from "./signer";
 export interface HttpResponse { status: number; headers: Record<string, string>; text: string; arrayBuffer: ArrayBuffer; }
 export interface HttpTransport { send(request: SignedRequest): Promise<HttpResponse>; }
 
+/** A browser bridge request has no cancellation API, so the race bounds the sync cycle's wait. */
+export const R2_REQUEST_TIMEOUT_MS = 30_000;
+
 /**
  * requestUrl-only transport. It forwards the signer output without changing URL, headers, or bytes.
  *
@@ -34,13 +37,23 @@ export interface HttpTransport { send(request: SignedRequest): Promise<HttpRespo
  * never gates a write — see `docs/development.md`.
  */
 export class RequestUrlTransport implements HttpTransport {
+  constructor(private readonly timeoutMs = R2_REQUEST_TIMEOUT_MS) {}
+
   async send(request: SignedRequest): Promise<HttpResponse> {
-    let response: RequestUrlResponse;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      response = await requestUrl({ url: request.url, method: request.method, headers: request.headers, body: request.body, throw: false });
+      const response: RequestUrlResponse = await Promise.race([
+        requestUrl({ url: request.url, method: request.method, headers: request.headers, body: request.body, throw: false }),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new RemoteTransportError(request.method, new Error("R2 request timed out"))), this.timeoutMs);
+        }),
+      ]);
+      return { status: response.status, headers: response.headers, text: response.text, arrayBuffer: response.arrayBuffer };
     } catch (error) {
+      if (error instanceof RemoteTransportError) throw error;
       throw new RemoteTransportError(request.method, error);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
-    return { status: response.status, headers: response.headers, text: response.text, arrayBuffer: response.arrayBuffer };
   }
 }
