@@ -497,10 +497,10 @@ export class SafeExecutor {
    * `unavailable` means the file or its metadata could not be read at all — the write's landing is
    * unknown. `mismatch` means a different version is on disk — a racing editor save won the window.
    */
-  private async verifyWrittenContent(key: string, expected: ArrayBuffer): Promise<
+  private async verifyWrittenContent(key: string, expected: ArrayBuffer, writtenFile?: TFile): Promise<
     { matched: true; version: { size: number; mtime: number }; hash: string } | { matched: false; cause: "unavailable" | "mismatch" }
   > {
-    const file = this.vault.getFileByPath(key);
+    const file = writtenFile ?? this.vault.getFileByPath(key);
     if (!file) return { matched: false, cause: "unavailable" };
     const before = await this.vault.adapter.stat(key);
     if (!before) return { matched: false, cause: "unavailable" };
@@ -539,11 +539,12 @@ export class SafeExecutor {
     // Local side effects stay as late as possible: a failed download must not create folders.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
     let wrote = false;
+    let writtenFile: TFile | undefined;
     try {
       const file = this.vault.getFileByPath(operation.key);
       if (file) {
         // A throwing write cannot prove that no bytes landed, so it is landing-unknown, not a failure.
-        try { await this.vault.modifyBinary(file, bytes); }
+        try { await this.vault.modifyBinary(file, bytes); writtenFile = file; }
         catch (error) { return this.landingUnknown(operation.key, error); }
       } else {
         if (this.vault.getAbstractFileByPath(operation.key) !== null) return { status: "failed", key: operation.key, reason: "target-path-is-folder", error: `Vault path "${operation.key}" is a folder, not a file` };
@@ -552,11 +553,14 @@ export class SafeExecutor {
         if (!folders.ok) return { status: "failed", key: operation.key, reason: folders.reason, error: folders.error };
         // Creating folders widens the race window, so the target is confirmed once more.
         if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "local-changed" };
-        try { await this.vault.createBinary(operation.key, bytes); }
+        try { writtenFile = await this.vault.createBinary(operation.key, bytes); }
         catch (error) { return this.landingUnknown(operation.key, error); }
       }
       wrote = true;
-      const verified = await this.verifyWrittenContent(operation.key, bytes);
+      // `createBinary` returns the authoritative TFile. On Windows the Vault index can lag that
+      // successful create, so looking it up again here can falsely turn every new download into a
+      // partial transfer and keep the scheduler in a perpetual cycle.
+      const verified = await this.verifyWrittenContent(operation.key, bytes, writtenFile);
       if (!verified.matched) {
         this.log(`download post-write verification mismatch path-digest=${pathDigest(operation.key)} cause=${verified.cause} result=partial`);
         return {

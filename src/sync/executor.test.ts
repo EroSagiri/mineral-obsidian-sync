@@ -108,6 +108,20 @@ describe("SafeExecutor", () => {
     await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(download())).resolves.toMatchObject({ status: "applied", key: "a.bin", localWrite: { key: "a.bin", size: 2, mtime: 20 } });
     expect(new Uint8Array(local.files.get("a.bin")!.bytes)).toEqual(new Uint8Array([7, 8])); expect(saved.entries).toHaveLength(1);
   });
+  it("verifies a newly-created file through createBinary's result when the Vault index lags", async () => {
+    const local = vault({}), saved = state();
+    const originalCreate = local.createBinary;
+    let indexLagging = false;
+    local.createBinary = async (key: string, value: ArrayBuffer) => {
+      const created = await originalCreate(key, value);
+      indexLagging = true;
+      return created;
+    };
+    local.getFileByPath = (key: string) => indexLagging ? null : (local.files.has(key) ? ({ path: key } as never) : null);
+
+    await expect(new SafeExecutor(local as never, remote(), saved, identity, "[]").execute(download())).resolves.toMatchObject({ status: "applied", key: "a.bin" });
+    expect(saved.entries).toHaveLength(1);
+  });
   it("reports a successful transfer with failed state persistence as unresolved", async () => {
     // The PUT is a fact even though this device could not record its baseline, so the revision it left is
     // still carried: whatever records remote mutations can report it, and the next cycle repairs the state.
