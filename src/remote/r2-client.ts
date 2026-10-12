@@ -82,7 +82,9 @@ export class SignedR2ListClient implements R2Client {
     const output = new Map<string, RemoteEntry>(); let token: string | undefined; const prefix = normalizePrefix(this.config.remotePrefix);
     do {
       const url = new URL(`/${encodeURIComponent(this.config.bucket)}`, this.config.endpoint); url.search = new URLSearchParams({ "list-type": "2", ...(prefix ? { prefix } : {}), ...(token ? { "continuation-token": token } : {}) }).toString();
-      const response = await this.send("ListObjectsV2", "GET", url.toString()); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("ListObjectsV2", response.status);
+      // Android's request bridge can stall while decoding R2's compressed XML response.  This header
+      // is part of the signed request so the bridge receives the exact, uncompressed listing bytes.
+      const response = await this.send("ListObjectsV2", "GET", url.toString(), { "accept-encoding": "identity" }); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("ListObjectsV2", response.status);
       const page = xmlEntries(response.text, this.config.remotePrefix); for (const entry of page.entries) output.set(entry.key, entry); token = page.truncated ? page.next : undefined;
       if (page.truncated && !token) throw new Error("R2 list response was truncated without a continuation token");
     } while (token);
@@ -93,7 +95,7 @@ export class SignedR2ListClient implements R2Client {
     do {
       const url = new URL(`/${encodeURIComponent(this.config.bucket)}`, this.config.endpoint);
       url.search = new URLSearchParams({ "list-type": "2", prefix, ...(token ? { "continuation-token": token } : {}) }).toString();
-      const response = await this.send("ListTombstonesV2", "GET", url.toString()); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("ListObjectsV2", response.status);
+      const response = await this.send("ListTombstonesV2", "GET", url.toString(), { "accept-encoding": "identity" }); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("ListObjectsV2", response.status);
       const page = xmlRawEntries(response.text); output.push(...page.entries); token = page.truncated ? page.next : undefined;
       if (page.truncated && !token) throw new Error("R2 list response was truncated without a continuation token");
     } while (token);
@@ -124,7 +126,7 @@ export class SignedR2ListClient implements R2Client {
     return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
-  async getObject(key: string, options: { ifMatch?: string } = {}): Promise<ArrayBuffer> { const response = await this.send("GetObject", "GET", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("GetObject", response.status); return response.arrayBuffer; }
+  async getObject(key: string, options: { ifMatch?: string } = {}): Promise<ArrayBuffer> { const response = await this.send("GetObject", "GET", this.objectUrl(key), { "accept-encoding": "identity", ...(options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}) }); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("GetObject", response.status); return response.arrayBuffer; }
   /**
    * Conditional write, recorded **from its own response**.
    *

@@ -15,8 +15,9 @@ describe("SignedR2ListClient.getObject", () => {
     await expect(client().getObject("folder/a.bin", { ifMatch: "etag-a" })).resolves.toEqual(new Uint8Array([1, 2, 3]).buffer);
     expect(request?.url).toContain("/bucket/sync/folder/a.bin");
     expect(request?.headers?.host).toBeUndefined();
+    expect(request?.headers?.["accept-encoding"]).toBe("identity");
     expect(request?.headers?.["if-match"]).toBe('"etag-a"');
-    expect(request?.headers?.Authorization).toContain("SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date");
+    expect(request?.headers?.Authorization).toContain("SignedHeaders=accept-encoding;host;if-match;x-amz-content-sha256;x-amz-date");
   });
 
   it("treats a 412 conditional read as stale metadata without accepting a body", async () => {
