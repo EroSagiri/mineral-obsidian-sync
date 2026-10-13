@@ -136,8 +136,23 @@ export class RecoveryCenter extends Modal {
   }
   private async submit(intent: RecoveryIntent): Promise<void> {
     this.busy = true;
+    this.selected = undefined;
+    this.contentEl.empty();
+    const cleaning = intent.action === "clean";
+    this.contentEl.createEl("h2", { text: cleaning ? "正在清理 R2 恢复记录…" : "正在执行 R2 操作…" });
+    this.contentEl.createEl("p", { text: cleaning ? `共 ${intent.selections.length} 项，正在校验并真实删除。完成后会重新读取 R2 列表。` : "正在校验并写入 R2，完成后会刷新列表。" });
+    const status = this.contentEl.createEl("p", { text: "已等待 0 秒", attr: { role: "status", "aria-live": "polite" } });
+    const started = Date.now();
+    const timer = setInterval(() => { if (this.alive) status.textContent = `已等待 ${Math.floor((Date.now() - started) / 1000)} 秒`; }, 1000);
+    let failure: unknown;
     try { await this.ui.submit(intent); new Notice("R2 操作完成"); }
-    finally { this.busy = false; this.selected = undefined; await this.refresh(); }
+    catch (error) { failure = error; throw error; }
+    finally {
+      clearInterval(timer);
+      this.busy = false;
+      await this.refresh();
+      if (this.alive) this.contentEl.createEl("p", { text: failure ? `操作未全部完成，请检查当前记录后重试：${String(failure)}` : "R2 操作已完成。", attr: { role: failure ? "alert" : "status" } });
+    }
   }
 }
 export function stateLabel(state: string): string { return ({ "delete-pending": "删除待确认", deleted: "已真实删除（已记录窗口风险）", anomaly: "异常，需人工恢复", backup: "版本备份", tombstone: "墓碑", "legacy-read-only": "旧墓碑（只读兼容）", invalid: "不完整或旧格式，禁止清理", migration: "已迁移", "legacy-version": "旧格式（可预览，请先迁移）", "cleanup-pending": "清理待确认，可重试清理" } as Record<string, string>)[state] ?? state; }

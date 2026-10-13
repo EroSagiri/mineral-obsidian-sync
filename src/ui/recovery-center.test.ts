@@ -44,6 +44,34 @@ for (const android of [false, true]) describe(android ? "Android recovery UI" : 
     const { modal, root } = await setup(); root.button("查看与恢复")!.click(); await flush();
     await modal.refresh(); expect(root.allText).toContain("# R2 preview"); expect(root.button("恢复")).toBeDefined();
   });
+  it("shows pending cleanup until R2 finishes, blocks repeated clicks and retains the result", async () => {
+    const { modal, root, submit } = await setup();
+    let complete!: () => void;
+    submit.mockImplementationOnce(() => new Promise<void>(resolve => { complete = resolve; }));
+    const confirmRoot = new FakeElement("div");
+    vi.spyOn(RecoveryConfirmation.prototype, "open").mockImplementation(function(this: RecoveryConfirmation) { installModalContainer(this, confirmRoot); this.onOpen(); });
+    root.button("清空恢复中心")!.click(); await flush();
+    confirmRoot.button("确认真实删除")!.click(); await flush();
+    expect(root.allText).toContain("正在清理 R2");
+    expect(root.allText).toContain("共 1 项");
+    expect(root.allText).toContain("已等待 0 秒");
+    expect(root.button("清空恢复中心")).toBeUndefined();
+    await modal.refresh(); expect(submit).toHaveBeenCalledTimes(1);
+    complete(); await flush();
+    expect(root.allText).toContain("R2 操作已完成");
+    expect(root.button("清空恢复中心")).toBeDefined();
+  });
+  it("retains cleanup failure in the refreshed UI", async () => {
+    const { root, submit } = await setup();
+    submit.mockRejectedValueOnce(new Error("ETag changed"));
+    const confirmRoot = new FakeElement("div");
+    vi.spyOn(RecoveryConfirmation.prototype, "open").mockImplementation(function(this: RecoveryConfirmation) { installModalContainer(this, confirmRoot); this.onOpen(); });
+    root.button("清空恢复中心")!.click(); await flush();
+    confirmRoot.button("确认真实删除")!.click(); await flush();
+    expect(root.allText).toContain("操作未全部完成");
+    expect(root.allText).toContain("ETag changed");
+    expect(root.allText).not.toContain("R2 操作已完成");
+  });
   it("requires confirmation with accepted race disclosure for real cleanup and binds ETag", async () => {
     const { root, submit } = await setup(); let confirmation: RecoveryConfirmation | undefined;
     const confirmRoot = new FakeElement("div");
