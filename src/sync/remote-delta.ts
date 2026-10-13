@@ -93,7 +93,7 @@ export async function observeLocalDelta(keys: readonly string[], dependencies: R
     const stat = await dependencies.statLocal(key);
     if (stat) local.set(key, { key, size: stat.size, mtime: stat.mtime });
     let present: RemoteEntry | undefined;
-    try { present = await dependencies.client.headObject(key); }
+    try { present = await (dependencies.client.observeObject ?? dependencies.client.headObject).call(dependencies.client, key); }
     catch (error) { if (!(error instanceof RemoteHttpError && error.status === 404)) throw error; }
     if (!present) continue;
     const baseline = all.get(key);
@@ -165,14 +165,14 @@ export async function observeRemoteDelta(changes: readonly RemoteChange[], depen
       // carries no version identity, exactly like a delete whose object is already gone.
       remote.delete(canonicalKey(change.from));
       const key = canonicalKey(change.to);
-      if (!dependencies.ignores(key)) remote.set(key, await dependencies.client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
+      if (!dependencies.ignores(key)) remote.set(key, await (dependencies.client.observeObject ?? dependencies.client.headObject).call(dependencies.client, key, change.etag ? { ifMatch: change.etag } : {}));
       continue;
     }
     const key = canonicalKey(change.path);
     if (dependencies.ignores(key)) continue;
     if (change.op === "delete") {
       let present: RemoteEntry | undefined;
-      try { present = await dependencies.client.headObject(key); }
+      try { present = await (dependencies.client.observeObject ?? dependencies.client.headObject).call(dependencies.client, key); }
       catch (error) { if (!(error instanceof RemoteHttpError && error.status === 404)) throw error; }
       remote.set(key, deletedObservation(key, present?.etag, present?.lastModified, all.get(key)?.remote?.lastModified));
       continue;
@@ -181,7 +181,7 @@ export async function observeRemoteDelta(changes: readonly RemoteChange[], depen
     // the event's ETag is still asserted when it supplied one, so a stale event cannot be recorded.
     const modified = change.modified ? Date.parse(change.modified) : NaN;
     if (change.etag && typeof change.size === "number" && Number.isFinite(modified)) remote.set(key, { key, etag: change.etag, size: change.size, lastModified: modified });
-    else remote.set(key, await dependencies.client.headObject(key, change.etag ? { ifMatch: change.etag } : {}));
+    else remote.set(key, await (dependencies.client.observeObject ?? dependencies.client.headObject).call(dependencies.client, key, change.etag ? { ifMatch: change.etag } : {}));
   }
 
   const local = new Map<string, LocalEntry>();

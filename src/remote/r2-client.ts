@@ -17,6 +17,8 @@ export interface R2Client {
   listTombstones?(): Promise<RemoteDeletion[]>;
   /** Used for capability probing and diagnostics; the execution path never issues a HEAD. */
   headObject(key: string, options?: { ifMatch?: string }): Promise<RemoteEntry>;
+  /** Canonical sync observation, with a conditional GET fallback for native HEAD limitations. */
+  observeObject?(key: string, options?: { ifMatch?: string }): Promise<RemoteEntry>;
   /** A conditional HEAD used only to prove an already-scanned version still exists. */
   verifyObjectVersion?(key: string, expectedETag: string): Promise<void>;
   getObject(key: string, options?: { ifMatch?: string }): Promise<ArrayBuffer>;
@@ -211,6 +213,13 @@ export class SignedR2ListClient implements R2Client {
     return [...deduplicated.values()];
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
+  async observeObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> {
+    // Ordinary incremental sync needs the same authoritative metadata and Android HEAD fallback
+    // as recovery. A failed request still cannot become an observation of absence.
+    const object = await this.recoveryPort().head(key, options.ifMatch);
+    if (!object) throw new RemoteHttpError("HeadObject", 404);
+    return { key, etag: object.etag, size: object.size, lastModified: Date.parse(object.modified) };
+  }
   /**
    * Deletion does not need a RemoteEntry: a 2xx conditional HEAD is the entire proof that the
    * scanned ETag still names this object.  Some Obsidian request bridges omit metadata headers from

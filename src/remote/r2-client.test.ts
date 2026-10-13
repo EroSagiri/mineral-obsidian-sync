@@ -174,6 +174,24 @@ describe("SignedR2ListClient.deleteTombstone / deleteObject", () => {
 
 
 describe("recovery HEAD fallback", () => {
+  it("uses the conditional metadata fallback for ordinary incremental sync", async () => {
+    const calls: Array<{ method?: string; headers?: Record<string, string> }> = [];
+    setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => {
+      calls.push(request);
+      return request.method === "HEAD"
+        ? { status: 200, arrayBuffer: new ArrayBuffer(0), text: "", headers: { etag: '"e"' } }
+        : { status: 206, arrayBuffer: new Uint8Array([1]).buffer, text: "", headers: { etag: '"e"', "content-length": "1", "content-range": "bytes 0-0/1024", "last-modified": "Tue, 13 Oct 2026 00:00:00 GMT" } };
+    });
+    expect(await client().observeObject("note.md", { ifMatch: "e" })).toMatchObject({ key: "note.md", etag: "e", size: 1024 });
+    expect(calls.map(c => c.method)).toEqual(["HEAD", "GET"]);
+    expect(calls[1].headers?.["if-match"]).toBe('"e"');
+  });
+  it("keeps ordinary missing-object and changed-object observations typed", async () => {
+    setRequestUrlHandler(async request => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 404, arrayBuffer: new ArrayBuffer(0), text: "missing", headers: {} }; });
+    await expect(client().observeObject("missing.md")).rejects.toMatchObject({ status: 404 });
+    setRequestUrlHandler(async request => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 412, arrayBuffer: new ArrayBuffer(0), text: "changed", headers: {} }; });
+    await expect(client().observeObject("changed.md", { ifMatch: "old" })).rejects.toBeInstanceOf(RemoteObjectChangedError);
+  });
   it("falls back to conditional ranged GET when HEAD omits canonical metadata", async () => {
     const calls: Array<{ method?: string; headers?: Record<string, string> }> = [];
     setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => {
