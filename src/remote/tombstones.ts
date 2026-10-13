@@ -1,7 +1,10 @@
 import { canonicalKey } from "../sync/path";
 
 /** Reserved below every configured remote prefix. It is never a Vault path. */
-export const TOMBSTONE_NAMESPACE = ".mineral-sync/tombstones/";
+export const TOMBSTONE_NAMESPACE = ".mineral/tombstones/";
+/** Records written before the shared `.mineral` storage migration remain readable. */
+export const LEGACY_TOMBSTONE_NAMESPACE = ".mineral-sync/tombstones/";
+export const TOMBSTONE_READ_NAMESPACES = [TOMBSTONE_NAMESPACE, LEGACY_TOMBSTONE_NAMESPACE] as const;
 export const TOMBSTONE_PROTOCOL = 1;
 
 /**
@@ -39,7 +42,8 @@ export interface RemoteDeletion {
 }
 
 export function isInternalRemoteKey(key: string): boolean {
-  return canonicalKey(key).startsWith(TOMBSTONE_NAMESPACE);
+  const canonical = canonicalKey(key);
+  return TOMBSTONE_READ_NAMESPACES.some((prefix) => canonical.startsWith(prefix));
 }
 
 function base64url(bytes: Uint8Array): string {
@@ -57,6 +61,17 @@ export async function tombstoneKey(path: string, deletedRemoteETag: string): Pro
   if (!deletedRemoteETag) throw new Error("Tombstone requires an exact remote ETag");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${canonical}\u0000${deletedRemoteETag}`));
   return `${TOMBSTONE_NAMESPACE}${base64url(new Uint8Array(digest))}.json`;
+}
+
+/**
+ * New writers always use `.mineral`; readers accept the equivalent legacy record while devices
+ * finish upgrading.  The suffix is the version-bound identity, so both keys describe the same
+ * deletion and can safely be de-duplicated by `(path, ETag)` after validation.
+ */
+export async function tombstoneReadKeys(path: string, deletedRemoteETag: string): Promise<string[]> {
+  const key = await tombstoneKey(path, deletedRemoteETag);
+  const suffix = key.slice(TOMBSTONE_NAMESPACE.length);
+  return TOMBSTONE_READ_NAMESPACES.map((prefix) => `${prefix}${suffix}`);
 }
 
 export function encodeTombstone(record: RemoteTombstone): ArrayBuffer {

@@ -4,7 +4,7 @@ import { Aws4FetchSigner, type RequestSigner } from "./signer";
 import { RequestUrlTransport, type HttpTransport } from "./transport";
 import { normalizePrefix, remoteObjectKey, vaultKeyFromRemote } from "../sync/path";
 import type { RemoteEntry, RemoteIdentity, RemoteVersion } from "../sync/types";
-import { TOMBSTONE_NAMESPACE, encodeTombstone, isInternalRemoteKey, parseTombstone, tombstoneKey, type RemoteDeletion, type RemoteTombstone } from "./tombstones";
+import { TOMBSTONE_READ_NAMESPACES, encodeTombstone, isInternalRemoteKey, parseTombstone, tombstoneKey, tombstoneReadKeys, type RemoteDeletion, type RemoteTombstone } from "./tombstones";
 
 export interface R2Configuration { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; remotePrefix: string; }
 export type RemoteDebugLogger = (message: string) => void;
@@ -102,10 +102,13 @@ export class SignedR2ListClient implements R2Client {
     return output;
   }
   async listTombstones(): Promise<RemoteDeletion[]> {
-    const prefix = `${normalizePrefix(this.config.remotePrefix)}${TOMBSTONE_NAMESPACE}`;
+    const prefixes = TOMBSTONE_READ_NAMESPACES.map((namespace) => `${normalizePrefix(this.config.remotePrefix)}${namespace}`);
     // These immutable metadata reads are independent. Keep their original listing order in the
     // returned array, but do not make one slow R2 GET delay every other tombstone verification.
-    const resolved = await Promise.all((await this.listRaw(prefix)).map(async (entry): Promise<RemoteDeletion | undefined> => {
+    // A correctly filtered R2 listing makes these namespaces disjoint.  Still deduplicate raw keys
+    // before GETs: it keeps a proxy returning an over-broad page from multiplying metadata reads.
+    const raw = [...new Map((await Promise.all(prefixes.map((prefix) => this.listRaw(prefix)))).flat().map((entry) => [entry.key, entry])).values()];
+    const resolved = await Promise.all(raw.map(async (entry): Promise<RemoteDeletion | undefined> => {
       const key = vaultKeyFromRemote(this.config.remotePrefix, entry.key);
       if (!key || !isInternalRemoteKey(key) || !entry.etag) throw new Error("Tombstone metadata key is invalid");
       let body: ArrayBuffer;
@@ -118,12 +121,20 @@ export class SignedR2ListClient implements R2Client {
         throw error;
       }
       const record = parseTombstone(body);
-      const expectedKey = await tombstoneKey(record.path, record.deletedRemoteETag);
-      if (key !== expectedKey) throw new Error("Tombstone metadata key does not match its record");
+      const expectedKeys = await tombstoneReadKeys(record.path, record.deletedRemoteETag);
+      if (!expectedKeys.includes(key)) throw new Error("Tombstone metadata key does not match its record");
       // The listing's own timestamp is R2's clock, which is what retention compares against the object's.
       return { tombstone: record, metadataETag: entry.etag, metadataLastModified: entry.lastModified };
     }));
-    return resolved.filter((deletion): deletion is RemoteDeletion => deletion !== undefined);
+    // Prefer the current namespace if a completed migration left the equivalent legacy record.
+    const deduplicated = new Map<string, RemoteDeletion>();
+    for (const deletion of resolved) {
+      if (!deletion) continue;
+      const identity = `${deletion.tombstone.path}\u0000${deletion.tombstone.deletedRemoteETag}`;
+      // `TOMBSTONE_READ_NAMESPACES` lists the current namespace first.
+      if (!deduplicated.has(identity)) deduplicated.set(identity, deletion);
+    }
+    return [...deduplicated.values()];
   }
   async headObject(key: string, options: { ifMatch?: string } = {}): Promise<RemoteEntry> { const response = await this.send("HeadObject", "HEAD", this.objectUrl(key), options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("HeadObject", response.status); return objectEntry(key, response.headers); }
   async getObject(key: string, options: { ifMatch?: string } = {}): Promise<ArrayBuffer> { const response = await this.send("GetObject", "GET", this.objectUrl(key), { "accept-encoding": "identity", ...(options.ifMatch ? { "if-match": `"${options.ifMatch}"` } : {}) }); if (response.status === 412) throw new RemoteObjectChangedError(); if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("GetObject", response.status); return response.arrayBuffer; }

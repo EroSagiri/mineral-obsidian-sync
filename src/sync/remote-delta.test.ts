@@ -212,7 +212,8 @@ describe("a locally-changed path is answered with one HEAD", () => {
 
     const observed = await observeLocalDelta(["foo.md"], localDependencies(calls, withoutTombstone));
 
-    expect(calls).toEqual(["head:foo.md", "get:missing"]);
+    // A missing current record also checks the legacy namespace during the storage migration window.
+    expect(calls).toEqual(["head:foo.md", "get:missing", "get:missing"]);
     expect(observed.remote.get("foo.md")?.deleted).toBeUndefined();
   });
 

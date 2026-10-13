@@ -222,6 +222,7 @@ export class SafeExecutor {
     } catch (error) {
       // A received 4xx means no record was accepted; a transport failure or 5xx remains ambiguous.
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
+      this.log(`local delete tombstone failed path-digest=${pathDigest(operation.key)} error=${message(error)}`);
       return uploadFailure("PutObject tombstone", operation.key, error);
     }
     // The revision this deletion retired is the one the conditional HEAD just proved and the tombstone
