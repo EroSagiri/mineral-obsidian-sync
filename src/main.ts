@@ -5,7 +5,7 @@ import { flushAction, isOwnWrite, writeChangedFile, type FileStamp } from "./loc
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
 import { scanRemote } from "./remote/scan-remote";
 import { RecoveryStore, recoverySelection } from "@mineral/sync-core/recovery";
-import { RecoveryCenter, RECOVERY_CSS, confirmPhysicalDelete } from "./ui/recovery-center";
+import { RecoveryCenter, RECOVERY_CSS } from "./ui/recovery-center";
 import { DEFAULT_SETTINGS, R2SyncSettingTab, type InterfaceLanguage, type R2SyncSettings } from "./settings";
 import { IndexedDbStateStore } from "./state/state-store";
 import { buildBootstrapResult } from "./bootstrap/bootstrap";
@@ -436,7 +436,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const identity = remoteIdentity(settings);
     const client = new SignedR2ListClient(settings);
     const store = new RecoveryStore(client.recoveryPort(), JSON.stringify(identity));
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicyFingerprint(settings), this.vaultFileRemover(), undefined, undefined, { confirmDelete: path => confirmPhysicalDelete(this.app, path), changed: () => this.recoveryChanged() });
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicyFingerprint(settings), this.vaultFileRemover(), undefined, undefined, { confirmDelete: async () => true, changed: () => this.recoveryChanged() });
     this.recoveryCenter?.close();
     this.recoveryCenter = new RecoveryCenter(this.app, {
       identity: store.identity,
@@ -719,7 +719,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const identity = remoteIdentity(settings);
     const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
     const channel = this.currentChannel();
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message), { confirmDelete: path => confirmPhysicalDelete(this.app, `将 R2 文件 ${path} 先备份并写墓碑，然后真实删除。`), changed: () => this.recoveryChanged() });
+    // A user file deletion authorizes its planned, ETag-bound remote deletion. Backup and
+    // tombstone protections stay in SafeExecutor; recovery-record cleanup confirms in its UI.
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message), { confirmDelete: async () => true, changed: () => this.recoveryChanged() });
     // One definition of a usable baseline, shared by every observation path in the cycle: a baseline from
     // another namespace, or one invalidated by an ignore-policy change, must never decide anything.
     const acceptsBaseline = (key: string, entry: PreviousEntry): boolean =>

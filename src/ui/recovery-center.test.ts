@@ -54,7 +54,7 @@ for (const android of [false, true]) describe(android ? "Android recovery UI" : 
     confirmRoot.button("确认真实删除")!.click(); await flush();
     expect(root.allText).toContain("正在清理 R2");
     expect(root.allText).toContain("共 1 项");
-    expect(root.allText).toContain("已等待 0 秒");
+    expect(root.allText).toContain("正在执行，请稍候");
     expect(root.button("清空恢复中心")).toBeUndefined();
     await modal.refresh(); expect(submit).toHaveBeenCalledTimes(1);
     complete(); await flush();
