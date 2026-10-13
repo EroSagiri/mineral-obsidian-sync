@@ -1,4 +1,5 @@
 import { RemoteHttpError, RemoteObjectChangedError } from "./errors";
+import { Platform } from "obsidian";
 import type { RecoveryObject, RecoveryPort } from "@mineral/sync-core/recovery";
 import { isSystemStorageKey } from "@mineral/sync-core/storage";
 import { SettingsCredentialProvider } from "./credentials";
@@ -111,16 +112,33 @@ export class SignedR2ListClient implements R2Client {
     const head = async (key: string, etag?: string): Promise<RecoveryObject | null> => {
       let response;
       const conditions: Record<string, string> = etag ? { "if-match": `"${etag}"` } : {};
-      try {
+      const rangedHead = async () => {
+        let result = await this.send("RecoveryHeadFallback", "GET", this.objectUrl(key), { ...conditions, range: "bytes=0-0", "accept-encoding": "identity" });
+        // A range cannot select a byte from an empty object. Read its empty representation
+        // with the same precondition to obtain canonical ETag/modified metadata.
+        if (result.status === 416) result = await this.send("RecoveryEmptyHead", "GET", this.objectUrl(key), { ...conditions, "accept-encoding": "identity" });
+        let range = header(result.headers, "content-range");
+        // Some native bridges strip Content-Range. The partial body's length is not the
+        // original object's size; obtain the full conditional representation in that case.
+        if (result.status === 206 && !range?.match(/\/(\d+)$/)) {
+          result = await this.send("RecoveryMetadataGet", "GET", this.objectUrl(key), { ...conditions, "accept-encoding": "identity" });
+          range = header(result.headers, "content-range");
+          if (result.status === 200) result.headers[Object.keys(result.headers).find(k => k.toLowerCase() === "content-length") ?? "content-length"] = String(result.arrayBuffer.byteLength);
+        }
+        if (range && /\/(\d+)$/.test(range)) result.headers[Object.keys(result.headers).find(k => k.toLowerCase() === "content-length") ?? "content-length"] = /\/(\d+)$/.exec(range)![1];
+        return result;
+      };
+      // Android may report Content-Length: 0 even on a nonempty successful HEAD.
+      // Canonical sync metadata must therefore come from the bounded GET representation.
+      if (Platform.isAndroidApp) response = await rangedHead();
+      else try {
         response = await this.send("RecoveryHead", "HEAD", this.objectUrl(key), conditions);
         if (response.status >= 200 && response.status < 300) object(key, response.headers);
       }
       catch {
         // Android's native bridge can discard non-2xx HEAD. A ranged GET provides a bounded,
         // authoritative existence/precondition result; network failure still fails closed.
-        response = await this.send("RecoveryHeadFallback", "GET", this.objectUrl(key), { ...conditions, range: "bytes=0-0", "accept-encoding": "identity" });
-        const range = header(response.headers, "content-range");
-        if (range && /\/(\d+)$/.test(range)) response.headers["content-length"] = /\/(\d+)$/.exec(range)![1];
+        response = await rangedHead();
       }
       if (response.status === 404) return null;
       if (response.status === 412) throw new RemoteObjectChangedError();

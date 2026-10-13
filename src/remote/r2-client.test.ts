@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { setRequestUrlHandler } from "../../test/obsidian";
+import { Platform, setRequestUrlHandler } from "../../test/obsidian";
 import { RemoteHttpError, RemoteObjectChangedError, SignedR2ListClient } from "./r2-client";
 import { encodeTombstone, tombstoneKey } from "./tombstones";
 
@@ -174,6 +174,43 @@ describe("SignedR2ListClient.deleteTombstone / deleteObject", () => {
 
 
 describe("recovery HEAD fallback", () => {
+  it("uses ranged GET on Android rather than trusting an erroneous zero-length HEAD", async () => {
+    Platform.isAndroidApp = true;
+    const methods: string[] = [];
+    try {
+      setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => {
+        methods.push(request.method ?? "GET");
+        expect(request.headers?.["if-match"]).toBe('"e"');
+        return { status: 206, headers: { ETag: '"e"', "Content-Length": "1", "Content-Range": "bytes 0-0/102", "Last-Modified": "Tue, 13 Oct 2026 00:00:00 GMT" }, text: "x", arrayBuffer: new Uint8Array([120]).buffer };
+      });
+      expect(await client().observeObject("note.md", { ifMatch: "e" })).toMatchObject({ size: 102, etag: "e" });
+      expect(methods).toEqual(["GET"]);
+    } finally { Platform.isAndroidApp = false; }
+  });
+  it("observes empty Android objects with the same ETag after range 416", async () => {
+    Platform.isAndroidApp = true;
+    try {
+      setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => {
+        expect(request.headers?.["if-match"]).toBe('"e"');
+        return request.headers?.range ? { status: 416, headers: {}, text: "", arrayBuffer: new ArrayBuffer(0) } : { status: 200, headers: { etag: '"e"', "content-length": "0", "last-modified": "Tue, 13 Oct 2026 00:00:00 GMT" }, text: "", arrayBuffer: new ArrayBuffer(0) };
+      });
+      expect(await client().observeObject("empty.md", { ifMatch: "e" })).toMatchObject({ size: 0, etag: "e" });
+    } finally { Platform.isAndroidApp = false; }
+  });
+  it("never mistakes a partial byte for full size when the native bridge strips Content-Range", async () => {
+    Platform.isAndroidApp = true;
+    const ranges: Array<string | undefined> = [];
+    try {
+      setRequestUrlHandler(async request => {
+        ranges.push(request.headers?.range);
+        expect(request.headers?.["if-match"]).toBe('"e"');
+        const size = request.headers?.range ? 1 : 102;
+        return { status: request.headers?.range ? 206 : 200, headers: { etag: '"e"', "content-length": String(size), "last-modified": "Tue, 13 Oct 2026 00:00:00 GMT" }, text: "", arrayBuffer: new ArrayBuffer(size) };
+      });
+      expect(await client().observeObject("note.md", { ifMatch: "e" })).toMatchObject({ size: 102 });
+      expect(ranges).toEqual(["bytes=0-0", undefined]);
+    } finally { Platform.isAndroidApp = false; }
+  });
   it("uses the conditional metadata fallback for ordinary incremental sync", async () => {
     const calls: Array<{ method?: string; headers?: Record<string, string> }> = [];
     setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => {
@@ -187,9 +224,9 @@ describe("recovery HEAD fallback", () => {
     expect(calls[1].headers?.["if-match"]).toBe('"e"');
   });
   it("keeps ordinary missing-object and changed-object observations typed", async () => {
-    setRequestUrlHandler(async request => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 404, arrayBuffer: new ArrayBuffer(0), text: "missing", headers: {} }; });
+    setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 404, arrayBuffer: new ArrayBuffer(0), text: "missing", headers: {} }; });
     await expect(client().observeObject("missing.md")).rejects.toMatchObject({ status: 404 });
-    setRequestUrlHandler(async request => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 412, arrayBuffer: new ArrayBuffer(0), text: "changed", headers: {} }; });
+    setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 412, arrayBuffer: new ArrayBuffer(0), text: "changed", headers: {} }; });
     await expect(client().observeObject("changed.md", { ifMatch: "old" })).rejects.toBeInstanceOf(RemoteObjectChangedError);
   });
   it("falls back to conditional ranged GET when HEAD omits canonical metadata", async () => {
