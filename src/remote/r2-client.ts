@@ -1,4 +1,6 @@
 import { RemoteHttpError, RemoteObjectChangedError } from "./errors";
+import type { RecoveryObject, RecoveryPort } from "@mineral/sync-core/recovery";
+import { isSystemStorageKey } from "@mineral/sync-core/storage";
 import { SettingsCredentialProvider } from "./credentials";
 import { Aws4FetchSigner, type RequestSigner } from "./signer";
 import { RequestUrlTransport, type HttpTransport } from "./transport";
@@ -9,6 +11,7 @@ import { TOMBSTONE_READ_NAMESPACES, encodeTombstone, isInternalRemoteKey, parseT
 export interface R2Configuration { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; remotePrefix: string; }
 export type RemoteDebugLogger = (message: string) => void;
 export interface R2Client {
+  recoveryPort?(): RecoveryPort;
   listObjects(): Promise<RemoteEntry[]>;
   /** Lists validated logical-deletion metadata separately from user objects. */
   listTombstones?(): Promise<RemoteDeletion[]>;
@@ -32,7 +35,7 @@ function xmlEntries(xml: string, prefix: string): { entries: RemoteEntry[]; next
   const document = new DOMParser().parseFromString(xml, "application/xml"); if (document.querySelector("parsererror")) throw new Error("R2 returned an invalid ListObjectsV2 response");
   const entries: RemoteEntry[] = [];
   for (const node of Array.from(document.getElementsByTagName("Contents"))) {
-    const objectKey = xmlText(node, "Key"); if (!objectKey) continue; const key = vaultKeyFromRemote(prefix, objectKey); if (!key || isInternalRemoteKey(key)) continue;
+    const objectKey = xmlText(node, "Key"); if (!objectKey) continue; const key = vaultKeyFromRemote(prefix, objectKey); if (!key || isSystemStorageKey(key) || isInternalRemoteKey(key)) continue;
     const size = Number(xmlText(node, "Size")), lastModified = Date.parse(xmlText(node, "LastModified") ?? "");
     if (!Number.isFinite(size) || !Number.isFinite(lastModified)) throw new Error("R2 list response contained invalid object metadata");
     entries.push({ key, size, etag: xmlText(node, "ETag")?.replace(/^"|"$/g, ""), lastModified });
@@ -91,6 +94,75 @@ export class SignedR2ListClient implements R2Client {
       if (page.truncated && !token) throw new Error("R2 list response was truncated without a continuation token");
     } while (token);
     return [...output.values()].sort((a, b) => a.key.localeCompare(b.key));
+  }
+  /** Direct S3 recovery adapter. It has no gateway dependency and never reads a local mirror. */
+  recoveryPort(): RecoveryPort {
+    const object = (key: string, headers: Record<string, string>): RecoveryObject => {
+      const entry = objectEntry(key, headers);
+      if (!entry.etag) throw new Error("Recovery object lacked ETag");
+      const metadata: Record<string, string> = {};
+      for (const [name, value] of Object.entries(headers)) if (name.toLowerCase().startsWith("x-amz-meta-")) metadata[name.slice(11).toLowerCase()] = value;
+      const httpMetadata: Record<string, string> = {};
+      for (const name of ["content-type", "cache-control", "content-disposition", "content-encoding", "content-language", "expires"]) { const value = header(headers, name); if (value) httpMetadata[name] = value; }
+      return { key, etag: entry.etag, size: entry.size, modified: new Date(entry.lastModified).toISOString(), contentType: header(headers, "content-type") ?? "application/octet-stream", metadata, httpMetadata };
+    };
+    const head = async (key: string, etag?: string): Promise<RecoveryObject | null> => {
+      let response;
+      const conditions: Record<string, string> = etag ? { "if-match": `"${etag}"` } : {};
+      try {
+        response = await this.send("RecoveryHead", "HEAD", this.objectUrl(key), conditions);
+        if (response.status >= 200 && response.status < 300) object(key, response.headers);
+      }
+      catch {
+        // Android's native bridge can discard non-2xx HEAD. A ranged GET provides a bounded,
+        // authoritative existence/precondition result; network failure still fails closed.
+        response = await this.send("RecoveryHeadFallback", "GET", this.objectUrl(key), { ...conditions, range: "bytes=0-0", "accept-encoding": "identity" });
+        const range = header(response.headers, "content-range");
+        if (range && /\/(\d+)$/.test(range)) response.headers["content-length"] = /\/(\d+)$/.exec(range)![1];
+      }
+      if (response.status === 404) return null;
+      if (response.status === 412) throw new RemoteObjectChangedError();
+      if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("RecoveryHead", response.status);
+      const result = object(key, response.headers);
+      if (etag && result.etag !== etag) throw new RemoteObjectChangedError();
+      return result;
+    };
+    return {
+      list: async (prefix) => {
+        if (!prefix.startsWith(".mineral/") && !prefix.startsWith(".mineral-sync/tombstones/")) throw new Error("Invalid recovery listing namespace");
+        const entries = await this.listRaw(`${normalizePrefix(this.config.remotePrefix)}${prefix}`);
+        const result: RecoveryObject[] = [];
+        for (const entry of entries) {
+          const key = vaultKeyFromRemote(this.config.remotePrefix, entry.key);
+          if (!key || !key.startsWith(prefix) || !entry.etag) throw new Error("Recovery listing escaped prefix");
+          result.push({ key, etag: entry.etag, size: entry.size, modified: new Date(entry.lastModified).toISOString(), contentType: "application/octet-stream", metadata: {} });
+        }
+        return result;
+      },
+      head,
+      read: async (key, etag) => {
+        const response = await this.send("RecoveryRead", "GET", this.objectUrl(key), { "if-match": `"${etag}"`, "accept-encoding": "identity" });
+        if (response.status === 412) throw new RemoteObjectChangedError();
+        if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("RecoveryRead", response.status);
+        const info = object(key, response.headers);
+        if (info.etag !== etag) throw new RemoteObjectChangedError();
+        return { object: info, bytes: new Uint8Array(response.arrayBuffer) };
+      },
+      put: async (key, bytes, expected, metadata = {}, contentType = "application/octet-stream", httpMetadata = {}) => {
+        const headers: Record<string, string> = { ...httpMetadata, "content-type": contentType, ...(expected === null ? { "if-none-match": "*" } : { "if-match": `"${expected}"` }) };
+        for (const [name, value] of Object.entries(metadata)) headers[`x-amz-meta-${name}`] = value;
+        const response = await this.send("RecoveryPut", "PUT", this.objectUrl(key), headers, bytes.slice().buffer);
+        if (response.status === 412) throw new RemoteObjectChangedError();
+        if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("RecoveryPut", response.status);
+        const etag = header(response.headers, "etag")?.replace(/^"|"$/g, "");
+        if (!etag) throw new Error("Recovery PUT returned no ETag");
+        return { key, etag, size: bytes.byteLength, modified: new Date().toISOString(), contentType, metadata, httpMetadata };
+      },
+      remove: async (key) => {
+        const response = await this.send("RecoveryDelete", "DELETE", this.objectUrl(key));
+        if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("RecoveryDelete", response.status);
+      },
+    };
   }
   private async listRaw(prefix: string): Promise<Array<{ key: string; size: number; etag?: string; lastModified: number }>> {
     const output: Array<{ key: string; size: number; etag?: string; lastModified: number }> = []; let token: string | undefined;

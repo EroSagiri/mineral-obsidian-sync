@@ -34,7 +34,8 @@ import type { GatewayTransport } from "./transport";
  */
 export type LandedWrite =
   | { op: "put"; path: string; etag: string; size: number }
-  | { op: "delete"; path: string; etag: string };
+  | { op: "delete"; path: string; etag: string }
+  | { op: "delete"; path: string; physicalDeleted: true; etag?: never };
 
 /** The mutation vocabulary, as the Vault's ingress accepts it from a writer. */
 export interface WriterMutation {
@@ -43,7 +44,7 @@ export interface WriterMutation {
   committedAt: number;
   op: "put" | "delete";
   path: string;
-  etag: string;
+  etag?: string;
   size?: number;
 }
 
@@ -138,6 +139,7 @@ function defaultNewId(now: number): string {
  * be rejected. There is no "report it anyway" path — an unverifiable report is noise, not evidence.
  */
 export function mutationForWrite(write: LandedWrite, id: string, committedAt: number): WriterMutation | undefined {
+  if (write.op === "delete" && "physicalDeleted" in write && write.physicalDeleted) return { id, source: "obsidian", committedAt, op: "delete", path: write.path };
   if (!write.etag || write.etag.length > 256) return undefined;
   if (write.op === "delete") return { id, source: "obsidian", committedAt, op: "delete", path: write.path, etag: write.etag };
   if (!Number.isFinite(write.size) || write.size < 0) return undefined;

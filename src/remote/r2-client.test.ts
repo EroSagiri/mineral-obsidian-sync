@@ -171,3 +171,28 @@ describe("SignedR2ListClient.deleteTombstone / deleteObject", () => {
     await expect(client().deleteObject("notes/a.md")).rejects.toMatchObject({ operation: "DeleteObject", status: 403 });
   });
 });
+
+
+describe("recovery HEAD fallback", () => {
+  it("falls back to conditional ranged GET when HEAD omits canonical metadata", async () => {
+    const calls: Array<{ method?: string; headers?: Record<string, string> }> = [];
+    setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => {
+      calls.push(request);
+      return request.method === "HEAD"
+        ? { status: 200, arrayBuffer: new ArrayBuffer(0), text: "", headers: { etag: '"e"' } }
+        : { status: 206, arrayBuffer: new Uint8Array([1]).buffer, text: "", headers: { etag: '"e"', "content-length": "1", "content-range": "bytes 0-0/1024", "last-modified": "Tue, 13 Oct 2026 00:00:00 GMT" } };
+    });
+    const result = await client().recoveryPort().head("note.md", "e");
+    expect(result?.size).toBe(1024); expect(calls.map(c => c.method)).toEqual(["HEAD", "GET"]);
+    expect(calls[1].headers?.["if-match"]).toBe('"e"'); expect(calls[1].headers?.range).toBe("bytes=0-0");
+  });
+  it("preserves a 404 existence result on Android when its native HEAD bridge rejects", async () => {
+    setRequestUrlHandler(async (request): Promise<import("../../test/obsidian").MockRequestUrlResponse> => { if (request.method === "HEAD") throw new Error("Stream closed"); return { status: 404, arrayBuffer: new ArrayBuffer(0), text: "missing", headers: {} }; });
+    expect(await client().recoveryPort().head("missing.md")).toBeNull();
+  });
+  it("excludes the entire .mineral namespace from ordinary R2 listing", async () => {
+    setRequestUrlHandler(async () => ({ status: 200, arrayBuffer: new ArrayBuffer(0), text: '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>sync/.mineral/versions/v/content/note.md</Key><Size>1</Size><ETag>e</ETag><LastModified>2026-10-13T00:00:00Z</LastModified></Contents></ListBucketResult>', headers: {} }));
+    const { installDomParserShim } = await import("../../test/integration/dom-parser-shim"); installDomParserShim();
+    expect(await client().listObjects()).toEqual([]);
+  });
+});

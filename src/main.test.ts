@@ -656,41 +656,11 @@ describe("a Gateway delete reaches the resolver as a deletion", () => {
   });
 });
 
-describe("tombstone retention is a once-per-session pass", () => {  /** The pass resolves a channel (a digest) and then talks to R2, so microtasks alone do not settle it. */
-  const settle = async (): Promise<void> => { for (let index = 0; index < 8; index++) await new Promise((resolve) => setTimeout(resolve, 0)); await flush(); };
-
-  it("waits for a reconciliation to finish, then runs exactly once", async () => {
+describe("physical recovery cleanup requires explicit intent", () => {
+  it("does not expose the former automatic tombstone cleanup", () => {
     const env = historyEnv();
-    const skipped = () => env.logs.filter((line) => line.startsWith("tombstone cleanup")).length;
-
-    // A cycle that has not finished is not a moment to read (and possibly remove) remote metadata.
-    env.plugin.maybePruneTombstones("debouncing");
-    expect(env.plugin.tombstoneCleanup).toBe("waiting");
-    env.plugin.maybePruneTombstones("running");
-    expect(env.plugin.tombstoneCleanup).toBe("ready");
-    expect(skipped()).toBe(0);
-
-    env.plugin.maybePruneTombstones("idle");
-    await settle();
-    expect(env.plugin.tombstoneCleanup).toBe("done");
-    // The pass runs, and a failure inside it stays a debug line: retention is housekeeping, not sync.
-    expect(skipped()).toBe(1);
-
-    // Every later cycle is ignored, because the window is measured in weeks.
-    env.plugin.maybePruneTombstones("running");
-    env.plugin.maybePruneTombstones("idle");
-    await settle();
-    expect(env.plugin.tombstoneCleanup).toBe("done");
-    expect(skipped()).toBe(1);
-  });
-
-  it("does not reach the network without a configured namespace", async () => {
-    const env = historyEnv();
-    env.plugin.settings = { ...env.settings, endpoint: "", bucket: "" };
-
-    await env.plugin.pruneTombstones();
-
-    expect(env.logs.filter((line) => line.startsWith("tombstone cleanup"))).toEqual([]);
+    expect(env.plugin.maybePruneTombstones).toBeUndefined();
+    expect(env.plugin.pruneTombstones).toBeUndefined();
   });
 });
 
@@ -758,8 +728,8 @@ describe("restoring an earlier version", () => {
     env.plugin.openStatusMenu({ preventDefault: () => {} } as unknown as MouseEvent);
 
     const items = menus.shown[menus.shown.length - 1]!.items;
-    expect(items.map((item) => item.title)).toEqual(["同步历史", "状态详情"]);
-    items[0]!.callback();
+    expect(items.map((item) => item.title)).toEqual(["全局恢复中心（R2）", "同步历史", "状态详情"]);
+    items[1]!.callback();
     expect(opened).toBe(1);
   });
 });

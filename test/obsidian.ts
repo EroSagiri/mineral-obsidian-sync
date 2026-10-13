@@ -242,3 +242,6 @@ export interface MenuStubItem {
   setIcon(name: string): MenuStubItem;
   onClick(handler: () => void): MenuStubItem;
 }
+
+export class Component { load(): void {} unload(): void {} }
+export const MarkdownRenderer = { render: async (_app: unknown, text: string, target: { createEl(tag: string, options: { text: string }): unknown }) => { target.createEl("p", { text }); } };

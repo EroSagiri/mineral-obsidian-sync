@@ -473,6 +473,7 @@ function landedWriteForOperation(operation: SyncOperation, result: OperationResu
     return { op: "put", path: operation.key, etag: revision.etag, size: revision.size };
   }
   if (operation.type === "delete-remote" || operation.type === "resolve-accept-local-delete") {
+    if ("physicalDeleted" in result && result.physicalDeleted) return { op: "delete", path: operation.key, physicalDeleted: true };
     const retired = "retired" in result ? result.retired : undefined;
     return retired ? { op: "delete", path: operation.key, etag: retired } : undefined;
   }

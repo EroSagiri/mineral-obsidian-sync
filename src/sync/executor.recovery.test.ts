@@ -1,0 +1,41 @@
+import { describe, expect, it, vi } from "vitest";
+import type { Vault } from "obsidian";
+import { RecoveryStore, recoverySelection } from "@mineral/sync-core/recovery";
+import { SafeExecutor } from "./executor";
+import type { StateStore } from "../state/sync-state";
+import type { R2Client } from "../remote/r2-client";
+import { RecoveryMemory } from "../../test/recovery-memory";
+const identity = { endpoint: "https://r2.example", bucket: "bucket", remotePrefix: "" };
+async function setup(confirmed = true, offline = false) {
+  const port = new RecoveryMemory(); await port.put("note.md", new TextEncoder().encode("old"), null);
+  const state: StateStore = { loadAll: async () => new Map(), saveAll: async () => {}, saveVerified: async () => {}, put: async () => {}, delete: vi.fn(async () => {}) };
+  const client: R2Client = { recoveryPort: () => port, listObjects: async () => [], headObject: async key => { const o = await port.head(key); if (!o) throw new Error("404"); return { key, size: o.size, etag: o.etag, lastModified: Date.parse(o.modified) }; }, getObject: async (key, options) => (await port.read(key, options!.ifMatch!)).bytes.slice().buffer, putObject: async (key, body, options) => port.put(key, new Uint8Array(body), options.ifMatch ?? null) };
+  const changed = vi.fn(async () => { if (offline) throw new Error("gateway offline"); });
+  const executor = new SafeExecutor({} as Vault, client, state, identity, "", undefined, undefined, undefined, { confirmDelete: async () => confirmed, changed });
+  return { port, state, executor, changed, store: new RecoveryStore(port, JSON.stringify(identity)) };
+}
+describe("SafeExecutor owns recovery mutation ingress", () => {
+  it("requires confirmation for normal sync physical deletion", async () => {
+    const { executor, port } = await setup(false);
+    expect(await executor.execute({ type: "delete-remote", key: "note.md", reason: "local-deleted", expectedRemoteETag: "e1" })).toMatchObject({ status: "blocked", reason: "physical-delete-confirmation-required" });
+    expect(await port.head("note.md")).not.toBeNull();
+  });
+  it("verifies real absence, prunes only then, and announces even with gateway offline", async () => {
+    const { executor, port, state, changed } = await setup(true, true);
+    expect(await executor.execute({ type: "delete-remote", key: "note.md", reason: "local-deleted", expectedRemoteETag: "e1" })).toMatchObject({ status: "applied", physicalDeleted: true });
+    expect(await port.head("note.md")).toBeNull(); expect(state.delete).toHaveBeenCalledWith("note.md"); expect(changed).toHaveBeenCalled();
+  });
+  it("offline restore and cleanup still execute R2 intents and call optional notifier", async () => {
+    const { executor, port, store, changed } = await setup(true, true);
+    const entry = await store.backup("note.md", "e1");
+    await executor.executeRecovery({ identity: store.identity, confirmed: true, action: "restore", selection: recoverySelection(entry), target: "new.md", expectedTargetETag: null });
+    await executor.executeRecovery({ identity: store.identity, confirmed: true, action: "clean", selections: [recoverySelection(entry)] });
+    expect(await port.head("new.md")).not.toBeNull(); expect(await store.list()).toEqual([]); expect(changed).toHaveBeenCalledTimes(2);
+  });
+  it("pending unknown DELETE retains baseline and subsequent scan retry finishes it", async () => {
+    const { executor, port, store, state } = await setup(); port.unknownDelete = true;
+    expect(await executor.execute({ type: "delete-remote", key: "note.md", reason: "local-deleted", expectedRemoteETag: "e1" })).toMatchObject({ status: "partial", reason: "physical-delete-pending" });
+    expect(state.delete).not.toHaveBeenCalled(); port.unknownDelete = false; await executor.retryRecoveryDeletes();
+    expect((await store.list()).find(e => e.kind === "version")!.state).toBe("deleted");
+  });
+});

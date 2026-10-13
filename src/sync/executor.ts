@@ -1,3 +1,4 @@
+import { RecoveryStore, type RecoveryIntent } from "@mineral/sync-core/recovery";
 import type { TFile, Vault } from "obsidian";
 import { ensureParentFolders } from "../local/ensure-folders";
 import { LocalFileChangedError, readCurrentStableLocalBytes, readStableLocalBytes } from "../local/read-local";
@@ -6,7 +7,7 @@ import type { R2Client } from "../remote/r2-client";
 import { TOMBSTONE_PROTOCOL, type RemoteTombstone } from "../remote/tombstones";
 import type { StateStore } from "../state/sync-state";
 import type { LocalEntry, PreviousEntry, RemoteIdentity, RemoteVersion, SyncOperation } from "./types";
-import { pathDigest } from "./path";
+import { canonicalKey, pathDigest } from "./path";
 import { sha256 } from "./fingerprint";
 
 /**
@@ -46,6 +47,7 @@ export type ResolutionWriteFailure = "target-missing" | "target-path-is-folder" 
  * a cycle's remote observation incomplete and no Gateway generation may be retired from it.
  */
 export type PartialReason =
+  | "physical-delete-pending"
   /** A conditional PUT landed and the local half (the catch-up, or the resolved write) did not. */
   | "remote-applied-local-changed"
   /** A completed local write was superseded by an editor save before its content could be verified. */
@@ -74,13 +76,13 @@ export type PartialReason =
  */
 export type OperationResult =
   | /** `retired` is the remote revision this operation logically deleted, when it deleted one. */
-  { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry; remote?: RemoteVersion; retired?: string }
+  { status: "applied"; key: string; /** Exact Vault version written by this executor, if it wrote locally. */ localWrite?: LocalEntry; remote?: RemoteVersion; retired?: string; physicalDeleted?: true }
   | { status: "stale"; key: string; reason: "local-changed" | "remote-changed" | "conflict-superseded" }
-  | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" | "remote-deletion-requires-version-identity" }
+  | { status: "blocked"; key: string; reason: "deletion-not-supported-in-phase-2a" | "missing-remote-etag" | "remote-deletion-requires-version-identity" | "physical-delete-confirmation-required" }
   /** A definitive negative answer: a received 4xx, or a Vault path that cannot hold the write. */
   | { status: "failed"; key: string; error: string; reason?: VaultWriteFailure | VaultTrashFailure | ResolutionWriteFailure; httpStatus?: number }
   /** The outcome of the write is genuinely unknown, or the baseline could not be committed. */
-  | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed"; remote?: RemoteVersion; retired?: string }
+  | { status: "unresolved"; key: string; reason: "ambiguous-put" | "state-commit-failed"; remote?: RemoteVersion; retired?: string; physicalDeleted?: true }
   /**
    * A transfer that may have left a side effect this device cannot describe with a baseline.
    *
@@ -129,7 +131,42 @@ export class SafeExecutor {
     private readonly files?: VaultFileRemover,
     private readonly mergeBase?: MergeBaseRecorder,
     private readonly debug?: (message: string) => void,
+    private readonly recoveryHooks?: { confirmDelete(path: string): Promise<boolean>; changed(): Promise<void> },
   ) {}
+
+  private recoveryStore(): RecoveryStore {
+    const port = this.r2.recoveryPort?.();
+    if (!port) throw new Error("Recovery storage unavailable");
+    return new RecoveryStore(port, JSON.stringify(this.identity));
+  }
+  async executeRecovery(intent: RecoveryIntent): Promise<void> {
+    try { await this.recoveryStore().execute(intent); }
+    finally { await this.recoveryHooks?.changed().catch(() => {}); }
+  }
+  /** Local sync-history restoration uses the same mutation boundary; the planner handles its upload. */
+  async restoreLocalHistory(path: string, content: string): Promise<void> {
+    canonicalKey(path);
+    if (path.startsWith(".mineral/") || path.startsWith(".mineral-sync/")) throw new Error("Internal recovery mirrors cannot be restored into the Vault");
+    const file = this.vault.getFileByPath(path);
+    if (file) await this.vault.modify(file, content);
+    else {
+      const prepared = await ensureParentFolders(this.vault, path);
+      if (!prepared.ok) throw new Error(`restore target folder unavailable (${prepared.reason})`);
+      await this.vault.create(path, content);
+    }
+  }
+  async retryRecoveryDeletes(): Promise<void> {
+    if (!this.r2.recoveryPort) return;
+    const count = await this.recoveryStore().retryPending();
+    if (count) await this.recoveryHooks?.changed().catch(() => {});
+  }
+  private async putWithBackup(key: string, bytes: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion> {
+    if (options.ifMatch && this.r2.recoveryPort) {
+      await this.recoveryStore().backup(key, options.ifMatch);
+      await this.recoveryHooks?.changed().catch(() => {});
+    }
+    return this.r2.putObject(key, bytes, options);
+  }
 
   /** Diagnostic categories only: never a key, never content, never request metadata. */
   private log(message: string): void { this.debug?.(message); }
@@ -191,7 +228,7 @@ export class SafeExecutor {
     return this.pruneResult(operation.key);
   }
 
-  private async pruneResult(key: string, retired?: { retired: string }): Promise<OperationResult> {
+  private async pruneResult(key: string, retired?: { retired: string }): Promise<Extract<OperationResult, { status: "applied" | "unresolved" }>> {
     try { await this.state.delete(key); return { status: "applied", key, ...retired }; }
     catch { return { status: "unresolved", key, reason: "state-commit-failed", ...retired }; }
   }
@@ -204,6 +241,18 @@ export class SafeExecutor {
   private async deleteRemote(operation: Extract<SyncOperation, { type: "delete-remote" }>): Promise<OperationResult> {
     const etag = operation.expectedRemoteETag;
     if (!etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
+    if (this.r2.recoveryPort) {
+      if (!await this.recoveryHooks?.confirmDelete(operation.key)) return { status: "blocked", key: operation.key, reason: "physical-delete-confirmation-required" };
+      try {
+        const result = await this.recoveryStore().deleteFile(operation.key, etag, true);
+        if (result.state !== "deleted") return { status: "partial", key: operation.key, reason: "physical-delete-pending" };
+        // Physical absence is the fact the gateway journal verifies for this deletion.
+        const pruned = await this.pruneResult(operation.key);
+        return { ...pruned, physicalDeleted: true };
+      } catch (error) {
+        return error instanceof RemoteObjectChangedError ? { status: "stale", key: operation.key, reason: "remote-changed" } : { status: "failed", key: operation.key, error: message(error) };
+      } finally { await this.recoveryHooks?.changed().catch(() => {}); }
+    }
     if (!this.r2.putTombstone) return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
     try {
       await this.verifyObjectVersion(operation.key, etag);
@@ -255,7 +304,7 @@ export class SafeExecutor {
     try { bytes = await readStableLocalBytes(this.vault, operation.expectedLocal); }
     catch (error) { return error instanceof LocalFileChangedError ? { status: "stale", key: operation.key, reason: "local-changed" } : { status: "failed", key: operation.key, error: message(error) }; }
     let remote: RemoteVersion;
-    try { remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemoteAbsent ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemoteETag! }); }
+    try { remote = await this.putWithBackup(operation.key, bytes, operation.expectedRemoteAbsent ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemoteETag! }); }
     catch (error) { return uploadFailure("PutObject", operation.key, error); }
     // The remote now holds L, which `bytes` were read from `expectedLocal`: recording that pair is the
     // same invariant every other landed PUT has. Leaving it uncommitted is what makes the device's own
@@ -310,7 +359,7 @@ export class SafeExecutor {
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "stale", key: operation.key, reason: "conflict-superseded" };
     const mergedBytes = encodeMerged(operation.merged);
     let remote: RemoteVersion;
-    try { remote = await this.r2.putObject(operation.key, mergedBytes, { ifMatch: operation.expectedRemoteETag }); }
+    try { remote = await this.putWithBackup(operation.key, mergedBytes, { ifMatch: operation.expectedRemoteETag }); }
     catch (error) { return uploadFailure("PutObject", operation.key, error); }
     // The remote holds M. Re-check the local precondition before overwriting the user's file.
     if (!(await localStillMatches(this.vault, operation.key, operation.expectedLocal))) return { status: "partial", key: operation.key, reason: "remote-applied-local-changed" };
@@ -435,7 +484,7 @@ export class SafeExecutor {
     let bytes: ArrayBuffer;
     try { bytes = await readStableLocalBytes(this.vault, operation.expectedLocal); } catch (error) { return error instanceof LocalFileChangedError ? { status: "stale", key: operation.key, reason: "local-changed" } : { status: "failed", key: operation.key, error: message(error) }; }
     try {
-      const remote = await this.r2.putObject(operation.key, bytes, operation.expectedRemote.kind === "absent" ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemote.value! });
+      const remote = await this.putWithBackup(operation.key, bytes, operation.expectedRemote.kind === "absent" ? { ifNoneMatch: "*" } : { ifMatch: operation.expectedRemote.value! });
       this.log(`upload landed path-digest=${pathDigest(operation.key)} etag=${shortEtag(remote.etag)}`);
       const floor = await this.commitFloorBaseline(operation.key, operation.expectedLocal, remote);
       if (floor) return this.landed(floor, remote);
@@ -471,7 +520,7 @@ export class SafeExecutor {
     try { latest = await readCurrentStableLocalBytes(this.vault, key); }
     catch { return partial(landedRemote); }
     try {
-      const remote = await this.r2.putObject(key, latest.bytes, { ifMatch: landedRemote.etag });
+      const remote = await this.putWithBackup(key, latest.bytes, { ifMatch: landedRemote.etag });
       this.log(`upload catch-up landed path-digest=${pathDigest(key)} etag=${shortEtag(remote.etag)}`);
       // This PUT landed as well, so the pair it carried is recorded before anything else can fail —
       // the same invariant the first PUT has. It is the newer of the two floors, and without it the

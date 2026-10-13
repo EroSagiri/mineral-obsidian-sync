@@ -286,7 +286,7 @@ await step(
 
 if (!args.skipInstall) {
   await step(`npm install in ${consumerDir}`, async () => {
-    await run("npm", ["install"], { cwd: consumerDir });
+    await run("npm", ["install", `@mineral/sync-core@${newDep}`], { cwd: consumerDir });
   });
 } else {
   process.stdout.write("→ skip-install set: consumer lockfile untouched; re-run without it before commit\n");

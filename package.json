@@ -1,7 +1,7 @@
 {
   "name": "mineral-obsidian-sync",
-  "version": "0.0.2",
-  "description": "Read-only dry-run planner for R2-backed Obsidian vault sync.",
+  "version": "0.0.3",
+  "description": "R2 sync with a global recovery center and backed-up physical deletion.",
   "private": true,
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -19,7 +19,7 @@
     "vitest": "^3.1.1"
   },
   "dependencies": {
-    "@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.2.tgz",
+    "@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.3.tgz",
     "aws4fetch": "^1.0.20",
     "node-diff3": "^3.2.1"
   }

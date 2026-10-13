@@ -8,40 +8,29 @@ would make a fresh clone unbuildable on any other machine.
 | Field | Value |
 | --- | --- |
 | Package | `@mineral/sync-core` |
-| Version | `0.1.0` |
+| Version | `0.0.3` |
 | Source repository | `bedrock-mcp` (`packages/sync-core`) |
-| Source commit | `adc924e` — the commit the artifact was packed from (`git log -1 -- packages/sync-core`) |
-| Artifact | `vendor/mineral-sync-core-0.1.0.tgz` |
-| SHA-256 (tarball) | `5BCBDF9D625A5E6393844AA9734CCE77706630079D51682E38DEB489FF2DF685` |
-| npm shasum | `1f5f4f94127e9e6b5f519ce5a303d3865baae6fe` |
-| npm integrity | `sha512-RlbQeOwqhzQCCfek5ROIZpCZzEblrGYMJDZBXTf2+3nGUqR5kik6bBKTWHl8FfmCalNtEgfOpY4T9RO2o+IQMA==` |
-| Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.1.0.tgz"` |
+| Source commit | `912b234` — backend recovery implementation |
+| Artifact | `vendor/mineral-sync-core-0.0.3.tgz` |
+| SHA-256 (tarball) | `56A1942D3A7C69E24ABB3C2D90792A5FF42202092490360C09888D361A224549` |
+| npm shasum | `3551d060ecc17a095e0147d73deacfd789501e2c` |
+| npm integrity | `sha512-Sn5jgygTI1Mc9bDR1RHMHnJ2a4Bq29IqhpSUbo9FLKwk3qNLMfN5W0weTSNZQpfe39K6SjlX2Gz2mhCHpx096Q==` |
+| Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.3.tgz"` |
 
-This revision carries the mutation contract the plugin reports against: `RemoteChangeHint.mutationId`
-(the gateway's writer idempotency key) and the `RemoteChange[]` hint the `/dirty` route accepts. It is
-the same source the Vault's `packages/sync-core` publishes, so the plugin and the backend cannot drift
-apart on the wire.
+This revision includes the portable R2 recovery store, TOML manifests, safe recovery selections,
+and mutation notification contracts used by both the plugin and backend.
 
 ## Rebuilding this artifact
 
-```powershell
-cd <backend>
-npm run build -w @mineral/sync-core   # tsc -> packages/sync-core/dist (js + d.ts)
-npm pack --silent -w @mineral/sync-core   # -> ./mineral-sync-core-0.1.0.tgz at the repo root
-Copy-Item -Force .\mineral-sync-core-0.1.0.tgz <plugin>\vendor\
-```
-
-Then update the source commit and hash in this table. Npm verifies the tarball contents against the
-integrity hash recorded in the plugin's `package-lock.json`, so replacing the file without
-reinstalling fails the install instead of silently mixing versions. The lockfile is regenerated
-alongside it:
+Run from the plugin repository:
 
 ```powershell
-Remove-Item -Force package-lock.json
-Remove-Item -Recurse -Force node_modules
-npm install
+node scripts/vendor-sync-core.mjs --from C:/path/to/bedrock-mcp
 ```
 
+The script builds and packs the shared package, refreshes the dependency and lockfile, and updates
+artifact hashes. Update the source commit above to the backend commit containing the packed source.
+For a same-version rebuild, explicitly reinstall the tarball to refresh npm's cached dependency.
 ## What is vendored, and what is not
 
 Only compiled output (`dist/*.js`, `dist/*.d.ts`) is vendored. The package source is **not** copied

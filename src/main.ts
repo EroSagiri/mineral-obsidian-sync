@@ -4,7 +4,8 @@ import { readStableLocalBytes } from "./local/read-local";
 import { flushAction, isOwnWrite, writeChangedFile, type FileStamp } from "./local/android-editor-save";
 import { remoteIdentity, SignedR2ListClient } from "./remote/r2-client";
 import { scanRemote } from "./remote/scan-remote";
-import { pruneExpiredTombstones, protectedFromCleanup } from "./remote/tombstone-retention";
+import { RecoveryStore, recoverySelection } from "@mineral/sync-core/recovery";
+import { RecoveryCenter, RECOVERY_CSS, confirmPhysicalDelete } from "./ui/recovery-center";
 import { DEFAULT_SETTINGS, R2SyncSettingTab, type InterfaceLanguage, type R2SyncSettings } from "./settings";
 import { IndexedDbStateStore } from "./state/state-store";
 import { buildBootstrapResult } from "./bootstrap/bootstrap";
@@ -103,7 +104,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
   private readonly history: SyncHistoryStore = new IndexedDbSyncHistoryStore();
   private lastConflictCount = 0;
   /** Retention is a once-per-session pass, held back until a reconciliation has finished. */
-  private tombstoneCleanup: "waiting" | "ready" | "done" = "waiting";
+  private recoveryCenter?: RecoveryCenter;
   /**
    * The mutation journal, as this device writes to it.
    *
@@ -160,6 +161,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.addCommand({ id: "r2-sync-now", name: t("command.syncNow"), callback: () => this.scheduler?.requestReconcile("manual") });
     this.addCommand({ id: "r2-sync-gateway-status", name: t("command.gatewayStatus"), callback: () => this.reportGatewayStatus() });
     this.addCommand({ id: "r2-sync-resolve-conflicts", name: t("command.resolveConflicts"), callback: () => this.openConflictResolver() });
+    this.addCommand({ id: "r2-sync-recovery-center", name: "全局恢复中心（R2）", callback: () => this.openRecoveryCenter() });
     this.addCommand({ id: "r2-sync-history", name: t("command.openHistory"), callback: () => this.openSyncHistory() });
     // Development-only diagnostics: never registered, and not even bundled, in production.
     if (__DEV__) {
@@ -173,7 +175,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     }
     // Theme-variable CSS for the status glyph, the resolver and the history viewer, injected rather than
     // shipped as a second file, so the deployment surface stays exactly `main.js` + `manifest.json`.
-    const statusStyle = document.head.createEl("style", { text: `${SYNC_STATUS_CSS}\n${CONFLICT_RESOLVER_CSS}\n${SYNC_HISTORY_CSS}` });
+    const statusStyle = document.head.createEl("style", { text: `${SYNC_STATUS_CSS}\n${CONFLICT_RESOLVER_CSS}\n${SYNC_HISTORY_CSS}\n${RECOVERY_CSS}` });
     this.register(() => statusStyle.remove());
     this.statusBar = this.addStatusBarItem();
     // Attached once, to the item itself, because its inner content is rebuilt on every state change.
@@ -191,6 +193,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
         onAnnounced: (generation, source, changes) => {
           this.debug(`gateway event remoteGeneration=${generation} lastAppliedGeneration=${this.gateway?.lastReconciled() ?? "0"} source=${source} changes=${changes?.length ?? 0}`);
           this.scheduler?.requestRemoteChange(generation, changes);
+          void this.recoveryCenter?.refresh();
         },
         onStatusChanged: () => this.scheduler?.refreshStatus(),
       },
@@ -388,62 +391,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       conflictCount: this.lastConflictCount,
       lastFailureClass: this.scheduler?.diagnostics?.().lastFailureClass,
     }));
-    this.maybePruneTombstones(state);
-  }
 
-  /**
-   * Tombstone retention runs once per session, and only once a reconciliation has finished.
-   *
-   * Deliberately not at load time. Reading the tombstone namespace is the same work a full reconcile
-   * already does, so doing it while a cycle is in flight would double that work and could interleave a
-   * removal with the scan reading the same records. Waiting for the first cycle costs nothing: the
-   * retention window is measured in weeks, so a few seconds either way cannot matter.
-   */
-  private maybePruneTombstones(state: SchedulerState): void {
-    if (this.tombstoneCleanup === "done") return;
-    if (state === "running") { this.tombstoneCleanup = "ready"; return; }
-    if (this.tombstoneCleanup !== "ready") return;
-    this.tombstoneCleanup = "done";
-    void this.pruneTombstones();
-  }
-
-  /**
-   * Removes tombstones that are old *and* that this device provably no longer needs.
-   *
-   * There is no cluster-wide acknowledgement that every device has seen a deletion, so age alone is
-   * never sufficient. The protections below are the concrete evidence this device has: an unresolved
-   * conflict (which is where a pending decision lives, since a decision can only be authored against a
-   * detected conflict), a baseline that still describes the path, or a local file that is still here.
-   * All three mean "this deletion has not finished happening on this device", and until it has, the
-   * record that names the deleted version is still load-bearing.
-   *
-   * Best effort and silent: this is metadata housekeeping on a path that has nothing to do with the
-   * sync decision, so a failure is a debug line and nothing else.
-   */
-  private async pruneTombstones(): Promise<void> {
-    if (!this.settings.endpoint.trim() || !this.settings.bucket.trim()) return;
-    try {
-      const channel = await this.resolveChannel();
-      if (!channel) return;
-      this.coordinator?.setChannel(channel);
-      const settings: R2SyncSettings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
-      const filter = createVaultPathFilter(settings);
-      const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
-      const [baselines, records] = await Promise.all([this.stateStore.loadAll(), this.coordinator?.list() ?? Promise.resolve([])]);
-      const protections = {
-        conflicted: new Set(records.map((record) => record.path)),
-        baselines: new Set(baselines.keys()),
-        ignored: (key: string) => filter.ignores(key),
-        localFilePresent: (key: string) => this.app.vault.getFileByPath(key) !== null,
-      };
-      await pruneExpiredTombstones(client, {
-        now: Date.now(),
-        protect: (path) => protectedFromCleanup(protections, path),
-        debug: (message) => this.debug(message),
-      });
-    } catch (error) {
-      this.debug(`tombstone cleanup skipped class=${error instanceof Error ? error.name : "unknown"}`);
-    }
   }
 
   /** Busy and error status for the paths that are not a reconcile cycle (inspection, self-tests). */
@@ -469,6 +417,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
    */
   private openStatusMenu(event: MouseEvent): void {
     const menu = new Menu();
+    menu.addItem((item) => item.setTitle("全局恢复中心（R2）").setIcon("archive-restore").onClick(() => this.openRecoveryCenter()));
     menu.addItem((item) => item.setTitle(t("statusMenu.history")).setIcon("history").onClick(() => void this.openSyncHistory()));
     menu.addItem((item) => item.setTitle(t("statusMenu.details")).setIcon("info").onClick(() => this.reportStatusDetails()));
     menu.showAtMouseEvent(event);
@@ -482,6 +431,31 @@ export default class R2PersonalSyncPlugin extends Plugin {
    * from another one. The restore itself is delegated to the plugin, which writes locally and lets the
    * planner decide the rest.
    */
+  openRecoveryCenter(): void {
+    const settings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
+    const identity = remoteIdentity(settings);
+    const client = new SignedR2ListClient(settings);
+    const store = new RecoveryStore(client.recoveryPort(), JSON.stringify(identity));
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicyFingerprint(settings), this.vaultFileRemover(), undefined, undefined, { confirmDelete: path => confirmPhysicalDelete(this.app, path), changed: () => this.recoveryChanged() });
+    this.recoveryCenter?.close();
+    this.recoveryCenter = new RecoveryCenter(this.app, {
+      identity: store.identity,
+      list: () => store.list(),
+      preview: entry => store.preview(recoverySelection(entry)),
+      target: path => store.observeTarget(path),
+      submit: async intent => {
+        if (JSON.stringify(remoteIdentity(this.settings)) !== intent.identity) throw new Error("R2 配置已改变，请重新打开恢复中心");
+        await executor.executeRecovery(intent);
+        this.scheduler?.requestReconcile("manual");
+      },
+    });
+    this.recoveryCenter.open();
+  }
+  private async recoveryChanged(): Promise<void> {
+    // Notification accelerates refresh, never gates an already completed R2 operation.
+    await this.gateway?.markRemoteDirty();
+    void this.recoveryCenter?.refresh();
+  }
   private async openSyncHistory(): Promise<void> {
     const channel = this.currentChannel() ?? await this.resolveChannel();
     if (!channel) { new Notice(t("notice.historyNeedsConfig")); return; }
@@ -745,7 +719,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const identity = remoteIdentity(settings);
     const client = new SignedR2ListClient(settings, undefined, undefined, undefined, (message) => this.debug(message));
     const channel = this.currentChannel();
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message));
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message), { confirmDelete: path => confirmPhysicalDelete(this.app, `将 R2 文件 ${path} 先备份并写墓碑，然后真实删除。`), changed: () => this.recoveryChanged() });
     // One definition of a usable baseline, shared by every observation path in the cycle: a baseline from
     // another namespace, or one invalidated by an ignore-policy change, must never decide anything.
     const acceptsBaseline = (key: string, entry: PreviousEntry): boolean =>
@@ -756,7 +730,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       // Android may retain stale TFile.stat after an omitted Vault event. The adapter is the
       // authoritative local metadata source for both planning and the foreground drift fallback.
       scanLocal: () => Platform.isAndroidApp ? scanLocalAdapterMetadata(this.app.vault, filter) : scanLocal(this.app.vault, filter),
-      scanRemote: () => scanRemote(client, filter, (message) => this.debug(message)),
+      scanRemote: async () => { await executor.retryRecoveryDeletes(); return scanRemote(client, filter, (message) => this.debug(message)); },
       // A Gateway delta is answered path by path: what the event omits is filled in by one exact
       // request, never by a listing. The rules live in `sync/remote-delta` so that they can be tested
       // against the request pattern they are supposed to have.
@@ -984,14 +958,9 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.debug(`history restore requested path-digest=${pathDigest(input.path)} sourceHistoryId=${input.sourceHistoryId}`);
     const file = this.app.vault.getFileByPath(input.path);
     const previousText = file ? await this.app.vault.read(file) : undefined;
-    if (file) await this.app.vault.modify(file, input.content);
-    else {
-      // A restore into a file that no longer exists has to recreate it, so its folders may be gone too.
-      // Checked rather than ignored: a silent failure here would look like a restore that landed.
-      const prepared = await ensureParentFolders(this.app.vault, input.path);
-      if (!prepared.ok) throw new Error(`restore target folder unavailable (${prepared.reason})`);
-      await this.app.vault.create(input.path, input.content);
-    }
+    const settings = { ...this.settings, ignoredPaths: [...this.settings.ignoredPaths] };
+    const executor = new SafeExecutor(this.app.vault, new SignedR2ListClient(settings), this.stateStore, remoteIdentity(settings), ignorePolicyFingerprint(settings));
+    await executor.restoreLocalHistory(input.path, input.content);
     try {
       // Recorded after the write, so a failed write leaves no entry claiming it happened.
       await this.history.record(await restoreHistoryEntry({

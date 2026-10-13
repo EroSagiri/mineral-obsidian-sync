@@ -51,6 +51,7 @@ export class R2SyncSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
       });
     });
+    new Setting(containerEl).setName("全局恢复中心").setDesc("直接访问 R2 中的已删除文件和版本；Windows 与 Android 共用同一份恢复数据。").addButton(button => button.setButtonText("打开恢复中心").onClick(() => this.plugin.openRecoveryCenter()));
     containerEl.createEl("h3", { text: t("settings.sectionGateway") });
     containerEl.createEl("p", { text: t("settings.sectionGatewayDesc") });
     new Setting(containerEl).setName(t("settings.gatewayEnabled")).setDesc(t("settings.gatewayEnabledDesc")).addToggle((toggle) => toggle.setValue(this.plugin.settings.gatewayEnabled).onChange(async (value) => { this.plugin.settings.gatewayEnabled = value; await this.plugin.saveSettings(); }));
