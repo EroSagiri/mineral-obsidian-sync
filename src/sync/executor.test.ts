@@ -169,6 +169,16 @@ describe("SafeExecutor", () => {
     expect(created).toMatchObject([{ path: "a", deletedRemoteETag: "A", protocol: 1 }]);
     expect(deleted).toEqual(["a"]);
   });
+  it("uses a metadata-free conditional verifier for logical deletion when available", async () => {
+    let verified: string | undefined;
+    const client = remote({
+      verifyObjectVersion: async (_key, etag) => { verified = etag; },
+      headObject: async () => { throw new Error("the entry reader must not run"); },
+      putTombstone: async (record) => ({ tombstone: record }),
+    });
+    await expect(new SafeExecutor(vault({}) as never, client, state(), identity, "[]").execute({ type: "delete-remote", key: "a", reason: "test", expectedRemoteETag: "A" })).resolves.toMatchObject({ status: "applied" });
+    expect(verified).toBe("A");
+  });
   it("does not retire a baseline when a tombstone PUT outcome is ambiguous", async () => {
     const deleted: string[] = [];
     const saved: StateStore = { ...state(), delete: async (key) => { deleted.push(key); } };

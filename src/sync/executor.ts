@@ -206,7 +206,7 @@ export class SafeExecutor {
     if (!etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
     if (!this.r2.putTombstone) return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
     try {
-      await this.r2.headObject(operation.key, { ifMatch: etag });
+      await this.verifyObjectVersion(operation.key, etag);
     } catch (error) {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "remote-changed" };
       return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };
@@ -230,6 +230,12 @@ export class SafeExecutor {
     // the result for the same reason a PUT's did — a report of the deletion has to name it to be
     // verifiable at all.
     return this.pruneResult(operation.key, { retired: etag });
+  }
+
+  /** Use the metadata-free conditional verification path when the transport provides it. */
+  private async verifyObjectVersion(key: string, etag: string): Promise<void> {
+    if (this.r2.verifyObjectVersion) return this.r2.verifyObjectVersion(key, etag);
+    await this.r2.headObject(key, { ifMatch: etag });
   }
 
   // ---- conflict resolution ----------------------------------------------------------------------
@@ -324,7 +330,7 @@ export class SafeExecutor {
   private async acceptRemoteDelete(operation: Extract<SyncOperation, { type: "resolve-accept-remote-delete" }>): Promise<OperationResult> {
     // Reconfirm the physical object still is the version named by the tombstone. A later B object
     // survives tombstone(A), and must also stop an old "accept delete" click from trashing local B.
-    if (operation.expectedDeletion.objectPresent) try { await this.r2.headObject(operation.key, { ifMatch: operation.expectedDeletion.deletedRemoteETag }); }
+    if (operation.expectedDeletion.objectPresent) try { await this.verifyObjectVersion(operation.key, operation.expectedDeletion.deletedRemoteETag); }
     catch (error) {
       if (error instanceof RemoteObjectChangedError) return { status: "stale", key: operation.key, reason: "conflict-superseded" };
       return error instanceof RemoteHttpError ? { status: "failed", key: operation.key, error: message(error), httpStatus: error.status } : { status: "failed", key: operation.key, error: message(error) };

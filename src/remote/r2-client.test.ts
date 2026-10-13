@@ -31,6 +31,17 @@ describe("SignedR2ListClient.getObject", () => {
   });
 });
 
+describe("SignedR2ListClient.verifyObjectVersion", () => {
+  it("accepts a matching conditional HEAD without download metadata", async () => {
+    let request: { method?: string; headers?: Record<string, string> } | undefined;
+    setRequestUrlHandler(async (value) => { request = value; return { status: 200, arrayBuffer: new ArrayBuffer(0), text: "", headers: {}, json: {} }; });
+
+    await expect(client().verifyObjectVersion("a.md", "version-a")).resolves.toBeUndefined();
+    expect(request?.method).toBe("HEAD");
+    expect(request?.headers?.["if-match"]).toBe('"version-a"');
+  });
+});
+
 describe("SignedR2ListClient.putObject", () => {
   it("records the baseline from the PUT response itself, with no confirmation HEAD", async () => {
     const methods: string[] = [];
