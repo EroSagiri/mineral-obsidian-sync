@@ -1,0 +1,32 @@
+import { afterEach, describe, expect, it } from "vitest";
+import type { Vault } from "obsidian";
+import { Platform } from "../obsidian";
+import { SignedR2ListClient, remoteIdentity } from "../../src/remote/r2-client";
+import { SafeExecutor } from "../../src/sync/executor";
+import { FakeR2 } from "./fake-r2";
+import { CONFIG } from "./harness";
+import { createMemoryStateStore } from "./fake-vault";
+import { installDomParserShim } from "./dom-parser-shim";
+import { createVaultPathFilter } from "../../src/sync/ignore";
+installDomParserShim();
+afterEach(() => { Platform.isAndroidApp = false; });
+for (const android of [false, true]) for (const deletionMode of ["backup", "direct"] as const) describe(`${android ? "Android native HEAD fallback" : "Windows"} ${deletionMode} HTTP integration`, () => {
+  it("signs and executes explicit batch deletion, verifies paginated absence and ignores all internal storage", async () => {
+    Platform.isAndroidApp = android;
+    const fake = new FakeR2({ bucket: CONFIG.bucket, accessKeyId: CONFIG.accessKeyId, pageSize: 2, failHeadNon2xx: android });
+    const client = new SignedR2ListClient(CONFIG), state = createMemoryStateStore();
+    const executor = new SafeExecutor({} as Vault, client, state, remoteIdentity(CONFIG), "", undefined, undefined, undefined, { deletionMode, defer: true, confirmDelete: async () => true, changed: async () => { throw Error("gateway offline"); } });
+    const entries = [];
+    for (let i = 0; i < 4; i++) entries.push({ key: `fixture/${i}.md`, ...await client.putObject(`fixture/${i}.md`, new TextEncoder().encode(`fixture ${i}`).buffer, { ifNoneMatch: "*" }) });
+    await client.putObject("fixture/keep.md", new Uint8Array([1]).buffer, { ifNoneMatch: "*" });
+    const results = await executor.executeRemoteDeletes(entries.map(entry => ({ type: "delete-remote", key: entry.key, expectedRemoteETag: entry.etag, reason: "local-deleted" })));
+    expect(results.every(r => r.status === "applied" && r.physicalDeleted), JSON.stringify(results)).toBe(true);
+    expect((await client.listObjects()).map(o => o.key)).toEqual(["fixture/keep.md"]);
+    expect(fake.requests.filter(r => r.method === "POST")).toHaveLength(1);
+    expect(fake.requests.filter(r => r.method === "PUT" && r.url.includes("/versions/"))).toHaveLength(deletionMode === "backup" ? 12 : 0);
+    expect((await client.recoveryPort().list(".mineral/delete-tasks/")).length).toBe(0);
+    await executor.flushRecoveryChanges();
+    const filter = createVaultPathFilter({ ignoredPaths: [] });
+    for (const key of [".mineral/delete-tasks/task.json", ".mineral/tombstones/t.json", ".mineral/versions/body", ".mineral/benchmarks/fixture.md"]) expect(filter.ignores(key)).toBe(true);
+  });
+});

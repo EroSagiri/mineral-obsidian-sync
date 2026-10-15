@@ -1,6 +1,7 @@
 import { RemoteHttpError, RemoteObjectChangedError } from "./errors";
 import { Platform } from "obsidian";
-import type { RecoveryObject, RecoveryPort } from "@mineral/sync-core/recovery";
+import type { DeleteReceipt, RecoveryObject, RecoveryPort } from "@mineral/sync-core/recovery";
+import { userPath } from "@mineral/sync-core/recovery";
 import { isSystemStorageKey } from "@mineral/sync-core/storage";
 import { SettingsCredentialProvider } from "./credentials";
 import { Aws4FetchSigner, type RequestSigner } from "./signer";
@@ -47,6 +48,7 @@ function xmlEntries(xml: string, prefix: string): { entries: RemoteEntry[]; next
 }
 function xmlRawEntries(xml: string): { entries: Array<{ key: string; size: number; etag?: string; lastModified: number }>; next?: string; truncated: boolean } {
   const document = new DOMParser().parseFromString(xml, "application/xml"); if (document.querySelector("parsererror")) throw new Error("R2 returned an invalid ListObjectsV2 response");
+  if (document.documentElement.tagName !== "ListBucketResult" || !["true", "false"].includes(xmlText(document.documentElement, "IsTruncated") ?? "")) throw Error("Incomplete ListObjectsV2 response");
   const entries = Array.from(document.getElementsByTagName("Contents")).map((node) => {
     const key = xmlText(node, "Key"), size = Number(xmlText(node, "Size")), lastModified = Date.parse(xmlText(node, "LastModified") ?? "");
     if (!key || !Number.isFinite(size) || !Number.isFinite(lastModified)) throw new Error("R2 list response contained invalid object metadata");
@@ -148,6 +150,9 @@ export class SignedR2ListClient implements R2Client {
       return result;
     };
     return {
+      isPreconditionFailure: error => error instanceof RemoteObjectChangedError,
+      removeMany: keys => this.deleteObjects(keys),
+      absent: keys => this.absentObjects(keys),
       list: async (prefix) => {
         if (!prefix.startsWith(".mineral/") && !prefix.startsWith(".mineral-sync/tombstones/")) throw new Error("Invalid recovery listing namespace");
         const entries = await this.listRaw(`${normalizePrefix(this.config.remotePrefix)}${prefix}`);
@@ -183,6 +188,63 @@ export class SignedR2ListClient implements R2Client {
         if (response.status < 200 || response.status >= 300) throw new RemoteHttpError("RecoveryDelete", response.status);
       },
     };
+  }
+  /** Explicit ordinary keys only; HTTP success is parsed independently for every requested key. */
+  async deleteObjects(keys: string[]): Promise<DeleteReceipt[]> {
+    if (!keys.length || keys.length > 32 || new Set(keys).size !== keys.length) throw Error("Invalid DeleteObjects batch");
+    keys.forEach(userPath);
+    const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r/g, "&#13;");
+    const body = new TextEncoder().encode(`<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>false</Quiet>${keys.map(key => `<Object><Key>${escape(remoteObjectKey(this.config.remotePrefix, key))}</Key></Object>`).join("")}</Delete>`);
+    const url = new URL(`/${encodeURIComponent(this.config.bucket)}?delete`, this.config.endpoint);
+    // R2 accepts a SHA-256 payload checksum for DeleteObjects (avoids platform-specific MD5).
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
+    const checksum = btoa(String.fromCharCode(...digest));
+    let response;
+    try { response = await this.send("DeleteObjects", "POST", url.toString(), { "content-type": "application/xml", "x-amz-checksum-sha256": checksum }, body.buffer); }
+    catch { return keys.map(key => ({ key, status: "unknown" })); }
+    if (response.status < 200 || response.status >= 300) return keys.map(key => ({ key, status: response.status >= 500 || response.status === 429 ? "unknown" : "failed", error: `HTTP ${response.status}` }));
+    const doc = new DOMParser().parseFromString(response.text, "application/xml");
+    if (doc.querySelector("parsererror") || doc.documentElement.tagName !== "DeleteResult") return keys.map(key => ({ key, status: "unknown", error: "Invalid DeleteObjects response" }));
+    const entries = new Map<string, DeleteReceipt[]>();
+    for (const name of ["Deleted", "Error"]) for (const node of Array.from(doc.getElementsByTagName(name))) {
+      const raw = xmlText(node, "Key"); const key = raw && vaultKeyFromRemote(this.config.remotePrefix, raw);
+      if (!key || !keys.includes(key)) continue;
+      const item: DeleteReceipt = { key, status: name === "Deleted" ? "requested" : "failed", ...(name === "Error" ? { error: xmlText(node, "Code") ?? "Unknown error" } : {}) };
+      entries.set(key, [...entries.get(key) ?? [], item]);
+    }
+    return keys.map(key => { const matches = entries.get(key); return matches?.length === 1 ? matches[0] : { key, status: matches ? "unknown" : "missing" }; });
+  }
+  /** Bounded affected-range LIST. Pagination overflow/errors fall back to exact observations. */
+  async absentObjects(keys: string[]): Promise<Set<string>> {
+    keys.forEach(userPath);
+    if (!keys.length) return new Set();
+    const parent = (key: string) => key.slice(0, key.lastIndexOf("/") + 1);
+    const prefix = parent(keys[0]);
+    if (keys.some(key => parent(key) !== prefix) || keys.length === 1) return this.absentByHead(keys);
+    const present = new Set<string>(), seen = new Set<string>(); let token: string | undefined;
+    try {
+      for (let pageNumber = 0; pageNumber < 4; pageNumber++) {
+        const url = new URL(`/${encodeURIComponent(this.config.bucket)}`, this.config.endpoint);
+        url.search = new URLSearchParams({ "list-type": "2", prefix: `${normalizePrefix(this.config.remotePrefix)}${prefix}`, "max-keys": "1000", ...(token ? { "continuation-token": token } : {}) }).toString();
+        const response = await this.send("VerifyDeleteList", "GET", url.toString(), { "accept-encoding": "identity" });
+        if (response.status !== 200) throw Error("Absence LIST failed");
+        const page = xmlRawEntries(response.text);
+        if (new DOMParser().parseFromString(response.text, "application/xml").documentElement.tagName !== "ListBucketResult") throw Error("Invalid absence LIST");
+        for (const entry of page.entries) {
+          if (!entry.key.startsWith(`${normalizePrefix(this.config.remotePrefix)}${prefix}`)) throw Error("Absence LIST escaped scope");
+          const key = vaultKeyFromRemote(this.config.remotePrefix, entry.key); if (key) present.add(key);
+        }
+        if (!page.truncated) return new Set(keys.filter(key => !present.has(key)));
+        if (!page.next || seen.has(page.next)) throw Error("Invalid absence LIST pagination");
+        token = page.next; seen.add(token);
+      }
+    } catch { /* Unfinished listing cannot prove absence. */ }
+    return this.absentByHead(keys);
+  }
+  private async absentByHead(keys: string[]): Promise<Set<string>> {
+    const absent = new Set<string>();
+    for (const key of keys) if (!await this.recoveryPort().head(key)) absent.add(key);
+    return absent;
   }
   private async listRaw(prefix: string): Promise<Array<{ key: string; size: number; etag?: string; lastModified: number }>> {
     const output: Array<{ key: string; size: number; etag?: string; lastModified: number }> = []; let token: string | undefined;

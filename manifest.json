@@ -1,7 +1,7 @@
 {
   "id": "mineral-obsidian-sync",
   "name": "Mineral Obsidian Sync",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "minAppVersion": "1.5.0",
   "description": "R2 sync with a global recovery center and backed-up physical deletion.",
   "author": "",

@@ -50,7 +50,7 @@ class ShimDocument {
   }
 
   getElementsByTagName(name: string): ShimList {
-    if (name === "Contents") return listOf(this.contents);
+    if (["Contents", "Deleted", "Error"].includes(name)) return listOf(this.contents.filter(node => node.tagName === name));
     if (name === this.root.tagName) return listOf([this.root]);
     return this.root.getElementsByTagName(name);
   }
@@ -63,8 +63,8 @@ class ShimDocument {
 export class ShimDOMParser {
   parseFromString(xml: string): ShimDocument {
     const contents: ShimElement[] = [];
-    for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) contents.push(new ShimElement("Contents", simpleTags(match[1] ?? "")));
-    const outer = xml.replace(/<Contents>[\s\S]*?<\/Contents>/g, "");
+    for (const match of xml.matchAll(/<(Contents|Deleted|Error)>([\s\S]*?)<\/\1>/g)) contents.push(new ShimElement(match[1], simpleTags(match[2] ?? "")));
+    const outer = xml.replace(/<(Contents|Deleted|Error)>[\s\S]*?<\/\1>/g, "");
     const rootTag = /<([A-Za-z0-9_.:-]+)[\s>]/.exec(outer)?.[1];
     return new ShimDocument(new ShimElement(rootTag ?? "document", simpleTags(outer)), contents, rootTag !== undefined);
   }

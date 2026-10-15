@@ -118,6 +118,13 @@ export class FakeR2 {
     const bucket = decodeURIComponent(segments[1] ?? "");
     const key = segments.slice(2).map((segment) => decodeURIComponent(segment)).join("/");
     if (bucket !== this.settings.bucket) return this.error(404, "NoSuchBucket");
+    if (method === "POST" && !key && url.searchParams.has("delete")) {
+      const xml = new TextDecoder().decode(bodyBytes(request.body));
+      const keys = [...xml.matchAll(/<Key>([^<]*)<\/Key>/g)].map(match => match[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
+      if (!keys.length || !this.header(request, "x-amz-checksum-sha256")) return this.error(400, "InvalidRequest");
+      for (const key of keys) this.objects.delete(key);
+      return { status: 200, headers: {}, text: `<DeleteResult>${keys.map(key => `<Deleted><Key>${escapeXml(key)}</Key></Deleted>`).join("")}</DeleteResult>`, arrayBuffer: EMPTY };
+    }
     if (method === "GET" && !key) return this.list(url);
     if (!key) return this.error(400, "InvalidRequest");
     return this.objectRequest(method, key, request);
@@ -145,6 +152,7 @@ export class FakeR2 {
     const current = this.objects.get(key);
     const ifMatch = stripQuotes(this.header(request, "if-match"));
     const ifNoneMatch = this.header(request, "if-none-match");
+    if (method === "DELETE") { this.objects.delete(key); return { status: 204, headers: {}, text: "", arrayBuffer: EMPTY }; }
 
     if (method === "PUT") {
       if (ifNoneMatch === "*" && !this.settings.ignoreIfNoneMatch && current) return this.error(412, "PreconditionFailed");

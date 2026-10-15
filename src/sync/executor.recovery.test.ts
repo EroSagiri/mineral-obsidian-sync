@@ -15,6 +15,26 @@ async function setup(confirmed = true, offline = false) {
   return { port, client, state, executor, changed, store: new RecoveryStore(port, JSON.stringify(identity)) };
 }
 describe("SafeExecutor owns recovery mutation ingress", () => {
+  for (const deletionMode of ["backup", "direct"] as const) it(`runs ${deletionMode} batches offline and only prunes verified absence`, async () => {
+    const { port, client, state } = await setup();
+    const changed = vi.fn(async () => { throw Error("gateway offline"); });
+    const executor = new SafeExecutor({} as Vault, client, state, identity, "", undefined, undefined, undefined, { deletionMode, defer: true, confirmDelete: async () => true, changed });
+    const results = await executor.executeRemoteDeletes([{ type: "delete-remote", key: "note.md", expectedRemoteETag: "e1", reason: "local-deleted" }]);
+    expect(results).toEqual([{ status: "applied", key: "note.md", physicalDeleted: true }]);
+    expect(state.delete).toHaveBeenCalledWith("note.md");
+    expect((await port.list(".mineral/versions/")).length).toBe(deletionMode === "backup" ? 2 : 0);
+    await executor.flushRecoveryChanges(); expect(changed).toHaveBeenCalledTimes(1);
+  });
+  it("resumes direct tasks under a new backup-mode executor after reload", async () => {
+    const { port, client, state } = await setup(); port.failDelete = true;
+    (port as typeof port & { isPreconditionFailure(error: unknown): boolean }).isPreconditionFailure = error => String(error).includes("conditional PUT failed");
+    const hooks = { deletionMode: "direct" as "direct" | "backup", confirmDelete: async () => true, changed: async () => {} };
+    const executor = new SafeExecutor({} as Vault, client, state, identity, "", undefined, undefined, undefined, hooks);
+    expect((await executor.execute({ type: "delete-remote", key: "note.md", expectedRemoteETag: "e1", reason: "local-deleted" })).status).toBe("partial");
+    expect(state.delete).not.toHaveBeenCalled(); port.failDelete = false;
+    await new SafeExecutor({} as Vault, client, state, identity, "", undefined, undefined, undefined, { ...hooks, deletionMode: "backup" }).retryRecoveryDeletes();
+    expect(await port.head("note.md")).toBeNull(); expect(await port.list(".mineral/versions/")).toEqual([]);
+  });
   it("coalesces a folder's notifications and completes with an offline gateway", async () => {
     const { port, client, state } = await setup();
     const changed = vi.fn(async () => { throw Error("offline"); });

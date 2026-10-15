@@ -6,9 +6,12 @@ import { DEFAULT_MUTATION_INGRESS_SETTINGS, type MutationIngressSettingsFields }
 import { t } from "./lang";
 
 export type InterfaceLanguage = "zh-CN" | "en" | "system";
+export type DeletionMode = "backup" | "direct";
+export const deletionMode = (value: unknown): DeletionMode => value === "direct" ? "direct" : "backup";
 
 export interface R2SyncSettings extends R2Configuration, GatewaySettings, MutationIngressSettingsFields {
   interfaceLanguage: InterfaceLanguage;
+  deletionMode: DeletionMode;
   debugLogging: boolean;
   ignoredPaths: string[];
   integrityReconcileIntervalMinutes: number;
@@ -16,7 +19,7 @@ export interface R2SyncSettings extends R2Configuration, GatewaySettings, Mutati
 export const DEFAULT_SETTINGS: R2SyncSettings = {
   ...DEFAULT_GATEWAY_SETTINGS, ...DEFAULT_MUTATION_INGRESS_SETTINGS,
   endpoint: "", bucket: "", accessKeyId: "", secretAccessKey: "", remotePrefix: "",
-  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20, interfaceLanguage: "zh-CN",
+  debugLogging: false, ignoredPaths: [], integrityReconcileIntervalMinutes: 20, interfaceLanguage: "zh-CN", deletionMode: "backup",
 };
 
 export class R2SyncSettingTab extends PluginSettingTab {
@@ -43,6 +46,12 @@ export class R2SyncSettingTab extends PluginSettingTab {
     text("settings.accessKeyId", "settings.accessKeyIdDesc", "accessKeyId");
     text("settings.secretAccessKey", "settings.secretAccessKeyDesc", "secretAccessKey", true);
     text("settings.remotePrefix", "settings.remotePrefixDesc", "remotePrefix");
+    containerEl.createEl("h3", { text: "文件同步／删除" });
+    new Setting(containerEl).setName("删除方式").setDesc("直接删除：删除前不创建云端恢复副本，删除的内容可能无法恢复。").addDropdown(dropdown => {
+      dropdown.addOption("backup", "备份后删除").addOption("direct", "直接删除");
+      dropdown.setValue(deletionMode(this.plugin.settings.deletionMode));
+      dropdown.onChange(async value => { this.plugin.settings.deletionMode = deletionMode(value); await this.plugin.saveSettings(); });
+    });
     new Setting(containerEl).setName(t("settings.ignoredPaths")).setDesc(t("settings.ignoredPathsDesc")).addTextArea((input) => {
       input.setValue(this.plugin.settings.ignoredPaths.join("\n")).setPlaceholder(t("settings.ignoredPathsPlaceholder"));
       input.inputEl.rows = 5;

@@ -37,6 +37,7 @@ export interface CycleDependencies {
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
   buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
   execute(operation: SyncOperation): Promise<OperationResult>;
+  executeRemoteDeletes?(operations: Extract<SyncOperation, { type: "delete-remote" }>[]): Promise<OperationResult[]>;
   /** Android retains its single-operation background pause boundary. */
   remoteDeleteConcurrency?: 1 | 4;
   /** Flush coalesced recovery notifications even when the cycle stops early. */

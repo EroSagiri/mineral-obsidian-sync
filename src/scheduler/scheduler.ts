@@ -201,7 +201,9 @@ export class SyncScheduler {
             // Only independent ordinary remote deletions overlap. All other operation
             // kinds retain their ordering, and duplicate keys never share a batch.
             if (batch[0].type === "delete-remote") while (batch.length < (cycle.remoteDeleteConcurrency ?? 1) && index < plan.operations.length && plan.operations[index].type === "delete-remote" && !batch.some(op => op.key === plan.operations[index].key)) batch.push(plan.operations[index++]);
-            const results = batch.length === 1 ? [await this.apply(batch[0], cycle)] : await Promise.all(batch.map(async operation => {
+            const results = batch[0].type === "delete-remote" && cycle.executeRemoteDeletes
+              ? await cycle.executeRemoteDeletes(batch as Extract<SyncOperation, { type: "delete-remote" }>[])
+              : batch.length === 1 ? [await this.apply(batch[0], cycle)] : await Promise.all(batch.map(async operation => {
               try { return await this.apply(operation, cycle!); }
               catch (error) {
                 if (operation.type !== "delete-remote") throw error;

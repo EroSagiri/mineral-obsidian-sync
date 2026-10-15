@@ -80,7 +80,7 @@ export class RecoveryCenter extends Modal {
       row.createEl("p", { text: `${e.createdAt} · ${e.size < 0 ? "原大小未知" : `${e.size} B`} · ${e.reason} · ${stateLabel(e.state)}` });
       if (e.error) row.createEl("p", { text: e.error });
       if (e.kind === "version") this.button(row, "查看与恢复", () => this.detail(e));
-      if (e.kind === "tombstone") {
+      if (e.kind === "tombstone" && e.recoverable === true) {
         this.button(row, "预览旧删除正文", () => this.detail(e));
         this.button(row, "保存为版本副本", () => this.submit({ identity: this.ui.identity, confirmed: true, action: "migrate", selection: recoverySelection(e) }));
       }

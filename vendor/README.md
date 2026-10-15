@@ -8,14 +8,14 @@ would make a fresh clone unbuildable on any other machine.
 | Field | Value |
 | --- | --- |
 | Package | `@mineral/sync-core` |
-| Version | `0.0.3` |
+| Version | `0.0.4` |
 | Source repository | `bedrock-mcp` (`packages/sync-core`) |
 | Source commit | `cbaa47616c9ebeb7e71e265082ce6ca3170a88e7` — bounded recovery discovery and redundant-read removal |
-| Artifact | `vendor/mineral-sync-core-0.0.3.tgz` |
-| SHA-256 (tarball) | `02DDA4BB8A17B7109C549D4BD04550BC490E2FBA5FCD924E1E314C408FF554F6` |
-| npm shasum | `b642b2d56d2c16e76944401abd714fc57825c24a` |
-| npm integrity | `sha512-WjQG4DnMydwx4xTSAUyX+qwGFxDN6Oy9Vr/WE9CKwmbe2qq2Evjmddxy1Df6SsRbogmOnzti8hW8xRUqsrmArg==` |
-| Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.3.tgz"` |
+| Artifact | `vendor/mineral-sync-core-0.0.4.tgz` |
+| SHA-256 (tarball) | `822244BFCA6816ED5C0FCA0A2D5792D8470BEBE011B087C0BBD278F67EEC1B2F` |
+| npm shasum | `f54d4c9c8574c91deaf381b35c55f2aa028e4224` |
+| npm integrity | `sha512-GGsV92mFH+Heg/CxBe17V4m6lrivIC977E/Ozf8lCmPbySTXx2PPk+ZPr/YOaQ1qnWxBFtsl6Ee9WaQYi85Cjg==` |
+| Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.4.tgz"` |
 
 This revision includes the portable R2 recovery store, TOML manifests, safe recovery selections,
 and mutation notification contracts used by both the plugin and backend.

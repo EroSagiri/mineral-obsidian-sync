@@ -138,6 +138,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...current,
+      deletionMode: current.deletionMode === "direct" ? "direct" : "backup",
       ignoredPaths: Array.isArray(persisted.ignoredPaths) ? persisted.ignoredPaths.filter((value): value is string => typeof value === "string") : legacyPaths,
     };
     this.logger = new DebugLogger(this.app, {
@@ -739,7 +740,10 @@ export default class R2PersonalSyncPlugin extends Plugin {
     const channel = this.currentChannel();
     // A user file deletion authorizes its planned, ETag-bound remote deletion. Backup and
     // tombstone protections stay in SafeExecutor; recovery-record cleanup confirms in its UI.
-    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message), { defer: true, confirmDelete: async () => true, changed: () => this.recoveryChanged() });
+    const generation = this.scheduler?.diagnostics().configGeneration;
+    const settingsFingerprint = JSON.stringify(settings);
+    const control = { concurrency: Platform.isAndroidApp ? 1 as const : 4 as const, shouldContinue: () => this.syncMayRun() && JSON.stringify(this.settings) === settingsFingerprint && this.scheduler?.diagnostics().stopped !== true && this.scheduler?.diagnostics().configGeneration === generation };
+    const executor = new SafeExecutor(this.app.vault, client, this.stateStore, identity, ignorePolicy, this.vaultFileRemover(), channel ? createMergeBaseRecorder(this.app.vault, channel, this.conflictStores) : undefined, (message) => this.debug(message), { defer: true, confirmDelete: async () => true, changed: () => this.recoveryChanged(), deletionMode: settings.deletionMode, control });
     // One definition of a usable baseline, shared by every observation path in the cycle: a baseline from
     // another namespace, or one invalidated by an ignore-policy change, must never decide anything.
     const acceptsBaseline = (key: string, entry: PreviousEntry): boolean =>
@@ -772,6 +776,7 @@ export default class R2PersonalSyncPlugin extends Plugin {
       filterPrevious: (storedPrevious: Awaited<ReturnType<IndexedDbStateStore["loadAll"]>>) => new Map([...storedPrevious].filter(([key, entry]) => !filter.ignores(key) && entry.ignorePolicy === ignorePolicy && entry.remoteIdentity?.endpoint === identity.endpoint && entry.remoteIdentity.bucket === identity.bucket && entry.remoteIdentity.remotePrefix === identity.remotePrefix)),
       buildPlan: (local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>) => buildSyncPlan(local, remote, previous, this.coordinator?.resolutions()),
       execute: (operation: Parameters<SafeExecutor["execute"]>[0]) => executor.execute(operation),
+      executeRemoteDeletes: (operations: Extract<SyncOperation, { type: "delete-remote" }>[]) => executor.executeRemoteDeletes(operations),
       finish: () => executor.flushRecoveryChanges(),
       remoteDeleteConcurrency: Platform.isAndroidApp ? 1 as const : 4 as const,
       localWriteStillMatches: async (entry: LocalEntry) => {

@@ -1,0 +1,885 @@
+{
+  "date": "2026-10-15",
+  "baseline": {
+    "plugin": "0764a4a",
+    "shared": "cbaa476"
+  },
+  "rows": [
+    {
+      "name": "r2-baseline-isolated-100",
+      "prefix": ".mineral/benchmarks/bulk-delete/b28c9dcf-647b-4d42-826d-277552edd187/",
+      "count": 100,
+      "phases": {
+        "delete": {
+          "ms": 105551,
+          "requests": 1001,
+          "operations": {
+            "RecoveryHead": {
+              "count": 400,
+              "ms": 74827
+            },
+            "RecoveryRead": {
+              "count": 100,
+              "ms": 48403
+            },
+            "RecoveryPut": {
+              "count": 400,
+              "ms": 189286
+            },
+            "RecoveryDelete": {
+              "count": 100,
+              "ms": 33603
+            },
+            "RecoveryHeadFallback": {
+              "count": 1,
+              "ms": 436
+            }
+          },
+          "stages": {
+            "source-validation-read:HEAD": {
+              "count": 200,
+              "ms": 39399
+            },
+            "source-validation-read:GET": {
+              "count": 101,
+              "ms": 48602
+            },
+            "backup-body:PUT": {
+              "count": 100,
+              "ms": 44967
+            },
+            "manifest:PUT": {
+              "count": 200,
+              "ms": 92879
+            },
+            "tombstone:HEAD": {
+              "count": 100,
+              "ms": 15832
+            },
+            "tombstone:PUT": {
+              "count": 100,
+              "ms": 50739
+            },
+            "delete:DELETE": {
+              "count": 100,
+              "ms": 33437
+            },
+            "verify-absence:HEAD": {
+              "count": 100,
+              "ms": 18859
+            }
+          }
+        },
+        "reconcile": {
+          "ms": 12710,
+          "requests": 110,
+          "operations": {
+            "ListTombstonesV2": {
+              "count": 2,
+              "ms": 649
+            },
+            "RecoveryRead": {
+              "count": 103,
+              "ms": 28577
+            },
+            "RecoveryHead": {
+              "count": 2,
+              "ms": 241
+            },
+            "RecoveryHeadFallback": {
+              "count": 1,
+              "ms": 798
+            },
+            "RecoveryPut": {
+              "count": 1,
+              "ms": 529
+            },
+            "ListObjectsV2": {
+              "count": 1,
+              "ms": 236
+            }
+          },
+          "stages": {
+            "scan:GET": {
+              "count": 3,
+              "ms": 881
+            },
+            "manifest:GET": {
+              "count": 101,
+              "ms": 27905
+            },
+            "backup-body:GET": {
+              "count": 1,
+              "ms": 303
+            },
+            "tombstone:HEAD": {
+              "count": 1,
+              "ms": 122
+            },
+            "tombstone:GET": {
+              "count": 2,
+              "ms": 912
+            },
+            "source-validation-read:HEAD": {
+              "count": 1,
+              "ms": 117
+            },
+            "manifest:PUT": {
+              "count": 1,
+              "ms": 528
+            }
+          }
+        }
+      },
+      "sourceAbsenceMs": 118261,
+      "fullRescanMs": null,
+      "initialUnsuccessful": 1,
+      "ordinaryRemaining": 0,
+      "tombstones": null,
+      "versionObjects": null,
+      "pendingTasks": null,
+      "failure": "TypeError: fetch failed",
+      "failures": [],
+      "remaining": 0,
+      "cleanup": {
+        "name": "r2-baseline-isolated-100",
+        "prefix": ".mineral/benchmarks/bulk-delete/b28c9dcf-647b-4d42-826d-277552edd187/",
+        "removed": 288,
+        "remaining": 0
+      }
+    },
+    {
+      "name": "r2-backup-isolated-100",
+      "prefix": ".mineral/benchmarks/bulk-delete/9c2e634d-bf32-4158-89a4-60fd10ca62e9/",
+      "count": 100,
+      "phases": {
+        "delete": {
+          "ms": 90906,
+          "requests": 742,
+          "operations": {
+            "RecoveryHead": {
+              "count": 200,
+              "ms": 32525
+            },
+            "RecoveryRead": {
+              "count": 100,
+              "ms": 41849
+            },
+            "RecoveryPut": {
+              "count": 392,
+              "ms": 176981
+            },
+            "DeleteObjects": {
+              "count": 25,
+              "ms": 10401
+            },
+            "VerifyDeleteList": {
+              "count": 25,
+              "ms": 5770
+            }
+          },
+          "stages": {
+            "source-validation-read:HEAD": {
+              "count": 198,
+              "ms": 31337
+            },
+            "source-validation-read:GET": {
+              "count": 100,
+              "ms": 41508
+            },
+            "backup-body:PUT": {
+              "count": 98,
+              "ms": 45735
+            },
+            "manifest:PUT": {
+              "count": 196,
+              "ms": 91204
+            },
+            "tombstone:PUT": {
+              "count": 98,
+              "ms": 39259
+            },
+            "source-validation-read:POST": {
+              "count": 25,
+              "ms": 10374
+            },
+            "scan:GET": {
+              "count": 25,
+              "ms": 5743
+            },
+            "verify-absence:HEAD": {
+              "count": 2,
+              "ms": 671
+            }
+          }
+        },
+        "reconcile": {
+          "ms": 23090,
+          "requests": 229,
+          "operations": {
+            "ListTombstonesV2": {
+              "count": 5,
+              "ms": 1179
+            },
+            "RecoveryRead": {
+              "count": 203,
+              "ms": 46115
+            },
+            "RecoveryPut": {
+              "count": 10,
+              "ms": 4820
+            },
+            "RecoveryHead": {
+              "count": 6,
+              "ms": 967
+            },
+            "RecoveryHeadFallback": {
+              "count": 1,
+              "ms": 512
+            },
+            "ListObjectsV2": {
+              "count": 2,
+              "ms": 921
+            },
+            "DeleteObjects": {
+              "count": 1,
+              "ms": 427
+            },
+            "VerifyDeleteList": {
+              "count": 1,
+              "ms": 208
+            }
+          },
+          "stages": {
+            "scan:GET": {
+              "count": 8,
+              "ms": 2298
+            },
+            "manifest:GET": {
+              "count": 199,
+              "ms": 43821
+            },
+            "backup-body:GET": {
+              "count": 1,
+              "ms": 291
+            },
+            "tombstone:PUT": {
+              "count": 3,
+              "ms": 1231
+            },
+            "tombstone:HEAD": {
+              "count": 1,
+              "ms": 204
+            },
+            "tombstone:GET": {
+              "count": 2,
+              "ms": 642
+            },
+            "source-validation-read:HEAD": {
+              "count": 5,
+              "ms": 756
+            },
+            "manifest:PUT": {
+              "count": 5,
+              "ms": 2758
+            },
+            "source-validation-read:GET": {
+              "count": 2,
+              "ms": 1327
+            },
+            "backup-body:PUT": {
+              "count": 2,
+              "ms": 822
+            },
+            "source-validation-read:POST": {
+              "count": 1,
+              "ms": 425
+            }
+          }
+        },
+        "convergence": {
+          "ms": 2292,
+          "requests": 206,
+          "operations": {
+            "ListObjectsV2": {
+              "count": 1,
+              "ms": 231
+            },
+            "ListTombstonesV2": {
+              "count": 6,
+              "ms": 1443
+            },
+            "GetObject": {
+              "count": 199,
+              "ms": 93945
+            }
+          },
+          "stages": {
+            "scan:GET": {
+              "count": 7,
+              "ms": 1644
+            },
+            "tombstone:GET": {
+              "count": 199,
+              "ms": 81910
+            }
+          }
+        }
+      },
+      "sourceAbsenceMs": 113996,
+      "fullRescanMs": 116295,
+      "initialUnsuccessful": 3,
+      "ordinaryRemaining": 0,
+      "tombstones": 100,
+      "versionObjects": 200,
+      "pendingTasks": 0,
+      "failure": null,
+      "failures": [
+        {
+          "phase": "convergence",
+          "attempt": 0,
+          "error": "TypeError: fetch failed"
+        }
+      ],
+      "remaining": 0,
+      "cleanup": {
+        "removed": 300,
+        "remaining": 0
+      }
+    },
+    {
+      "name": "r2-direct-final-100",
+      "prefix": ".mineral/benchmarks/bulk-delete/bdbb300c-4825-4780-a0b0-cba72b2389c0/",
+      "count": 100,
+      "phases": {
+        "delete": {
+          "ms": 76275,
+          "requests": 572,
+          "operations": {
+            "RecoveryHead": {
+              "count": 200,
+              "ms": 33848
+            },
+            "RecoveryPut": {
+              "count": 199,
+              "ms": 103824
+            },
+            "VerifyDeleteList": {
+              "count": 50,
+              "ms": 9811
+            },
+            "DeleteObjects": {
+              "count": 25,
+              "ms": 12138
+            },
+            "RecoveryDelete": {
+              "count": 98,
+              "ms": 32263
+            }
+          },
+          "stages": {
+            "source-validation-read:HEAD": {
+              "count": 198,
+              "ms": 32879
+            },
+            "source-validation-read:PUT": {
+              "count": 100,
+              "ms": 59124
+            },
+            "scan:GET": {
+              "count": 50,
+              "ms": 9754
+            },
+            "tombstone:PUT": {
+              "count": 99,
+              "ms": 44134
+            },
+            "source-validation-read:POST": {
+              "count": 25,
+              "ms": 12114
+            },
+            "delete:DELETE": {
+              "count": 98,
+              "ms": 31959
+            },
+            "verify-absence:HEAD": {
+              "count": 2,
+              "ms": 528
+            }
+          }
+        },
+        "reconcile": {
+          "ms": 13349,
+          "requests": 33,
+          "operations": {
+            "ListTombstonesV2": {
+              "count": 4,
+              "ms": 576
+            },
+            "RecoveryRead": {
+              "count": 5,
+              "ms": 2094
+            },
+            "VerifyDeleteList": {
+              "count": 1,
+              "ms": 119
+            },
+            "RecoveryPut": {
+              "count": 5,
+              "ms": 1437
+            },
+            "RecoveryHead": {
+              "count": 8,
+              "ms": 2283
+            },
+            "RecoveryHeadFallback": {
+              "count": 2,
+              "ms": 3878
+            },
+            "RecoveryDelete": {
+              "count": 4,
+              "ms": 2365
+            },
+            "DeleteObjects": {
+              "count": 2,
+              "ms": 2514
+            },
+            "ListObjectsV2": {
+              "count": 2,
+              "ms": 549
+            }
+          },
+          "stages": {
+            "scan:GET": {
+              "count": 7,
+              "ms": 1232
+            },
+            "source-validation-read:GET": {
+              "count": 3,
+              "ms": 790
+            },
+            "tombstone:PUT": {
+              "count": 4,
+              "ms": 1031
+            },
+            "tombstone:HEAD": {
+              "count": 2,
+              "ms": 278
+            },
+            "source-validation-read:HEAD": {
+              "count": 3,
+              "ms": 587
+            },
+            "tombstone:GET": {
+              "count": 4,
+              "ms": 5168
+            },
+            "delete:DELETE": {
+              "count": 4,
+              "ms": 2358
+            },
+            "source-validation-read:POST": {
+              "count": 2,
+              "ms": 2510
+            },
+            "verify-absence:HEAD": {
+              "count": 3,
+              "ms": 1407
+            },
+            "source-validation-read:PUT": {
+              "count": 1,
+              "ms": 399
+            }
+          }
+        },
+        "convergence": {
+          "ms": 6137,
+          "requests": 105,
+          "operations": {
+            "ListObjectsV2": {
+              "count": 1,
+              "ms": 212
+            },
+            "ListTombstonesV2": {
+              "count": 4,
+              "ms": 1081
+            },
+            "GetObject": {
+              "count": 100,
+              "ms": 68271
+            }
+          },
+          "stages": {
+            "scan:GET": {
+              "count": 5,
+              "ms": 1263
+            },
+            "tombstone:GET": {
+              "count": 100,
+              "ms": 60926
+            }
+          }
+        }
+      },
+      "sourceAbsenceMs": 89624,
+      "fullRescanMs": 95766,
+      "initialUnsuccessful": 4,
+      "ordinaryRemaining": 0,
+      "tombstones": 100,
+      "versionObjects": 0,
+      "pendingTasks": 0,
+      "failure": null,
+      "failures": [],
+      "remaining": 0,
+      "cleanup": {
+        "removed": 100,
+        "remaining": 0
+      }
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "r2-baseline-100",
+      "prefix": "mineral-bulk-benchmark/712dc7e2-6f2d-483a-9ccc-bc8a73a6908b/",
+      "removed": 302,
+      "remaining": 0
+    },
+    {
+      "name": "r2-direct-100",
+      "prefix": "mineral-bulk-benchmark/a6d85def-4653-4fa5-aef1-8e6d52460439/",
+      "removed": 102,
+      "remaining": 0
+    },
+    {
+      "name": "r2-backup-100",
+      "prefix": "mineral-bulk-benchmark/e2d00f8e-09fd-476e-b302-f631bd4b04f8/",
+      "removed": 276,
+      "remaining": 0
+    },
+    {
+      "name": "r2-baseline-isolated-100",
+      "prefix": ".mineral/benchmarks/bulk-delete/b28c9dcf-647b-4d42-826d-277552edd187/",
+      "removed": 288,
+      "remaining": 0
+    },
+    {
+      "name": "r2-direct-isolated-100",
+      "prefix": ".mineral/benchmarks/bulk-delete/b9fbb6d2-7630-4141-965d-9804f1fc5301/",
+      "removed": 96,
+      "remaining": 0
+    },
+    {
+      "name": "r2-direct-probe",
+      "prefix": "mineral-bulk-benchmark/f3dfe526-5c1a-44d4-b275-e1c71ebfdddb/",
+      "removed": 0,
+      "remaining": 0
+    },
+    {
+      "name": "live-windows",
+      "prefix": ".mineral/benchmarks/live-windows/95c4241e-7b98-407b-a150-463647924f09/",
+      "removed": 12,
+      "remaining": 0
+    },
+    {
+      "name": "live-android",
+      "prefix": ".mineral/benchmarks/live-android/9b79ae35-31cb-4c75-a83e-4b1d250d0738/",
+      "removed": 12,
+      "remaining": 0
+    }
+  ],
+  "deployment": {
+    "version": "0.0.4",
+    "sha256": "628e93b51217177f8ca0f2e231dda3501ae0d91681c93fc68ca2802510903fe8",
+    "windows": {
+      "version": "0.0.4",
+      "mode": "backup",
+      "vault": "mineral",
+      "hasSettingsFence": true,
+      "batchConcurrency": 4,
+      "stopped": false,
+      "visibility": "hidden"
+    },
+    "android": {
+      "version": "0.0.4",
+      "mode": "backup",
+      "vault": "mineral",
+      "hasSettingsFence": true,
+      "batchConcurrency": 1,
+      "stopped": false,
+      "visibility": "visible"
+    }
+  },
+  "runtime": {
+    "windows": {
+      "version": "0.0.4",
+      "visibility": "hidden",
+      "platform": "windows",
+      "prefix": ".mineral/benchmarks/live-windows/95c4241e-7b98-407b-a150-463647924f09/",
+      "persistedMode": "direct",
+      "results": [
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-3.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-1.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-0.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-2.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-6.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-5.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-7.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-4.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-8.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-11.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-10.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-95c4241e-7b98-407b-a150-463647924f09/note-9.md",
+          "physicalDeleted": true
+        }
+      ],
+      "ms": 6297,
+      "restoredMode": "backup",
+      "instrumentationError": "TypeError: p.gateway.status is not a function",
+      "gatewayEndpointDuringTest": "https://127.0.0.1:9"
+    },
+    "android": {
+      "version": "0.0.4",
+      "platform": "android",
+      "prefix": ".mineral/benchmarks/live-android/9b79ae35-31cb-4c75-a83e-4b1d250d0738/",
+      "visibility": "visible",
+      "persistedMode": "direct",
+      "results": [
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-0.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-1.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-2.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-3.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-4.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-6.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-7.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-5.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "partial",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-8.md",
+          "reason": "physical-delete-pending"
+        },
+        {
+          "status": "partial",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-11.md",
+          "reason": "physical-delete-pending"
+        },
+        {
+          "status": "partial",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-10.md",
+          "reason": "physical-delete-pending"
+        },
+        {
+          "status": "partial",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-9.md",
+          "reason": "physical-delete-pending"
+        }
+      ],
+      "ms": 16715,
+      "backgroundVisibility": "hidden",
+      "backgroundScanEntries": 12,
+      "backgroundTaskRetryCompleted": true,
+      "resumed": [
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-11.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-10.md",
+          "physicalDeleted": true
+        },
+        {
+          "status": "applied",
+          "key": "mineral-live-9b79ae35-31cb-4c75-a83e-4b1d250d0738/note-9.md",
+          "physicalDeleted": true
+        }
+      ],
+      "finalVisibility": "visible",
+      "restoredMode": "backup"
+    }
+  },
+  "ui": {
+    "windows": {
+      "value": "backup",
+      "options": [
+        {
+          "value": "backup",
+          "text": "备份后删除"
+        },
+        {
+          "value": "direct",
+          "text": "直接删除"
+        }
+      ],
+      "warning": true
+    },
+    "android": {
+      "value": "backup",
+      "options": [
+        {
+          "value": "backup",
+          "text": "备份后删除"
+        },
+        {
+          "value": "direct",
+          "text": "直接删除"
+        }
+      ],
+      "warning": true
+    }
+  },
+  "localCleanup": {
+    "windows": {
+      "path": "mineral-bulk-benchmark/712dc7e2-6f2d-483a-9ccc-bc8a73a6908b",
+      "existed": true,
+      "trashed": true,
+      "absent": true
+    },
+    "android": [
+      {
+        "path": "mineral-bulk-benchmark/712dc7e2-6f2d-483a-9ccc-bc8a73a6908b",
+        "existed": true,
+        "absent": true
+      },
+      {
+        "path": "mineral-bulk-benchmark/a6d85def-4653-4fa5-aef1-8e6d52460439",
+        "existed": false,
+        "absent": true
+      },
+      {
+        "path": "mineral-bulk-benchmark/e2d00f8e-09fd-476e-b302-f631bd4b04f8",
+        "existed": false,
+        "absent": true
+      }
+    ]
+  },
+  "androidVault": {
+    "status": {
+      "diagnostics": {
+        "lastCycleStartedAt": 1792076222078,
+        "lastCycleFinishedAt": 1792076230680,
+        "lastCycleReason": "remote-change",
+        "lastResultCounts": {
+          "applied": 68,
+          "stale": 0,
+          "failed": 0,
+          "unresolved": 0,
+          "blocked": 0,
+          "partial": 0,
+          "conflict": 419,
+          "noop": 7
+        },
+        "pendingDirtyCount": 0,
+        "syncDirtyVersion": 0,
+        "currentState": "idle",
+        "configGeneration": 0,
+        "stopped": false,
+        "lastHandshakeStart": "2590",
+        "lastConfirmation": "confirmed",
+        "lastCycleRemoteMutation": false,
+        "pendingRemoteDeltaCount": 0
+      },
+      "conflictRecords": 0,
+      "kinds": {},
+      "testConflicts": 0
+    },
+    "plan": {
+      "local": 426,
+      "remote": 461,
+      "stored": 425,
+      "accepted": 7,
+      "kinds": {
+        "both-created-different:first sync cannot prove both entries identical": 419,
+        "noop": 7
+      }
+    },
+    "baselineMismatch": {
+      "endpoint": 0,
+      "bucket": 0,
+      "prefix": 0,
+      "policy": {
+        "[]": 7,
+        "[\".history\",\".trash\"]": 418
+      }
+    },
+    "originalIgnoredPaths": []
+  }
+}

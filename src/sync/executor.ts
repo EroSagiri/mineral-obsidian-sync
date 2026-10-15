@@ -1,4 +1,4 @@
-import { RecoveryStore, type RecoveryIntent } from "@mineral/sync-core/recovery";
+import { RecoveryStore, DirectDeleteStore, type DeleteControl, type RecoveryIntent } from "@mineral/sync-core/recovery";
 import type { TFile, Vault } from "obsidian";
 import { ensureParentFolders } from "../local/ensure-folders";
 import { LocalFileChangedError, readCurrentStableLocalBytes, readStableLocalBytes } from "../local/read-local";
@@ -132,7 +132,7 @@ export class SafeExecutor {
     private readonly files?: VaultFileRemover,
     private readonly mergeBase?: MergeBaseRecorder,
     private readonly debug?: (message: string) => void,
-    private readonly recoveryHooks?: { confirmDelete(path: string): Promise<boolean>; changed(): Promise<void>; defer?: boolean },
+    private readonly recoveryHooks?: { confirmDelete(path: string): Promise<boolean>; changed(): Promise<void>; defer?: boolean; deletionMode?: "backup" | "direct"; control?: DeleteControl },
   ) {}
 
   private async recoveryChanged(): Promise<void> {
@@ -171,9 +171,36 @@ export class SafeExecutor {
   async retryRecoveryDeletes(): Promise<void> {
     if (!this.r2.recoveryPort) return;
     const started = Date.now();
-    const count = await this.recoveryStore().retryPending();
+    const control = this.recoveryHooks?.control;
+    const direct = await new DirectDeleteStore(this.r2.recoveryPort(), JSON.stringify(this.identity)).retryPending(control);
+    const count = await this.recoveryStore().retryPending(control);
+    for (const result of direct) this.log(`direct delete retry state=${result.state} request=${result.request ?? "none"} path-digest=${pathDigest(result.path)}`);
     this.log(`recovery retry completed=${count} durationMs=${Date.now() - started}`);
-    if (count) await this.recoveryChanged();
+    if (count || direct.some(r => r.state === "deleted")) await this.recoveryChanged();
+    if (direct.some(r => r.state === "delete-pending") && control?.shouldContinue?.() !== false) throw new Error("Direct deletion remains pending verification");
+  }
+  async executeRemoteDeletes(operations: Extract<SyncOperation, { type: "delete-remote" }>[]): Promise<OperationResult[]> {
+    const port = this.r2.recoveryPort?.();
+    if (!port) return Promise.all(operations.map(op => this.deleteRemote(op)));
+    const eligible: typeof operations = [], results = new Map<string, OperationResult>();
+    for (const op of operations) {
+      if (!op.expectedRemoteETag) results.set(op.key, { status: "blocked", key: op.key, reason: "missing-remote-etag" });
+      else if (!await this.recoveryHooks?.confirmDelete(op.key)) results.set(op.key, { status: "blocked", key: op.key, reason: "physical-delete-confirmation-required" });
+      else eligible.push(op);
+    }
+    try {
+      const files = eligible.map(op => ({ path: op.key, etag: op.expectedRemoteETag! }));
+      const outcomes = this.recoveryHooks?.deletionMode === "direct"
+        ? await new DirectDeleteStore(port, JSON.stringify(this.identity)).deleteFiles(files, this.recoveryHooks?.control)
+        : await this.recoveryStore().deleteFiles(files, this.recoveryHooks?.control);
+      for (const result of outcomes) {
+        this.log(`physical delete state=${result.state} request=${result.request ?? "none"} path-digest=${pathDigest(result.path)}`);
+        results.set(result.path, result.state === "deleted" ? { ...await this.pruneResult(result.path), physicalDeleted: true }
+          : result.state === "conflict" ? { status: "stale", key: result.path, reason: "remote-changed" }
+          : { status: "partial", key: result.path, reason: "physical-delete-pending", error: result.error });
+      }
+    } finally { await this.recoveryChanged(); }
+    return operations.map(op => results.get(op.key) ?? { status: "partial", key: op.key, reason: "physical-delete-pending" });
   }
   private async putWithBackup(key: string, bytes: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion> {
     if (options.ifMatch && this.r2.recoveryPort) {
@@ -256,6 +283,7 @@ export class SafeExecutor {
   private async deleteRemote(operation: Extract<SyncOperation, { type: "delete-remote" }>): Promise<OperationResult> {
     const etag = operation.expectedRemoteETag;
     if (!etag) return { status: "blocked", key: operation.key, reason: "missing-remote-etag" };
+    if (this.recoveryHooks?.deletionMode === "direct" && this.r2.recoveryPort) return (await this.executeRemoteDeletes([operation]))[0];
     if (this.r2.recoveryPort) {
       if (!await this.recoveryHooks?.confirmDelete(operation.key)) return { status: "blocked", key: operation.key, reason: "physical-delete-confirmation-required" };
       try {
