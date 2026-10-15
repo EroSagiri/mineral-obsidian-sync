@@ -122,6 +122,7 @@ const shortEtag = (etag: string | undefined): string => etag ? `${etag.slice(0, 
 
 /** Sequentially executed, deliberately unexposed executor: callers must supply an already-observed plan. */
 export class SafeExecutor {
+  private recoveryDirty = false;
   constructor(
     private readonly vault: Vault,
     private readonly r2: R2Client,
@@ -131,8 +132,20 @@ export class SafeExecutor {
     private readonly files?: VaultFileRemover,
     private readonly mergeBase?: MergeBaseRecorder,
     private readonly debug?: (message: string) => void,
-    private readonly recoveryHooks?: { confirmDelete(path: string): Promise<boolean>; changed(): Promise<void> },
+    private readonly recoveryHooks?: { confirmDelete(path: string): Promise<boolean>; changed(): Promise<void>; defer?: boolean },
   ) {}
+
+  private async recoveryChanged(): Promise<void> {
+    this.recoveryDirty = true;
+    if (!this.recoveryHooks?.defer) await this.flushRecoveryChanges();
+  }
+  async flushRecoveryChanges(): Promise<void> {
+    if (!this.recoveryDirty) return;
+    this.recoveryDirty = false;
+    const started = Date.now();
+    await this.recoveryHooks?.changed().catch(() => {});
+    this.log(`recovery notification durationMs=${Date.now() - started}`);
+  }
 
   private recoveryStore(): RecoveryStore {
     const port = this.r2.recoveryPort?.();
@@ -141,7 +154,7 @@ export class SafeExecutor {
   }
   async executeRecovery(intent: RecoveryIntent): Promise<void> {
     try { await this.recoveryStore().execute(intent); }
-    finally { await this.recoveryHooks?.changed().catch(() => {}); }
+    finally { await this.recoveryChanged(); }
   }
   /** Local sync-history restoration uses the same mutation boundary; the planner handles its upload. */
   async restoreLocalHistory(path: string, content: string): Promise<void> {
@@ -157,13 +170,15 @@ export class SafeExecutor {
   }
   async retryRecoveryDeletes(): Promise<void> {
     if (!this.r2.recoveryPort) return;
+    const started = Date.now();
     const count = await this.recoveryStore().retryPending();
-    if (count) await this.recoveryHooks?.changed().catch(() => {});
+    this.log(`recovery retry completed=${count} durationMs=${Date.now() - started}`);
+    if (count) await this.recoveryChanged();
   }
   private async putWithBackup(key: string, bytes: ArrayBuffer, options: { ifMatch?: string; ifNoneMatch?: "*" }): Promise<RemoteVersion> {
     if (options.ifMatch && this.r2.recoveryPort) {
       await this.recoveryStore().backup(key, options.ifMatch);
-      await this.recoveryHooks?.changed().catch(() => {});
+      await this.recoveryChanged();
     }
     return this.r2.putObject(key, bytes, options);
   }
@@ -251,7 +266,7 @@ export class SafeExecutor {
         return { ...pruned, physicalDeleted: true };
       } catch (error) {
         return error instanceof RemoteObjectChangedError ? { status: "stale", key: operation.key, reason: "remote-changed" } : { status: "failed", key: operation.key, error: message(error) };
-      } finally { await this.recoveryHooks?.changed().catch(() => {}); }
+      } finally { await this.recoveryChanged(); }
     }
     if (!this.r2.putTombstone) return { status: "blocked", key: operation.key, reason: "remote-deletion-requires-version-identity" };
     try {

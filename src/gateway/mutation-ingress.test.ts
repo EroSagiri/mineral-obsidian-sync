@@ -163,6 +163,18 @@ describe("how an answer is classified", () => {
 });
 
 describe("retry and rejection", () => {
+  it("bounds requests and stops an offline batch after one wave, preserving retry identities", async () => {
+    let active = 0, peak = 0, offline = true, sequence = 0;
+    const sent: string[] = [];
+    const instance = createMutationIngressReporter({ settings: () => settings(), now: () => 1, newId: () => `id-${++sequence}`, transport: { send: async request => {
+      sent.push(JSON.parse(request.body!).id); peak = Math.max(peak, ++active);
+      await Promise.resolve(); active--; return { status: offline ? 503 : 202, text: "" };
+    } } });
+    await instance.report(Array.from({ length: 13 }, (_, i) => put(`${i}.md`)));
+    expect(peak).toBe(4); expect(sent).toHaveLength(4); expect(instance.pendingCount()).toBe(13);
+    offline = false; await instance.report([]);
+    expect(sent.slice(4, 8)).toEqual(sent.slice(0, 4)); expect(sent).toHaveLength(17); expect(instance.pendingCount()).toBe(0);
+  });
   it("retries a deferred report with the same idempotency key", async () => {
     // The retry is safe precisely because the key is unchanged: if the first attempt was recorded and its
     // answer was lost, the ingress recognises the id and replays the original result.

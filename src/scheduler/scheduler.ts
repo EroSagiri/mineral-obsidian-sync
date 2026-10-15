@@ -192,47 +192,69 @@ export class SyncScheduler {
           for (const operation of plan.operations) planCounts.set(operation.type, (planCounts.get(operation.type) ?? 0) + 1);
           this.dependencies.debug?.(`cycle plan operations=${plan.operations.length} counts=${JSON.stringify(Object.fromEntries(planCounts))}`);
           const operationsStartedAt = Date.now();
-          for (const operation of plan.operations) {
+          const total = plan.operations.filter(op => op.type !== "noop").length;
+          let completed = 0;
+          this.dependencies.onProgress?.(0, total, 0);
+          for (let index = 0; index < plan.operations.length;) {
             if (this.shouldStop(generation)) { halted = true; break; }
-            // Each operation is executed exactly once and its result classified once: the loop and
-            // the `finally` block must never disagree about what counts as a shortfall.
-            const result = await this.apply(operation, cycle);
-            counts[result.status]++;
-            if (result.status === "applied" && result.localWrite) localWrites.set(result.localWrite.key, result.localWrite);
-            const detail = resultDetail(result);
-            if (detail) resultDetails.set(detail, (resultDetails.get(detail) ?? 0) + 1);
-            if (result.status === "stale" || result.status === "partial") stale = true;
-            const mutation = observeRemoteMutation(operation, result);
-            if (mutation === "confirmed" || (mutation === "possible" && remoteMutation !== "confirmed")) remoteMutation = mutation;
-            if (mutation) {
-              const change = remoteChangeForOperation(operation, result);
-              if (change) remoteChanges.push(change);
-              // Everything that definitely changed R2 is handed over, deletions included: what the journal
-              // can accept is the journal's contract, not something this cycle should pre-judge. A PUT whose
-              // outcome is unknown is *not* here — there is no revision to name — which is what keeps a
-              // report from ever being a guess.
-              if (mutation === "confirmed") {
-                const write = landedWriteForOperation(operation, result);
-                if (write) landedMutations.push(write);
+            const batch = [plan.operations[index++]];
+            // Only independent ordinary remote deletions overlap. All other operation
+            // kinds retain their ordering, and duplicate keys never share a batch.
+            if (batch[0].type === "delete-remote") while (batch.length < (cycle.remoteDeleteConcurrency ?? 1) && index < plan.operations.length && plan.operations[index].type === "delete-remote" && !batch.some(op => op.key === plan.operations[index].key)) batch.push(plan.operations[index++]);
+            const results = batch.length === 1 ? [await this.apply(batch[0], cycle)] : await Promise.all(batch.map(async operation => {
+              try { return await this.apply(operation, cycle!); }
+              catch (error) {
+                if (operation.type !== "delete-remote") throw error;
+                // Every in-flight result must be accounted for even after a peer fails.
+                return { status: "partial" as const, key: operation.key, reason: "physical-delete-pending" as const };
+              }
+            }));
+            for (let item = 0; item < batch.length; item++) {
+              const operation = batch[item];
+              // Each operation is executed exactly once and its result classified once: the loop and
+              // the `finally` block must never disagree about what counts as a shortfall.
+              const result = results[item];
+              counts[result.status]++;
+              if (result.status === "applied" && result.localWrite) localWrites.set(result.localWrite.key, result.localWrite);
+              const detail = resultDetail(result);
+              if (detail) resultDetails.set(detail, (resultDetails.get(detail) ?? 0) + 1);
+              if (result.status === "stale" || result.status === "partial") stale = true;
+              const mutation = observeRemoteMutation(operation, result);
+              if (mutation === "confirmed" || (mutation === "possible" && remoteMutation !== "confirmed")) remoteMutation = mutation;
+              if (mutation) {
+                const change = remoteChangeForOperation(operation, result);
+                if (change) remoteChanges.push(change);
+                // Everything that definitely changed R2 is handed over, deletions included: what the journal
+                // can accept is the journal's contract, not something this cycle should pre-judge. A PUT whose
+                // outcome is unknown is *not* here — there is no revision to name — which is what keeps a
+                // report from ever being a guess.
+                if (mutation === "confirmed") {
+                  const write = landedWriteForOperation(operation, result);
+                  if (write) landedMutations.push(write);
+                }
+              }
+              // A resolution that actually applied is retired here, once, outside the planner: the
+              // conflict it described no longer exists, and keeping its intent would let a stale decision
+              // be replayed later.
+              if (result.status === "applied" && isResolution(operation) && this.dependencies.onResolutionApplied) {
+                try { await this.dependencies.onResolutionApplied(operation.conflictId, operation.key); }
+                catch { this.dependencies.debug?.("resolution cleanup failed"); }
+              }
+              // Only a shortfall discovered *before* the operation loop means the loop never reached
+              // its deterministic end. A shortfall discovered by an operation itself is recorded in
+              // `failures` (when it is a cycle failure) or is a normal shortfall that does not by
+              // itself change cycle control flow.
+              const classified = classify(result);
+              if (classified === "auth") { failure = "auth"; halted = true; }
+              if (classified === "retryable" && failure !== "auth") failure = "retryable";
+              else if (classified === "stable" && failure === undefined) failure = "stable";
+              if (operation.type !== "noop") {
+                completed++;
+                this.dependencies.onProgress?.(completed, total, counts.failed + counts.partial + counts.unresolved + counts.blocked + counts.stale);
               }
             }
-            // A resolution that actually applied is retired here, once, outside the planner: the
-            // conflict it described no longer exists, and keeping its intent would let a stale decision
-            // be replayed later.
-            if (result.status === "applied" && isResolution(operation) && this.dependencies.onResolutionApplied) {
-              try { await this.dependencies.onResolutionApplied(operation.conflictId, operation.key); }
-              catch { this.dependencies.debug?.("resolution cleanup failed"); }
-            }
-            // Only a shortfall discovered *before* the operation loop means the loop never reached
-            // its deterministic end. A shortfall discovered by an operation itself is recorded in
-            // `failures` (when it is a cycle failure) or is a normal shortfall that does not by
-            // itself change cycle control flow.
             if (this.shouldStop(generation)) { halted = true; break; }
-            const classified = classify(result);
-            if (classified === "auth") { failure = "auth"; halted = true; break; }
-            if (classified === "retryable") failure = "retryable";
-            else if (classified === "stable" && failure === undefined) failure = "stable";
-            if (this.shouldStop(generation)) { halted = true; break; }
+            if (halted) break;
           }
           this.dependencies.debug?.(`cycle operations durationMs=${Date.now() - operationsStartedAt}`);
           if (!halted && cycle.observeConverged) {
@@ -248,6 +270,9 @@ export class SyncScheduler {
     } catch (error) {
       failure = classifyError(error);
       this.dependencies.debug?.(`cycle error class=${failure}`);
+    } finally {
+      try { await cycle?.finish?.(); }
+      catch { this.dependencies.debug?.("cycle recovery notification failed"); }
     }
 
     // The exit handshake runs before the dirty-version pruning in `finally`, because a mismatched
@@ -282,8 +307,10 @@ export class SyncScheduler {
     // as much as a full one, and the fact must reach the journal whether or not a generation was
     // confirmed here. The report cannot change any result: the write was durable before this ran.
     if (landedMutations.length > 0 && this.dependencies.mutationIngress) {
+      const started = Date.now();
       try { await this.dependencies.mutationIngress.report(landedMutations); }
       catch { this.dependencies.debug?.("mutation ingress report failed"); }
+      this.dependencies.debug?.(`cycle mutation-ingress count=${landedMutations.length} durationMs=${Date.now() - started}`);
     }
     this.lastCycleFinishedAt = Date.now(); this.lastResultCounts = counts; this.lastFailureClass = failure;
     this.lastCycleRemoteMutation = remoteMutation !== undefined;

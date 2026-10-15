@@ -12,9 +12,19 @@ async function setup(confirmed = true, offline = false) {
   const client: R2Client = { recoveryPort: () => port, listObjects: async () => [], headObject: async key => { const o = await port.head(key); if (!o) throw new Error("404"); return { key, size: o.size, etag: o.etag, lastModified: Date.parse(o.modified) }; }, getObject: async (key, options) => (await port.read(key, options!.ifMatch!)).bytes.slice().buffer, putObject: async (key, body, options) => port.put(key, new Uint8Array(body), options.ifMatch ?? null) };
   const changed = vi.fn(async () => { if (offline) throw new Error("gateway offline"); });
   const executor = new SafeExecutor({} as Vault, client, state, identity, "", undefined, undefined, undefined, { confirmDelete: async () => confirmed, changed });
-  return { port, state, executor, changed, store: new RecoveryStore(port, JSON.stringify(identity)) };
+  return { port, client, state, executor, changed, store: new RecoveryStore(port, JSON.stringify(identity)) };
 }
 describe("SafeExecutor owns recovery mutation ingress", () => {
+  it("coalesces a folder's notifications and completes with an offline gateway", async () => {
+    const { port, client, state } = await setup();
+    const changed = vi.fn(async () => { throw Error("offline"); });
+    const executor = new SafeExecutor({} as Vault, client, state, identity, "", undefined, undefined, undefined, { defer: true, confirmDelete: async () => true, changed });
+    const entries = await Promise.all(Array.from({ length: 8 }, (_, i) => port.put(`folder/${i}.md`, new TextEncoder().encode("body"), null)));
+    const results = [];
+    for (let i = 0; i < entries.length; i += 4) results.push(...await Promise.all(entries.slice(i, i + 4).map(o => executor.execute({ type: "delete-remote", key: o.key, expectedRemoteETag: o.etag, reason: "local-deleted" }))));
+    expect(results.every(r => r.status === "applied")).toBe(true); expect(changed).not.toHaveBeenCalled();
+    await executor.flushRecoveryChanges(); await executor.flushRecoveryChanges(); expect(changed).toHaveBeenCalledTimes(1);
+  });
   it("requires confirmation for normal sync physical deletion", async () => {
     const { executor, port } = await setup(false);
     expect(await executor.execute({ type: "delete-remote", key: "note.md", reason: "local-deleted", expectedRemoteETag: "e1" })).toMatchObject({ status: "blocked", reason: "physical-delete-confirmation-required" });

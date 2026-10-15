@@ -37,6 +37,10 @@ export interface CycleDependencies {
   filterPrevious(entries: Map<string, PreviousEntry>): Map<string, PreviousEntry>;
   buildPlan(local: Map<string, LocalEntry>, remote: Map<string, RemoteEntry>, previous: Map<string, PreviousEntry>): SyncPlan;
   execute(operation: SyncOperation): Promise<OperationResult>;
+  /** Android retains its single-operation background pause boundary. */
+  remoteDeleteConcurrency?: 1 | 4;
+  /** Flush coalesced recovery notifications even when the cycle stops early. */
+  finish?(): Promise<void>;
   /** Confirms an executor-originated Vault write has not been changed again before its event is ignored. */
   localWriteStillMatches?(entry: LocalEntry): Promise<boolean>;
   /**
@@ -119,6 +123,7 @@ export interface SchedulerDependencies {
   onResolutionApplied?(conflictId: string, path: string): Promise<void>;
   timers?: SchedulerTimers;
   onStatus?(state: SchedulerState, counts: ResultCounts): void;
+  onProgress?(completed: number, total: number, failed: number): void;
   debug?(message: string): void;
 }
 

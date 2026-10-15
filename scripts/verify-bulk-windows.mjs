@@ -1,0 +1,26 @@
+/** Read and clean only a previously recorded disposable Windows folder test. */
+import { readFileSync, writeFileSync } from 'node:fs';
+import { SignedR2ListClient, remoteIdentity, SafeExecutor, RecoveryStore, recoverySelection } from '../build-diag/bulk-after.mjs';
+import { NodeFetchTransport } from './node-fetch-transport.mjs';
+const [settingsFile, checkpoint] = process.argv.slice(2);
+const report = JSON.parse(readFileSync(checkpoint, 'utf8'));
+report.verifiedBeforeCleanup ||= report.absent === 12 && report.versions === 12;
+if (!/^mineral-bulk-windows-test-20261015-[0-9a-f-]{36}$/.test(report.root)) throw Error('Invalid test root');
+const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
+const client = new SignedR2ListClient(settings, undefined, undefined, new NodeFetchTransport());
+const identity = remoteIdentity(settings), port = client.recoveryPort(), store = new RecoveryStore(port, JSON.stringify(identity));
+const entries = (await store.list()).filter(e => e.path.startsWith(report.root + '/'));
+report.versions = entries.filter(e => e.kind === 'version').length;
+report.tombstones = entries.filter(e => e.kind === 'tombstone').length;
+report.absent = 0;
+for (let i = 0; i < 12; i++) if (await port.head(`${report.root}/note-${i}.md`) === null) report.absent++;
+writeFileSync(checkpoint, JSON.stringify(report, null, 2));
+if (report.absent !== 12 || !report.verifiedBeforeCleanup && report.versions !== 12 || entries.some(e => !['deleted', 'cleanup-pending', 'tombstone'].includes(e.state))) throw Error('Test not fully deleted; preserve evidence');
+report.verifiedBeforeCleanup = true;
+writeFileSync(checkpoint, JSON.stringify(report, null, 2));
+const executor = new SafeExecutor({}, client, {}, identity, '');
+await executor.executeRecovery({ identity: store.identity, confirmed: true, action: 'clean', selections: entries.map(recoverySelection) });
+report.remainingRecovery = (await store.list()).filter(e => e.path.startsWith(report.root + '/')).length;
+report.remainingOrdinary = (await client.listObjects()).filter(e => e.key.startsWith(report.root + '/')).length;
+writeFileSync(checkpoint, JSON.stringify(report, null, 2));
+console.log(JSON.stringify(report));

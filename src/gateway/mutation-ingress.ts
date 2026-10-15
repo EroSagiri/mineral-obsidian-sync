@@ -229,12 +229,22 @@ export function createMutationIngressReporter(dependencies: MutationIngressDepen
       // Retries first: an older fact is the one a consumer has been missing for longer.
       let deferred = 0;
       let rejected = 0;
-      for (const mutation of [...pending.values()]) {
-        const verdict = await send(mutation, settings);
-        if (verdict === "retryable") { deferred += 1; continue; }
-        pending.delete(mutation.id);
-        if (verdict === "state-mismatch") { rejected += 1; dependencies.debug?.(`mutation ingress rejected reason=state-mismatch path-digest=${pathDigest(mutation.path)}`); }
-        else if (verdict === "permanent") { rejected += 1; dependencies.debug?.(`mutation ingress rejected reason=not-accepted path-digest=${pathDigest(mutation.path)}`); }
+      const queued = [...pending.values()];
+      for (let index = 0; index < queued.length;) {
+        const batch = [queued[index++]];
+        // Preserve order for repeated paths and cap the optional control-plane work.
+        while (batch.length < 4 && index < queued.length && !batch.some(m => m.path === queued[index].path)) batch.push(queued[index++]);
+        const verdicts = await Promise.all(batch.map(mutation => send(mutation, settings)));
+        for (let item = 0; item < batch.length; item++) {
+          const mutation = batch[item], verdict = verdicts[item];
+          if (verdict === "retryable") { deferred += 1; continue; }
+          pending.delete(mutation.id);
+          if (verdict === "state-mismatch") { rejected += 1; dependencies.debug?.(`mutation ingress rejected reason=state-mismatch path-digest=${pathDigest(mutation.path)}`); }
+          else if (verdict === "permanent") { rejected += 1; dependencies.debug?.(`mutation ingress rejected reason=not-accepted path-digest=${pathDigest(mutation.path)}`); }
+        }
+        // An outage costs at most one wave of timeouts, not one timeout per file.
+        // Unsent facts retain their original idempotency keys for the next attempt.
+        if (deferred) break;
       }
 
       while (pending.size > MAX_PENDING_MUTATIONS) {

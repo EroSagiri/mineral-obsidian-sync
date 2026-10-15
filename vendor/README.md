@@ -10,11 +10,11 @@ would make a fresh clone unbuildable on any other machine.
 | Package | `@mineral/sync-core` |
 | Version | `0.0.3` |
 | Source repository | `bedrock-mcp` (`packages/sync-core`) |
-| Source commit | `912b234` — backend recovery implementation |
+| Source commit | `cbaa47616c9ebeb7e71e265082ce6ca3170a88e7` — bounded recovery discovery and redundant-read removal |
 | Artifact | `vendor/mineral-sync-core-0.0.3.tgz` |
-| SHA-256 (tarball) | `56A1942D3A7C69E24ABB3C2D90792A5FF42202092490360C09888D361A224549` |
-| npm shasum | `3551d060ecc17a095e0147d73deacfd789501e2c` |
-| npm integrity | `sha512-Sn5jgygTI1Mc9bDR1RHMHnJ2a4Bq29IqhpSUbo9FLKwk3qNLMfN5W0weTSNZQpfe39K6SjlX2Gz2mhCHpx096Q==` |
+| SHA-256 (tarball) | `02DDA4BB8A17B7109C549D4BD04550BC490E2FBA5FCD924E1E314C408FF554F6` |
+| npm shasum | `b642b2d56d2c16e76944401abd714fc57825c24a` |
+| npm integrity | `sha512-WjQG4DnMydwx4xTSAUyX+qwGFxDN6Oy9Vr/WE9CKwmbe2qq2Evjmddxy1Df6SsRbogmOnzti8hW8xRUqsrmArg==` |
 | Consumption | `"@mineral/sync-core": "file:vendor/mineral-sync-core-0.0.3.tgz"` |
 
 This revision includes the portable R2 recovery store, TOML manifests, safe recovery selections,

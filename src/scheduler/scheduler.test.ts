@@ -28,6 +28,35 @@ function setup(capture: () => CycleDependencies, debug?: (message: string) => vo
 }
 
 describe("SyncScheduler", () => {
+  it("bounds folder deletion at four, accounts for partial failures, and flushes once", async () => {
+    const operations: SyncOperation[] = Array.from({ length: 11 }, (_, i) => ({ type: "delete-remote", key: `${i}.md`, expectedRemoteETag: "old", reason: "local-deleted" }));
+    let active = 0, peak = 0, finished = 0, flushes = 0;
+    const progress: number[][] = [];
+    const timers = new FakeTimers();
+    const scheduler = new SyncScheduler({ visible: () => true, timers, onProgress: (...args) => progress.push(args), captureCycle: () => ({
+      ...base(operations), remoteDeleteConcurrency: 4, finish: async () => { flushes++; },
+      execute: async op => {
+        peak = Math.max(peak, ++active);
+        await Promise.resolve(); await Promise.resolve(); active--; finished++;
+        return op.key === "3.md" ? { status: "partial", key: op.key, reason: "physical-delete-pending" } : { status: "applied", key: op.key, physicalDeleted: true };
+      },
+    }) });
+    scheduler.requestReconcile("manual"); timers.fire();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    expect(peak).toBe(4); expect(active).toBe(0); expect(finished).toBe(11); expect(flushes).toBe(1);
+    expect(scheduler.diagnostics().lastResultCounts).toMatchObject({ applied: 10, partial: 1 });
+    expect(progress.at(-1)).toEqual([11, 11, 1]);
+  });
+  it("drains all four in-flight deletes after a stop without starting the next batch", async () => {
+    const operations: SyncOperation[] = Array.from({ length: 8 }, (_, i) => ({ type: "delete-remote", key: `${i}.md`, expectedRemoteETag: "old", reason: "local-deleted" }));
+    let release!: () => void; const wait = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0, flushes = 0;
+    const { scheduler, timers, hide } = setup(() => ({ ...base(operations), remoteDeleteConcurrency: 4, finish: async () => { flushes++; }, execute: async op => { calls++; await wait; return { status: "applied", key: op.key }; } }));
+    scheduler.requestReconcile("manual"); timers.fire(); await flush();
+    expect(calls).toBe(4); hide(); release();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    expect(calls).toBe(4); expect(flushes).toBe(1); expect(scheduler.diagnostics().lastResultCounts.applied).toBe(4);
+  });
   it("uses one trailing global debounce for repeated and burst local events", async () => {
     let cycles = 0; const { scheduler, timers } = setup(() => { cycles++; return base([]); });
     scheduler.markLocalPaths(["a.md"], () => false); scheduler.markLocalPaths(["a.md"], () => false);
